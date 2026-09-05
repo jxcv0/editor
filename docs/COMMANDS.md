@@ -279,11 +279,11 @@ aliases are accepted.
 | Command | Action |
 | --- | --- |
 | `:w[!] [PATH]`, `:write[!] [PATH]` | Save, or save as `PATH`. Without `!`, refuse an external-change conflict. |
-| `:q`, `:quit` | Close the active buffer, refusing if it has unsaved changes. The last buffer is replaced by an empty scratch buffer. |
-| `:q!`, `:quit!` | Close the active buffer and explicitly discard its unsaved changes. |
+| `:q`, `:quit` | Close the current pane. Refuse if it is the only view of a modified buffer. On the last pane, quit only when every buffer is clean. |
+| `:q!`, `:quit!` | Close the current pane, discarding its modified buffer only if this is its last view. On the last pane, switch to another unsaved buffer if one remains; otherwise quit. |
 | `:qa`, `:qall` | Quit the editor only if every buffer is clean. |
 | `:qa!`, `:qall!` | Quit the editor and explicitly discard all unsaved buffers. |
-| `:wq[!] [PATH]`, `:x[!] [PATH]` | Save the active buffer, then quit if all buffers are clean (or forced). |
+| `:wq[!] [PATH]`, `:x[!] [PATH]` | Save the active buffer, then close the current pane. A failed save keeps the pane open. Other unsaved buffers prevent exiting the last pane. |
 | `:e[!] [PATH]`, `:edit[!] [PATH]` | Open `PATH`; with no path, reload the current file. `!` permits discarding local changes for reload. |
 | `:saveas[!] PATH` | Save the buffer under another name. |
 | `:b [NUMBER\|NAME]`, `:buffer ...` | Open the buffer picker, or switch by one-based number/name substring. |
@@ -307,6 +307,11 @@ the destination does not exist; the latter is created on save. `:w PATH` and
 `:x` currently shares the save-then-quit flow with `:wq`. Plain `:x` does not
 rewrite a clean buffer at its existing path, while forced or save-as variants
 can publish bytes.
+`:q` closes a pane; `:bd` deletes a buffer. Closing one of several panes showing
+the same modified buffer preserves its text and undo history, including with
+`:q!`. There is no `'hidden'` option: normal `:q` refuses to hide the only view
+of a modified buffer. `:q!` does not discard other unsaved buffers; `:qa!` is the
+explicit command to discard all and exit.
 `:earlier`/`:later` interpret their argument as an undo-step count (a suffix
 such as `5m` is not Vim time travel). There is no Ex range grammar, command
 chaining, shell escape, substitutions, or autocommand language.
@@ -320,8 +325,9 @@ In Normal and Visual modes, `<C-h>`/`<C-k>` select the previous layout leaf and
 `<C-j>`/`<C-l>` select the next one. The same directions work after a `<C-w>`
 prefix. When the explorer is open, moving left from an editor pane focuses it;
 moving right from the explorer focuses the editor. This is deterministic but
-not yet geometric left/down/up/right pane selection. Closing a pane never closes
-its buffer.
+not yet geometric left/down/up/right pane selection. Closing a pane retains its
+buffer, except when `:q!` explicitly discards a modified buffer's last view.
+`<Space>wd` keeps buffers open and still refuses to close the last pane.
 
 ## Unsupported-command feedback
 

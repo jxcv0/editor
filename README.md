@@ -83,8 +83,8 @@ The editor starts in Normal mode. A minimal first session is:
 - `u` and `Ctrl-r` to undo and redo; `.` repeats a supported last change.
 - `/` or `?` to search; `n`/`N` repeat.
 - `v`, `V`, and `Ctrl-v` for character, line, and early block selection.
-- `:w`, `:q`, `:qa`, force variants, and `:wq` for basic file/buffer/exit
-  operations.
+- `:w` to save; `:q` to close the current pane or quit from the last pane;
+  `:wq` to save and close that pane; `:bd` to delete a buffer; `:qa` to quit all.
 - `<Space>` for the keyboard-driven command menu; `<Space><Space>` finds files
   and `<Space>e` toggles the explorer.
 - `<Space>t` to open or hide the integrated terminal.
@@ -105,6 +105,10 @@ saved. Where the platform permits, saving uses a same-directory atomic
 replacement while preserving the existing line endings, final-newline state,
 Unix permissions, and symlink target. `:w!`, `:e!`, `:bd!`, and `:q!` are the
 explicit force/discard paths; review the command reference before using them.
+Normal `:q` protects a modified buffer's last visible pane; another pane showing
+the same buffer can close safely. `:q!` discards that buffer only when closing
+its last view. Other unsaved buffers keep the editor open; `:qa!` explicitly
+discards all and exits.
 
 Undo retains changed bytes rather than a complete document per edit. Each
 buffer has both an entry limit and a retained-change byte limit (64 MiB by
@@ -258,6 +262,12 @@ Selecting either mode requires pressing the same leader action twice within
 five seconds; this is the current confirmation gate, not a separate dialog.
 Status, parsed JSON, stderr, malformed input, queue overflow, and crashes are
 exposed as events. Bounded raw output is retained separately for the logs view.
+The watcher's `{"type":"status","state":"waiting",...}` events drive the status
+bar: preparing, waiting, and retrying show processing; applied/previewed show
+completion when no other file is active. Task summaries and failures appear in
+messages. Completed files trigger a reload of clean buffers even while another
+task is processing. Active task tracking is capped at 4,096 paths and 4 MiB of
+path text; exceeding either limit fails the integration with an explicit error.
 Safe automatic reload/review of files changed by the tool is not complete, so
 inspect changes with version control—especially in workspace-write mode.
 

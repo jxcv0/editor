@@ -156,6 +156,18 @@ impl EditorTerminal {
         }
     }
 
+    fn wait_for_copies(&mut self, text: &str, copies: usize) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.parser.screen().contents().matches(text).count() != copies {
+            assert!(
+                Instant::now() < deadline,
+                "waiting for {copies} copies of {text:?}; screen: {:?}",
+                self.parser.screen().contents()
+            );
+            self.read_output();
+        }
+    }
+
     fn normal_mode(&mut self) {
         // Wait for the standalone escape to be decoded before sending ':'.
         self.send(b"\x1b");
@@ -164,6 +176,7 @@ impl EditorTerminal {
 
     fn ex(&mut self, command: &str) {
         self.send(format!(":{command}").as_bytes());
+        self.wait_for("COMMAND");
         self.wait_for(&format!(":{command}"));
         self.send(b"\r");
     }
@@ -324,6 +337,189 @@ fn terminal_edits_first_file_at_grapheme_position_and_saves_all_session_files() 
     assert_eq!(session.files, vec![first, second]);
     assert_eq!(session.active, 0);
     assert_eq!(session.panes[0].cursor_line, 1);
+}
+
+#[test]
+fn terminal_quit_closes_the_active_split_then_exits_from_the_last_pane() {
+    let workspace = Workspace::new();
+    let path = workspace.project.join("split.txt");
+    fs::write(&path, "split body marker\n").unwrap();
+    let mut terminal = workspace.terminal(&["--no-session", "split.txt"]);
+    terminal.wait_for("NORMAL");
+    terminal.ex("split");
+    terminal.wait_for("NORMAL");
+    terminal.wait_for_copies("split body marker", 2);
+
+    terminal.ex("q");
+    terminal.wait_for("NORMAL");
+    terminal.wait_for_copies("split body marker", 1);
+    assert!(terminal.child.try_wait().unwrap().is_none());
+    terminal.ex("q");
+    terminal.finish();
+
+    assert_eq!(fs::read_to_string(&path).unwrap(), "split body marker\n");
+    let session = workspace.session();
+    assert_eq!(session.files, vec![path.clone()]);
+    assert_eq!(session.panes.len(), 1);
+    assert_eq!(session.panes[0].file, path);
+}
+
+#[test]
+fn terminal_quit_preserves_dirty_buffer_in_the_remaining_duplicate_pane() {
+    for quit in ["q", "q!"] {
+        let workspace = Workspace::new();
+        let path = workspace.project.join("shared.txt");
+        fs::write(&path, "shared body marker\n").unwrap();
+        let mut terminal = workspace.terminal(&["--no-session", "shared.txt"]);
+        terminal.wait_for("NORMAL");
+        terminal.send(b"iKEEP-");
+        terminal.wait_for("KEEP-shared body marker");
+        terminal.normal_mode();
+        terminal.ex("vsplit");
+        terminal.wait_for("NORMAL");
+        terminal.wait_for_copies("KEEP-shared body marker", 2);
+
+        terminal.ex(quit);
+        terminal.wait_for("NORMAL");
+        terminal.wait_for_copies("KEEP-shared body marker", 1);
+        terminal.wait_for("shared.txt [+]");
+        assert!(terminal.child.try_wait().unwrap().is_none());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "shared body marker\n");
+        terminal.ex("wq");
+        terminal.finish();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "KEEP-shared body marker\n"
+        );
+        assert_eq!(workspace.session().panes.len(), 1);
+    }
+}
+
+#[test]
+fn terminal_quit_protects_a_dirty_sole_view_and_force_discards_only_that_split() {
+    let workspace = Workspace::new();
+    let first = workspace.project.join("first.txt");
+    let second = workspace.project.join("second.txt");
+    fs::write(&first, "first body marker\n").unwrap();
+    fs::write(&second, "second body marker\n").unwrap();
+    let mut terminal = workspace.terminal(&["--no-session", "first.txt"]);
+    terminal.wait_for("NORMAL");
+    terminal.send(b"iKEEP-");
+    terminal.wait_for("KEEP-first body marker");
+    terminal.normal_mode();
+    terminal.ex("split second.txt");
+    terminal.wait_for("NORMAL");
+    terminal.wait_for("second body marker");
+    terminal.send(b"iDISCARD-");
+    terminal.wait_for("DISCARD-second body marker");
+    terminal.normal_mode();
+
+    terminal.ex("q");
+    terminal.wait_for("NORMAL");
+    terminal.wait_for("second.txt [+]");
+    terminal.wait_for("DISCARD-second body marker");
+    terminal.wait_for("KEEP-first body marker");
+    assert!(terminal.child.try_wait().unwrap().is_none());
+    terminal.ex("q!");
+    terminal.wait_for("NORMAL");
+    terminal.wait_for_copies("second body marker", 0);
+    terminal.wait_for("first.txt [+]");
+    terminal.wait_for_copies("KEEP-first body marker", 1);
+    assert!(terminal.child.try_wait().unwrap().is_none());
+    assert_eq!(fs::read_to_string(&second).unwrap(), "second body marker\n");
+    terminal.ex("wq");
+    terminal.finish();
+
+    assert_eq!(
+        fs::read_to_string(&first).unwrap(),
+        "KEEP-first body marker\n"
+    );
+    assert_eq!(fs::read_to_string(&second).unwrap(), "second body marker\n");
+    let session = workspace.session();
+    assert_eq!(session.panes.len(), 1);
+    assert_eq!(session.panes[0].file, first);
+}
+
+#[test]
+fn terminal_write_quit_saves_and_closes_only_the_active_split() {
+    let workspace = Workspace::new();
+    let first = workspace.project.join("first.txt");
+    let second = workspace.project.join("second.txt");
+    fs::write(&first, "first body marker\n").unwrap();
+    fs::write(&second, "second body marker\n").unwrap();
+    let mut terminal = workspace.terminal(&["--no-session", "first.txt"]);
+    terminal.wait_for("NORMAL");
+    terminal.ex("vsplit second.txt");
+    terminal.wait_for("NORMAL");
+    terminal.wait_for("second body marker");
+    terminal.send(b"iSAVED-");
+    terminal.wait_for("SAVED-second body marker");
+    terminal.normal_mode();
+
+    terminal.ex("wq");
+    terminal.wait_for("NORMAL");
+    terminal.wait_for_copies("second body marker", 0);
+    terminal.wait_for_copies("first body marker", 1);
+    assert!(terminal.child.try_wait().unwrap().is_none());
+    assert_eq!(
+        fs::read_to_string(&second).unwrap(),
+        "SAVED-second body marker\n"
+    );
+    assert_eq!(fs::read_to_string(&first).unwrap(), "first body marker\n");
+    terminal.send(b"iSTILL-EDITING-");
+    terminal.wait_for("STILL-EDITING-first body marker");
+    terminal.normal_mode();
+    terminal.ex("wq");
+    terminal.finish();
+
+    assert_eq!(
+        fs::read_to_string(&first).unwrap(),
+        "STILL-EDITING-first body marker\n"
+    );
+    let session = workspace.session();
+    assert_eq!(session.files, vec![first.clone(), second]);
+    assert_eq!(session.panes.len(), 1);
+    assert_eq!(session.panes[0].file, first);
+}
+
+#[test]
+fn terminal_force_quit_of_last_pane_reveals_another_hidden_dirty_buffer() {
+    let workspace = Workspace::new();
+    let first = workspace.project.join("first.txt");
+    let second = workspace.project.join("second.txt");
+    fs::write(&first, "first body marker\n").unwrap();
+    fs::write(&second, "second body marker\n").unwrap();
+    let mut terminal = workspace.terminal(&["--no-session", "first.txt"]);
+    terminal.wait_for("NORMAL");
+    terminal.send(b"iKEEP-");
+    terminal.wait_for("KEEP-first body marker");
+    terminal.normal_mode();
+    terminal.ex("e second.txt");
+    terminal.wait_for("NORMAL");
+    terminal.wait_for_copies("first body marker", 0);
+    terminal.send(b"iDISCARD-");
+    terminal.wait_for("DISCARD-second body marker");
+    terminal.normal_mode();
+
+    terminal.ex("q!");
+    terminal.wait_for("NORMAL");
+    terminal.wait_for("first.txt [+]");
+    terminal.wait_for_copies("KEEP-first body marker", 1);
+    terminal.wait_for_copies("second body marker", 0);
+    assert!(terminal.child.try_wait().unwrap().is_none());
+    terminal.ex("wq");
+    terminal.finish();
+
+    assert_eq!(
+        fs::read_to_string(&first).unwrap(),
+        "KEEP-first body marker\n"
+    );
+    assert_eq!(fs::read_to_string(&second).unwrap(), "second body marker\n");
+    let session = workspace.session();
+    assert_eq!(session.files, vec![first.clone()]);
+    assert_eq!(session.panes.len(), 1);
+    assert_eq!(session.panes[0].file, first);
 }
 
 #[test]

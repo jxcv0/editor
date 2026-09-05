@@ -9,6 +9,7 @@ use crate::process::{
     SupervisedChild,
 };
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
@@ -19,6 +20,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_STATUS_ERROR_BYTES: usize = 4 * 1024;
+const MAX_ACTIVE_PATHS: usize = 4096;
+const MAX_ACTIVE_PATH_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CodexRunMode {
@@ -145,6 +148,17 @@ pub struct CodexJsonEvent {
     pub payload: Value,
 }
 
+impl CodexJsonEvent {
+    /// Current codex-watch uses a status envelope; older peers name the event directly.
+    pub fn state_name(&self) -> &str {
+        if self.kind == "status" {
+            self.payload["state"].as_str().unwrap_or(&self.kind)
+        } else {
+            &self.kind
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum CodexWatchEvent {
     Status(CodexWatchStatus),
@@ -264,6 +278,9 @@ impl CodexWatch {
             enabled: false,
             run_mode: None,
             generation: 0,
+            active_paths: BTreeSet::new(),
+            active_path_bytes: 0,
+            had_task_failure: false,
         };
         let worker = thread::Builder::new()
             .name("editor-codex-watch".to_owned())
@@ -444,6 +461,10 @@ struct CodexWorker {
     enabled: bool,
     run_mode: Option<CodexRunMode>,
     generation: u64,
+    // Retain only files being processed, not all files visited by a long-lived watcher.
+    active_paths: BTreeSet<String>,
+    active_path_bytes: usize,
+    had_task_failure: bool,
 }
 
 impl CodexWorker {
@@ -550,6 +571,7 @@ impl CodexWorker {
             return;
         };
 
+        self.reset_task_progress();
         self.generation = self.generation.saturating_add(1);
         self.publisher.transition(
             CodexWatchState::Starting,
@@ -612,6 +634,7 @@ impl CodexWorker {
     }
 
     fn stop_current(&mut self) {
+        self.reset_task_progress();
         let Some(mut runtime) = self.runtime.take() else {
             self.transition(
                 if self.enabled {
@@ -736,6 +759,7 @@ impl CodexWorker {
         }
 
         if let Some(error) = fatal_error {
+            self.reset_task_progress();
             let generation = runtime.generation;
             let _ = runtime.child.terminate(Duration::ZERO);
             self.publisher.transition(
@@ -773,6 +797,7 @@ impl CodexWorker {
                         return;
                     }
                     let error = "codex-watch output remained open after process exit".to_owned();
+                    self.reset_task_progress();
                     let _ = runtime.child.terminate(Duration::ZERO);
                     self.publisher.transition(
                         CodexWatchState::Failed,
@@ -790,14 +815,20 @@ impl CodexWorker {
                 let previous_state = lock_unpoison(&self.publisher.status).state;
                 let (state, error) = match runtime.kind {
                     CodexRunKind::Once
-                        if exit.success && previous_state != CodexWatchState::Failed =>
+                        if exit.success
+                            && !self.had_task_failure
+                            && previous_state != CodexWatchState::Failed =>
                     {
                         (CodexWatchState::Completed, None)
                     }
-                    CodexRunKind::Once if previous_state == CodexWatchState::Failed => (
-                        CodexWatchState::Failed,
-                        Some("codex-watch reported a failed task".to_owned()),
-                    ),
+                    CodexRunKind::Once
+                        if self.had_task_failure || previous_state == CodexWatchState::Failed =>
+                    {
+                        (
+                            CodexWatchState::Failed,
+                            Some("codex-watch reported a failed task".to_owned()),
+                        )
+                    }
                     CodexRunKind::Once => (
                         CodexWatchState::Failed,
                         Some(exit_description("codex-watch run", exit.code)),
@@ -813,6 +844,7 @@ impl CodexWorker {
                 if let Some(error) = &error {
                     self.publisher.emit(CodexWatchEvent::Error(error.clone()));
                 }
+                self.reset_task_progress();
                 self.publisher.transition(
                     state,
                     self.enabled,
@@ -825,6 +857,7 @@ impl CodexWorker {
                 );
             }
             Err(error) => {
+                self.reset_task_progress();
                 let message = format!("failed to inspect codex-watch process: {error}");
                 let _ = runtime.child.terminate(Duration::ZERO);
                 self.publisher.transition(
@@ -858,15 +891,58 @@ impl CodexWorker {
     fn consume_line(&mut self, line: &[u8]) -> Result<(), String> {
         let event = parse_event_line(line, self.config.max_event_line_bytes)
             .map_err(|error| format!("malformed codex-watch event: {error}"))?;
-        self.apply_event_state(&event);
+        self.apply_event_state(&event)?;
         self.publisher.emit(CodexWatchEvent::Json(event));
         Ok(())
     }
 
-    fn apply_event_state(&self, event: &CodexJsonEvent) {
-        let normalized = event.kind.to_ascii_lowercase().replace('-', "_");
+    fn reset_task_progress(&mut self) {
+        self.active_paths.clear();
+        self.active_path_bytes = 0;
+        self.had_task_failure = false;
+    }
+
+    fn apply_event_state(&mut self, event: &CodexJsonEvent) -> Result<(), String> {
+        let normalized = event.state_name().to_ascii_lowercase().replace('-', "_");
         let current = lock_unpoison(&self.publisher.status).clone();
-        let state = if normalized.contains("watch") && normalized.contains("start") {
+        let state = if event.kind == "status" {
+            let path = event.payload["path"].as_str().unwrap_or("");
+            match normalized.as_str() {
+                "preparing" | "waiting" | "retrying" => {
+                    if !self.active_paths.contains(path) {
+                        if self.active_paths.len() >= MAX_ACTIVE_PATHS
+                            || path.len() > MAX_ACTIVE_PATH_BYTES - self.active_path_bytes
+                        {
+                            return Err(
+                                "codex-watch active task tracking limit exceeded".to_owned()
+                            );
+                        }
+                        self.active_paths.insert(path.to_owned());
+                        self.active_path_bytes += path.len();
+                    }
+                    Some(CodexWatchState::Processing)
+                }
+                "applied" | "previewed" | "failed" | "idle" => {
+                    let removed = self.active_paths.remove(path);
+                    if removed {
+                        self.active_path_bytes -= path.len();
+                    }
+                    if !self.active_paths.is_empty() {
+                        Some(CodexWatchState::Processing)
+                    } else {
+                        match normalized.as_str() {
+                            "applied" | "previewed" => Some(CodexWatchState::Completed),
+                            "failed" => Some(CodexWatchState::Failed),
+                            "idle" if removed => Some(CodexWatchState::Watching),
+                            // A scan of an unrelated file must not erase the latest
+                            // completion/error or interrupt a legacy processing event.
+                            _ => None,
+                        }
+                    }
+                }
+                _ => None,
+            }
+        } else if normalized.contains("watch") && normalized.contains("start") {
             Some(CodexWatchState::Watching)
         } else if normalized.contains("fail") || normalized == "error" {
             Some(CodexWatchState::Failed)
@@ -885,6 +961,8 @@ impl CodexWorker {
             None
         };
         if let Some(state) = state {
+            let failed = normalized == "failed" || state == CodexWatchState::Failed;
+            self.had_task_failure |= failed;
             self.publisher.transition(
                 state,
                 current.enabled,
@@ -893,13 +971,10 @@ impl CodexWorker {
                 current.pid,
                 current.generation,
                 current.last_exit_code,
-                if state == CodexWatchState::Failed {
-                    event_message(event)
-                } else {
-                    None
-                },
+                if failed { event_message(event) } else { None },
             );
         }
+        Ok(())
     }
 
     fn report_error(&self, error: String) {
@@ -988,6 +1063,9 @@ mod tests {
             enabled: false,
             run_mode: None,
             generation: 0,
+            active_paths: BTreeSet::new(),
+            active_path_bytes: 0,
+            had_task_failure: false,
         };
         (worker, event_rx)
     }
@@ -1006,6 +1084,164 @@ mod tests {
             matches!(event, CodexWatchEvent::Error(message) if message.contains(expected))
         })
         });
+    }
+
+    fn task_status(worker: &mut CodexWorker, state: &str, path: &str) -> CodexWatchStatus {
+        worker
+            .consume_line(
+                serde_json::to_string(&json!({
+                    "version": 1, "type": "status", "state": state, "path": path,
+                    "line": 89, "task": 1, "message": "task detail"
+                }))
+                .unwrap()
+                .as_bytes(),
+            )
+            .unwrap();
+        lock_unpoison(&worker.publisher.status).clone()
+    }
+
+    #[test]
+    fn real_status_events_track_overlapping_tasks_without_idle_hiding_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut worker, events) = worker(CodexWatchConfig::new(directory.path()));
+        for state in ["preparing", "waiting", "retrying"] {
+            assert_eq!(
+                task_status(&mut worker, state, "/project/a.rs").state,
+                CodexWatchState::Processing
+            );
+        }
+        assert_eq!(worker.active_paths.len(), 1);
+        assert_eq!(worker.active_path_bytes, "/project/a.rs".len());
+        for state in ["queued", "idle", "future_state"] {
+            assert_eq!(
+                task_status(&mut worker, state, "/project/unrelated.rs").state,
+                CodexWatchState::Processing
+            );
+        }
+        task_status(&mut worker, "preparing", "/project/b.rs");
+        assert_eq!(
+            task_status(&mut worker, "applied", "/project/a.rs").state,
+            CodexWatchState::Processing
+        );
+        assert_eq!(
+            task_status(&mut worker, "previewed", "/project/b.rs").state,
+            CodexWatchState::Completed
+        );
+        assert!(worker.active_paths.is_empty());
+        assert_eq!(worker.active_path_bytes, 0);
+        assert!(events.try_iter().any(|event| matches!(event,
+            CodexWatchEvent::Json(event) if event.kind == "status"
+                && event.state_name() == "applied" && event.payload["line"] == 89
+        )));
+
+        task_status(&mut worker, "preparing", "/project/a.rs");
+        task_status(&mut worker, "retrying", "/project/a.rs");
+        assert_eq!(
+            task_status(&mut worker, "idle", "/project/a.rs").state,
+            CodexWatchState::Watching
+        );
+        assert!(worker.active_paths.is_empty());
+    }
+
+    #[test]
+    fn task_failures_remain_visible_while_other_files_are_processing() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut worker, _events) = worker(CodexWatchConfig::new(directory.path()));
+        task_status(&mut worker, "preparing", "a.rs");
+        task_status(&mut worker, "preparing", "b.rs");
+        let status = task_status(&mut worker, "failed", "a.rs");
+        assert_eq!(status.state, CodexWatchState::Processing);
+        assert_eq!(status.last_error.as_deref(), Some("task detail"));
+        assert!(worker.had_task_failure);
+        assert_eq!(
+            task_status(&mut worker, "failed", "b.rs").state,
+            CodexWatchState::Failed
+        );
+        assert_eq!(
+            task_status(&mut worker, "idle", "unrelated.rs").state,
+            CodexWatchState::Failed
+        );
+        worker.stop_current();
+        assert!(!worker.had_task_failure);
+        assert!(worker.active_paths.is_empty());
+    }
+
+    #[test]
+    fn active_task_tracking_bounds_paths_and_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = CodexWatchConfig::new(directory.path());
+        config.max_event_line_bytes = MAX_ACTIVE_PATH_BYTES + 256;
+        let (mut worker, _events) = worker(config);
+        for index in 0..MAX_ACTIVE_PATHS {
+            task_status(&mut worker, "preparing", &format!("{index}.rs"));
+        }
+        let event = parse_event_line(
+            br#"{"type":"status","state":"preparing","path":"excess.rs"}"#,
+            256,
+        )
+        .unwrap();
+        assert!(
+            worker
+                .apply_event_state(&event)
+                .unwrap_err()
+                .contains("limit")
+        );
+        assert_eq!(worker.active_paths.len(), MAX_ACTIVE_PATHS);
+        worker.stop_current();
+        assert!(worker.active_paths.is_empty());
+        assert_eq!(worker.active_path_bytes, 0);
+
+        let path = "a".repeat(MAX_ACTIVE_PATH_BYTES);
+        task_status(&mut worker, "preparing", &path);
+        task_status(&mut worker, "waiting", &path);
+        assert_eq!(worker.active_paths.len(), 1);
+        assert!(
+            worker
+                .apply_event_state(&event)
+                .unwrap_err()
+                .contains("limit")
+        );
+        task_status(&mut worker, "idle", &path);
+        assert_eq!(worker.active_path_bytes, 0);
+        worker.apply_event_state(&event).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn once_run_preserves_an_earlier_task_failure_and_restart_clears_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut worker, _events) = worker(echo_config(directory.path()));
+        worker.enabled = true;
+        worker.run_mode = Some(CodexRunMode::DryRun);
+        worker.start_kind(CodexRunKind::Once);
+        let runtime = worker.runtime.as_mut().unwrap();
+        runtime.child.write_all(concat!(
+            "{\"version\":1,\"type\":\"status\",\"state\":\"preparing\",\"path\":\"a.rs\"}\n",
+            "{\"version\":1,\"type\":\"status\",\"state\":\"preparing\",\"path\":\"b.rs\"}\n",
+            "{\"version\":1,\"type\":\"status\",\"state\":\"failed\",\"path\":\"a.rs\",\"message\":\"failed a\"}\n",
+            "{\"version\":1,\"type\":\"status\",\"state\":\"applied\",\"path\":\"b.rs\"}\n"
+        ).as_bytes()).unwrap();
+        runtime.child.close_stdin();
+        wait_until(|| {
+            worker.pump();
+            worker.runtime.is_none()
+        });
+        let status = lock_unpoison(&worker.publisher.status).clone();
+        assert_eq!(status.last_exit_code, Some(0));
+        assert_eq!(status.state, CodexWatchState::Failed);
+        assert!(status.last_error.unwrap().contains("failed task"));
+        assert!(worker.active_paths.is_empty());
+        worker.start_kind(CodexRunKind::Watch);
+        assert!(!worker.had_task_failure);
+        task_status(&mut worker, "waiting", "unfinished.rs");
+        worker.handle_command(CodexCommand::Restart);
+        assert!(worker.active_paths.is_empty());
+        assert_eq!(worker.active_path_bytes, 0);
+        assert_eq!(
+            lock_unpoison(&worker.publisher.status).state,
+            CodexWatchState::Watching
+        );
+        worker.stop_current();
     }
 
     #[cfg(unix)]

@@ -3302,11 +3302,11 @@ impl Editor {
             "w" | "write" => {
                 self.write_buffer(argument, forced);
             }
-            "q" | "quit" => self.close_buffer(forced),
+            "q" | "quit" => self.quit_pane(forced),
             "qa" | "qall" => self.quit_all(forced),
             "wq" | "x" => {
                 if self.write_buffer(argument, forced) {
-                    self.quit_all(forced);
+                    self.quit_pane(forced);
                 }
             }
             "e" | "edit" => {
@@ -3478,6 +3478,35 @@ impl Editor {
                 false
             }
         }
+    }
+
+    fn quit_pane(&mut self, forced: bool) {
+        let buffer = self.active_pane().buffer;
+        let shown_elsewhere = self
+            .panes
+            .iter()
+            .any(|pane| pane.id != self.active_pane && pane.buffer == buffer);
+        if self.active_buffer().is_dirty() && !shown_elsewhere {
+            if !forced {
+                self.message("Buffer has unsaved changes; use :w to save or :q! to discard it");
+                return;
+            }
+            // Discard only an abandoned buffer. A duplicate pane must retain
+            // its text, cursor, and undo history even when this quit is forced.
+            self.close_buffer(true);
+        }
+        if self.panes.len() > 1 {
+            self.close_pane();
+            return;
+        }
+        // A forced window quit does not authorize losing other dirty buffers.
+        // Surface the first one so it can be saved or explicitly discarded.
+        if let Some(index) = self.buffers.iter().position(|slot| slot.buffer.is_dirty()) {
+            self.switch_buffer(index);
+            self.message("Another buffer has unsaved changes; use :w to save, :q! to discard it, or :qa! to discard all");
+            return;
+        }
+        self.should_quit = true;
     }
 
     fn quit_all(&mut self, forced: bool) {
@@ -3720,7 +3749,7 @@ impl Editor {
     fn close_buffer(&mut self, forced: bool) {
         let index = self.active_pane().buffer;
         if self.buffers[index].buffer.is_dirty() && !forced {
-            self.message("Buffer has unsaved changes; use :q! or :bd! to discard it");
+            self.message("Buffer has unsaved changes; use :bd! to discard it");
             return;
         }
         if self.buffers.len() == 1 {
@@ -4230,37 +4259,200 @@ mod tests {
     }
 
     #[test]
-    fn q_closes_only_the_active_buffer_and_protects_unsaved_text() {
+    fn bd_deletes_the_active_buffer_and_keeps_a_scratch_when_no_buffers_remain() {
         let mut editor = editor("first");
         editor.open_scratch_text("[clean]", "");
 
-        editor.execute_ex("q");
+        editor.execute_ex("bd");
 
         assert_eq!(editor.buffers.len(), 1);
         assert_eq!(editor.active_buffer().text(), "first");
         assert!(!editor.should_quit);
 
         editor.open_scratch_text("[stdin]", "important");
-        editor.execute_ex("q");
+        editor.execute_ex("bd");
 
         assert_eq!(editor.buffers.len(), 2);
         assert_eq!(editor.active_buffer().text(), "important");
         assert!(
             editor
                 .current_message()
-                .is_some_and(|message| message.contains(":q!"))
+                .is_some_and(|message| message.contains(":bd!"))
         );
 
-        editor.execute_ex("q!");
+        editor.execute_ex("bd!");
         assert_eq!(editor.buffers.len(), 1);
         assert_eq!(editor.active_buffer().text(), "first");
         assert!(!editor.should_quit);
 
-        editor.execute_ex("q");
+        editor.execute_ex("bd");
         assert_eq!(editor.buffers.len(), 1);
         assert!(editor.active_buffer().is_empty());
         assert_eq!(editor.active_slot().display_name, "[scratch]");
         assert!(!editor.should_quit);
+    }
+
+    #[test]
+    fn q_closes_the_active_split_retains_buffers_and_exits_on_the_last_pane() {
+        for command in ["q", "quit"] {
+            let mut editor = editor("first");
+            let first_pane = editor.active_pane;
+            editor.active_pane_mut().cursor = Pos::new(0, 2);
+            editor.split(Orientation::Vertical);
+            editor.open_scratch_text("[second]", "");
+            editor.execute_ex(command);
+            assert!(!editor.should_quit);
+            assert_eq!(editor.panes.len(), 1);
+            assert_eq!(editor.active_pane, first_pane);
+            assert!(matches!(editor.layout, Layout::Leaf(id) if id == first_pane));
+            assert_eq!(editor.active_pane().cursor, Pos::new(0, 2));
+            assert_eq!(editor.active_buffer().text(), "first");
+            assert_eq!(editor.buffers.len(), 2);
+
+            editor.execute_ex(command);
+            assert!(editor.should_quit);
+            assert_eq!(editor.active_buffer().text(), "first");
+            assert_eq!(editor.buffers.len(), 2);
+        }
+    }
+
+    #[test]
+    fn quitting_a_duplicate_pane_preserves_dirty_text_and_undo_history() {
+        for command in ["q", "q!"] {
+            let mut editor = editor("original");
+            editor
+                .active_buffer_mut()
+                .insert(Pos::new(0, 8), " changed")
+                .unwrap();
+            editor.active_pane_mut().cursor = Pos::new(0, 3);
+            let first_pane = editor.active_pane;
+            editor.split(Orientation::Horizontal);
+            editor.split(Orientation::Vertical);
+            editor.execute_ex(command);
+            assert_eq!(editor.panes.len(), 2);
+            assert!(!editor.should_quit);
+            editor.execute_ex(command);
+            assert_eq!(editor.panes.len(), 1);
+            assert_eq!(editor.active_pane, first_pane);
+            assert_eq!(editor.active_pane().cursor, Pos::new(0, 3));
+            assert_eq!(editor.buffers.len(), 1);
+            assert_eq!(editor.active_buffer().text(), "original changed");
+            assert!(editor.active_buffer().is_dirty());
+            assert!(editor.active_buffer_mut().undo().unwrap());
+            assert_eq!(editor.active_buffer().text(), "original");
+        }
+    }
+
+    #[test]
+    fn q_protects_an_abandoned_dirty_buffer_and_q_bang_discards_only_that_buffer() {
+        let mut editor = editor("first");
+        let first_pane = editor.active_pane;
+        editor.active_pane_mut().cursor = Pos::new(0, 2);
+        editor.split(Orientation::Vertical);
+        editor.open_scratch_text("[second]", "unsaved");
+        let second_pane = editor.active_pane;
+        editor.execute_ex("q");
+        assert!(!editor.should_quit);
+        assert_eq!(editor.panes.len(), 2);
+        assert_eq!(editor.active_pane, second_pane);
+        assert_eq!(editor.active_buffer().text(), "unsaved");
+        assert!(editor.current_message().unwrap().contains(":q!"));
+
+        editor.execute_ex("quit!");
+        assert!(!editor.should_quit);
+        assert_eq!(editor.panes.len(), 1);
+        assert_eq!(editor.active_pane, first_pane);
+        assert_eq!(editor.active_pane().cursor, Pos::new(0, 2));
+        assert_eq!(editor.buffers.len(), 1);
+        assert_eq!(editor.active_buffer().text(), "first");
+        editor.execute_ex("q");
+        assert!(editor.should_quit);
+    }
+
+    #[test]
+    fn quitting_the_last_pane_protects_dirty_hidden_buffers_even_when_forced() {
+        for command in ["q", "q!"] {
+            let mut editor = editor("hidden");
+            editor
+                .active_buffer_mut()
+                .insert(Pos::new(0, 6), " changed")
+                .unwrap();
+            editor.open_scratch_text("[clean]", "");
+            editor.execute_ex(command);
+            assert!(!editor.should_quit);
+            assert_eq!(editor.panes.len(), 1);
+            assert_eq!(editor.active_buffer().text(), "hidden changed");
+            assert_eq!(editor.buffers.len(), 2);
+            assert!(editor.current_message().unwrap().contains(":qa!"));
+        }
+
+        let mut editor = editor("hidden");
+        editor
+            .active_buffer_mut()
+            .insert(Pos::new(0, 6), " changed")
+            .unwrap();
+        editor.open_scratch_text("[active]", "discard me");
+        editor.execute_ex("q!");
+        assert!(!editor.should_quit);
+        assert_eq!(editor.buffers.len(), 1);
+        assert_eq!(editor.active_buffer().text(), "hidden changed");
+        editor.execute_ex("q");
+        assert!(!editor.should_quit);
+        assert_eq!(editor.active_buffer().text(), "hidden changed");
+        editor.execute_ex("q!");
+        assert!(editor.should_quit);
+    }
+
+    #[test]
+    fn write_and_quit_closes_one_pane_only_after_a_successful_save() {
+        for command in ["wq", "x"] {
+            let directory = tempfile::tempdir().unwrap();
+            let file = directory.path().join("save.txt");
+            std::fs::write(&file, "original").unwrap();
+            let mut editor = Editor::new(Config::default(), directory.path().to_owned());
+            editor.open_path(&file).unwrap();
+            editor.discard_initial_scratch();
+            editor
+                .active_buffer_mut()
+                .insert(Pos::new(0, 8), " changed")
+                .unwrap();
+            editor.split(Orientation::Vertical);
+            editor.execute_ex(command);
+            assert_eq!(editor.panes.len(), 1);
+            assert!(!editor.should_quit);
+            assert_eq!(editor.active_buffer().text(), "original changed");
+            assert!(!editor.active_buffer().is_dirty());
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "original changed");
+            editor.execute_ex(command);
+            assert!(editor.should_quit);
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let mut editor = Editor::new(Config::default(), directory.path().to_owned());
+        editor.split(Orientation::Vertical);
+        editor.open_scratch_text("[unsaved]", "keep me");
+        editor.execute_ex("wq missing-parent/new.txt");
+        assert_eq!(editor.panes.len(), 2);
+        assert!(!editor.should_quit);
+        assert_eq!(editor.active_buffer().text(), "keep me");
+    }
+
+    #[test]
+    fn forced_write_and_quit_does_not_discard_other_dirty_buffers() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("save.txt");
+        std::fs::write(&file, "original").unwrap();
+        let mut editor = Editor::new(Config::default(), directory.path().to_owned());
+        editor.open_scratch_text("[hidden]", "keep me");
+        editor.open_path(&file).unwrap();
+        editor
+            .active_buffer_mut()
+            .insert(Pos::new(0, 8), " changed")
+            .unwrap();
+        editor.execute_ex("wq!");
+        assert!(!editor.should_quit);
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "original changed");
+        assert_eq!(editor.active_buffer().text(), "keep me");
+        assert!(editor.active_buffer().is_dirty());
     }
 
     #[test]
