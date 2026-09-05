@@ -32,8 +32,11 @@ mutate editor text directly.
 
 The foreground `app::Runtime` thread owns `Editor`, terminal input, and
 rendering. It performs small, nonblocking polls of worker handles between input
-events. Project traversal and child-process work are isolated behind bounded
-queues:
+events. Idle ticks continue polling services but render only after input or a
+worker result changes visible state. `ui::FrameBuilder` retains line syntax
+and display checkpoints using buffer-provided line identities. Lexical work
+is capped at 16 KiB per line; the remainder remains readable as plain text.
+Project traversal and child-process work are isolated behind bounded queues:
 
 ```text
 terminal event -> input::Key -> editor::Editor -> buffer::Buffer
@@ -72,16 +75,24 @@ measured.
 - Positions use explicit `Pos` (line plus grapheme), `ByteOffset`, and
   `Utf16Pos` types. Conversions reject invalid boundaries.
 - One insert session or explicit operator/edit transaction is intended to
-  produce one undo node. Redo branches are retained within a configurable
-  history bound.
+  produce one undo node. Nodes retain byte-range changes, preserving exact
+  separators and byte boundaries even when edits join grapheme clusters.
+  Redo branches are retained within configurable entry and change-storage byte
+  bounds. An oversized committed change clears history; active transactions
+  retain rollback data until they end. Tree metadata is bounded by entry count.
 - A normal save checks the captured on-disk identity before replacement,
   preserves line separators/final-newline state, follows an existing symlink
   target, and preserves Unix mode bits where supported. Force-save is a
   separate API.
-- External-process input is untrusted and bounded. A dropped stdout event is a
-  protocol failure because framing can no longer be trusted.
+- External-process input is untrusted and bounded. Protocol stdout uses
+  cancellable backpressure instead of discarding bytes; stderr logs may drop
+  events. A separate bounded stdin writer preserves FIFO order without
+  preventing the integration worker from draining stdout or handling stop.
 - Project scans/searches are cancellable and result-bounded. Starting a new UI
-  query should drop/cancel stale work rather than queue unlimited scans.
+  query cancels stale work. The file-finder worker owns normalized relative
+  paths and reuses matching scratch storage; only current query/index results
+  reach the picker. Scan batches append to the index instead of republishing
+  the entire growing project. Regex compilation also runs in the search worker.
 - Persisted state and recovery formats are versioned. Session data contains
   paths/layout metadata, never buffer contents; recovery records hold dirty
   text separately.

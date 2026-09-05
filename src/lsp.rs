@@ -910,6 +910,11 @@ impl LspWorker {
     fn pump_runtime(&mut self, runtime: &mut LspRuntime) -> PumpOutcome {
         for event in runtime.child.drain_events(64) {
             match event {
+                ProcessEvent::WriteError(error) => {
+                    return PumpOutcome::Fail(format!(
+                        "failed writing rust-analyzer stdin: {error}"
+                    ));
+                }
                 ProcessEvent::Output {
                     stream: OutputStream::Stdout,
                     bytes,

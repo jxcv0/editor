@@ -35,10 +35,11 @@ use crate::{
 pub struct Runtime {
     pub editor: Editor,
     renderer: Renderer,
+    frame_builder: ui::FrameBuilder,
+    redraw: bool,
     rust_analyzer: Option<RustAnalyzerClient>,
     codex_watch: Option<CodexWatch>,
     project_scan: Option<BackgroundTask<ProjectEntry>>,
-    project_files: Vec<PathBuf>,
     project_search: Option<BackgroundTask<TextSearchMatch>>,
     project_search_results: Vec<PickerItem>,
     last_search_query: String,
@@ -92,6 +93,14 @@ impl PendingLspRequest {
 
 impl Runtime {
     pub fn new(editor: Editor, restore_session: bool) -> io::Result<Self> {
+        Self::with_state_root(editor, restore_session, state::state_dir())
+    }
+
+    fn with_state_root(
+        editor: Editor,
+        restore_session: bool,
+        state_root: Option<PathBuf>,
+    ) -> io::Result<Self> {
         let root = editor.explorer.root.clone();
         let mut ra_config = RustAnalyzerConfig::new(root.clone());
         ra_config.executable = PathBuf::from(&editor.config.tools.rust_analyzer.path);
@@ -119,7 +128,6 @@ impl Runtime {
         codex_config.max_event_line_bytes = editor.config.limits.tool_message_bytes;
         let codex_watch = CodexWatch::new(codex_config).ok();
 
-        let state_root = state::state_dir();
         let journal = state_root
             .as_ref()
             .and_then(|path| Journal::start(path.join("recovery")).ok());
@@ -131,10 +139,11 @@ impl Runtime {
         Ok(Self {
             editor,
             renderer: Renderer::new(),
+            frame_builder: ui::FrameBuilder::new(),
+            redraw: true,
             rust_analyzer,
             codex_watch,
             project_scan: None,
-            project_files: Vec::new(),
             project_search: None,
             project_search_results: Vec::new(),
             last_search_query: String::new(),
@@ -160,22 +169,21 @@ impl Runtime {
         self.start_background();
         while !self.editor.should_quit {
             let input = ui::poll_input(Duration::from_millis(25))?;
-            let idle = matches!(input, InputEvent::Tick);
-            match input {
-                InputEvent::Key(key) => self.editor.handle_key(key),
-                InputEvent::Paste(text) => self.editor.handle_paste(&text),
-                InputEvent::Resize | InputEvent::Focus | InputEvent::Tick => {}
+            self.handle_input(input);
+            if self.redraw {
+                self.render(&terminal)?;
             }
-            self.pump(idle);
-            self.render(&terminal)?;
         }
         self.save_session();
         Ok(())
     }
 
     fn render(&mut self, terminal: &TerminalSession) -> io::Result<()> {
+        self.redraw = false;
         let (width, height) = terminal.size()?;
-        let (canvas, cursor) = ui::draw_editor(&mut self.editor, width, height);
+        let (canvas, cursor) = self
+            .frame_builder
+            .draw_editor(&mut self.editor, width, height);
         self.sync_terminal_size();
         self.renderer
             .draw(&canvas, cursor, ui::cursor_style(&self.editor))
@@ -186,6 +194,7 @@ impl Runtime {
             return;
         }
         self.background_started = true;
+        self.redraw = true;
         self.restart_scan();
         if let Some(client) = &self.rust_analyzer {
             if let Err(error) = client.start() {
@@ -218,6 +227,17 @@ impl Runtime {
         }
     }
 
+    fn handle_input(&mut self, input: InputEvent) {
+        let idle = matches!(input, InputEvent::Tick);
+        self.redraw |= !idle;
+        match input {
+            InputEvent::Key(key) => self.editor.handle_key(key),
+            InputEvent::Paste(text) => self.editor.handle_paste(&text),
+            InputEvent::Resize | InputEvent::Focus | InputEvent::Tick => {}
+        }
+        self.pump(idle);
+    }
+
     fn pump(&mut self, idle: bool) {
         self.drain_terminal();
         self.handle_request();
@@ -225,6 +245,7 @@ impl Runtime {
         self.update_project_search();
         self.drain_project_scan();
         self.drain_project_search();
+        self.redraw |= self.editor.poll_file_finder();
         self.drain_lsp();
         self.drain_codex();
         self.restore_session_if_ready();
@@ -244,7 +265,7 @@ impl Runtime {
         if let Some(task) = self.project_scan.take() {
             task.cancel();
         }
-        self.project_files.clear();
+        self.editor.set_project_files(Vec::new());
         let options = project::ScanOptions {
             include_hidden: self.editor.explorer.show_hidden,
             include_ignored: self.editor.explorer.show_ignored,
@@ -260,11 +281,13 @@ impl Runtime {
             .as_ref()
             .map(|task| task.drain(256))
             .unwrap_or_default();
+        self.redraw |= !events.is_empty();
         let mut changed = false;
+        let mut files = Vec::new();
         for event in events {
             match event {
                 StreamEvent::Item(entry) if entry.is_file() => {
-                    self.project_files.push(entry.path);
+                    files.push(entry.path);
                     changed = true;
                 }
                 StreamEvent::Error(error) => self
@@ -279,7 +302,8 @@ impl Runtime {
             }
         }
         if changed {
-            self.editor.set_project_files(self.project_files.clone());
+            self.redraw = true;
+            self.editor.append_project_files(files);
         }
     }
 
@@ -327,6 +351,7 @@ impl Runtime {
             .as_ref()
             .map(|task| task.drain(256))
             .unwrap_or_default();
+        self.redraw |= !events.is_empty();
         let mut changed = false;
         for event in events {
             match event {
@@ -347,6 +372,7 @@ impl Runtime {
             }
         }
         if changed {
+            self.redraw = true;
             self.editor
                 .set_project_search_results(self.project_search_results.clone());
         }
@@ -420,6 +446,7 @@ impl Runtime {
             .as_ref()
             .map(|terminal| terminal.drain_output(256))
             .unwrap_or_default();
+        self.redraw |= !output.is_empty() && self.editor.terminal.visible;
         let mut read_error = None;
         for event in output {
             match event {
@@ -457,6 +484,7 @@ impl Runtime {
             None => None,
         };
         if let Some(status) = status {
+            self.redraw = true;
             self.terminal.take();
             self.editor.terminal.status = TerminalStatus::Exited(status.clone());
             if self.editor.focus == crate::editor::Focus::Terminal {
@@ -467,6 +495,7 @@ impl Runtime {
     }
 
     fn fail_terminal(&mut self, error: String) {
+        self.redraw = true;
         self.terminal.take();
         self.editor.terminal.status = TerminalStatus::Failed(error.clone());
         if self.editor.focus == crate::editor::Focus::Terminal {
@@ -555,6 +584,7 @@ impl Runtime {
             .as_ref()
             .map(|client| client.drain_events(128))
             .unwrap_or_default();
+        self.redraw |= !events.is_empty();
         for event in events {
             match event {
                 LspEvent::Status(status) => {
@@ -994,6 +1024,7 @@ impl Runtime {
     }
 
     fn discard_stale_diagnostics(&mut self) {
+        let previous_count = self.editor.diagnostics.len();
         self.editor.diagnostics.retain(|diagnostic| {
             self.editor
                 .buffers
@@ -1001,6 +1032,7 @@ impl Runtime {
                 .find(|slot| slot.buffer.path() == diagnostic.path.as_deref())
                 .is_none_or(|slot| diagnostic.version == slot.buffer.revision())
         });
+        self.redraw |= previous_count != self.editor.diagnostics.len();
     }
 
     fn command_codex(&mut self, command: CommandId) {
@@ -1114,6 +1146,7 @@ impl Runtime {
             .as_ref()
             .map(|watch| watch.drain_events(128))
             .unwrap_or_default();
+        self.redraw |= !events.is_empty();
         for event in events {
             match event {
                 CodexWatchEvent::Status(status) => {
@@ -1158,11 +1191,12 @@ impl Runtime {
                 .map(state::project_key)
                 .unwrap_or_else(|| format!("{project_key}-scratch-{index}"));
             if !slot.buffer.is_dirty() {
-                journal.remove(key.clone());
-                self.journal_versions.remove(&key);
+                if self.journal_versions.contains_key(&key) && journal.remove(key.clone()) {
+                    self.journal_versions.remove(&key);
+                }
                 continue;
             }
-            if self.journal_versions.get(&key) == Some(&slot.buffer.version()) {
+            if self.journal_versions.get(&key) == Some(&slot.buffer.revision()) {
                 continue;
             }
             let queued = journal.queue(RecoveryRecord {
@@ -1173,7 +1207,7 @@ impl Runtime {
                 text: slot.buffer.text(),
             });
             if queued {
-                self.journal_versions.insert(key, slot.buffer.version());
+                self.journal_versions.insert(key, slot.buffer.revision());
             }
         }
     }
@@ -1230,6 +1264,7 @@ impl Runtime {
             }
         }
         for message in messages {
+            self.redraw = true;
             self.editor.message(message);
         }
     }
@@ -1248,6 +1283,7 @@ impl Runtime {
         };
         self.session_rx = None;
         let Some(session) = session else { return };
+        self.redraw = true;
         if restore_session_state(&mut self.editor, session) {
             self.editor.message("Session restored");
         } else {
@@ -1600,6 +1636,67 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use tempfile::tempdir;
+
+    fn local_runtime(root: &Path) -> Runtime {
+        let editor = Editor::new(Config::default(), root.to_owned());
+        let mut runtime = Runtime::with_state_root(editor, false, None).unwrap();
+        runtime.rust_analyzer = None;
+        runtime.codex_watch = None;
+        runtime
+    }
+
+    #[test]
+    fn recovery_tracks_typing_without_closing_the_undo_transaction() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        runtime.journal = Some(Journal::start(directory.path().join("recovery")).unwrap());
+        for character in "iabc".chars() {
+            runtime
+                .editor
+                .handle_key(crate::input::Key::char(character));
+        }
+        let committed = runtime.editor.active_buffer().version();
+        runtime.journal_buffers();
+        for character in "def".chars() {
+            runtime
+                .editor
+                .handle_key(crate::input::Key::char(character));
+        }
+        assert_eq!(runtime.editor.active_buffer().version(), committed);
+        assert!(runtime.editor.active_buffer().in_transaction());
+        runtime.journal_buffers();
+        // Joining the writer makes this a deterministic test of persisted
+        // recovery text, rather than a timing assertion about queue delivery.
+        drop(runtime.journal.take());
+        let records = state::list_recoverable(&directory.path().join("recovery")).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text, "abcdef");
+    }
+
+    #[test]
+    fn idle_ticks_do_not_request_frames_but_input_and_results_do() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        runtime.redraw = false;
+        runtime.handle_input(InputEvent::Tick);
+        assert!(!runtime.redraw);
+        runtime.handle_input(InputEvent::Key(crate::input::Key::char('i')));
+        assert!(runtime.redraw);
+        runtime.redraw = false;
+        runtime.handle_input(InputEvent::Resize);
+        assert!(runtime.redraw);
+        runtime.redraw = false;
+        runtime.project_scan = Some(project::scan_project(directory.path(), Default::default()));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !runtime.redraw && Instant::now() < deadline {
+            runtime.handle_input(InputEvent::Tick);
+            thread::yield_now();
+        }
+        assert!(
+            runtime.redraw,
+            "background scan completion must update the frame"
+        );
+    }
 
     #[test]
     fn file_uri_decoding_is_utf8_and_percent_aware() {

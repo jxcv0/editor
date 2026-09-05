@@ -172,81 +172,208 @@ impl From<io::Error> for BufferError {
 
 pub type Result<T> = std::result::Result<T, BufferError>;
 
+/// A changed range, including exact separator ownership. A literal CR at the
+/// end of a line followed by LF is distinct from a CRLF separator even though
+/// their serialized bytes match; undo must not reparse that distinction away.
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct TextFragment {
+    lines: Vec<String>,
+    endings: Vec<LineEnding>,
+}
+
+impl TextFragment {
+    fn to_text(&self) -> String {
+        let mut text = String::new();
+        for (index, line) in self.lines.iter().enumerate() {
+            text.push_str(line);
+            if let Some(ending) = self.endings.get(index) {
+                text.push_str(ending.as_str());
+            }
+        }
+        text
+    }
+    fn heap_bytes(&self) -> usize {
+        self.lines.capacity() * std::mem::size_of::<String>()
+            + self.lines.iter().map(String::capacity).sum::<usize>()
+            + self.endings.capacity() * std::mem::size_of::<LineEnding>()
+    }
+}
+
+#[derive(Debug)]
 struct TextState {
-    // `endings[n]` follows `lines[n]`.  There is an ending for every line
-    // except an unterminated final line, so `endings.len()` is either
-    // `lines.len() - 1` or `lines.len()`.  Keeping separators individually
-    // lets mixed-ending files round-trip without exposing a phantom line for a
-    // final newline.
     lines: Vec<String>,
     endings: Vec<LineEnding>,
     preferred_ending: LineEnding,
+    line_info: Vec<LineInfo>,
+    content_hash: u64,
+    content_bytes: usize,
+    crlf_count: usize,
+}
+
+#[derive(Debug)]
+struct LineInfo {
+    hash: u64,
+    key: u64,
+    graphemes: std::sync::OnceLock<GraphemeIndex>,
+}
+
+#[derive(Debug)]
+enum GraphemeIndex {
+    Ascii,
+    Unicode(Vec<usize>),
+}
+
+static LINE_KEY: AtomicU64 = AtomicU64::new(1);
+
+impl LineInfo {
+    fn for_lines(lines: &[String]) -> Vec<Self> {
+        use std::hash::{Hash, Hasher};
+        let first = LINE_KEY.fetch_add(lines.len() as u64, Ordering::Relaxed);
+        lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let mut hash = std::collections::hash_map::DefaultHasher::new();
+                line.hash(&mut hash);
+                Self {
+                    hash: hash.finish(),
+                    key: first + index as u64,
+                    graphemes: std::sync::OnceLock::new(),
+                }
+            })
+            .collect()
+    }
+}
+
+impl Clone for TextState {
+    fn clone(&self) -> Self {
+        Self {
+            lines: self.lines.clone(),
+            endings: self.endings.clone(),
+            preferred_ending: self.preferred_ending,
+            line_info: self
+                .line_info
+                .iter()
+                .map(|line| LineInfo {
+                    hash: line.hash,
+                    key: line.key,
+                    graphemes: std::sync::OnceLock::new(),
+                })
+                .collect(),
+            content_hash: self.content_hash,
+            content_bytes: self.content_bytes,
+            crlf_count: self.crlf_count,
+        }
+    }
+}
+
+impl PartialEq for TextState {
+    fn eq(&self, other: &Self) -> bool {
+        self.signature() == other.signature()
+            && self.lines == other.lines
+            && self.endings == other.endings
+    }
+}
+impl Eq for TextState {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TextSignature {
+    hash: u64,
+    bytes: usize,
+    lines: usize,
+    endings: usize,
+    crlf: usize,
+    preferred: LineEnding,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BytePoint {
+    line: usize,
+    byte: usize,
 }
 
 impl TextState {
     fn empty() -> Self {
+        Self::parse("")
+    }
+
+    fn from_parts(
+        lines: Vec<String>,
+        endings: Vec<LineEnding>,
+        preferred_ending: LineEnding,
+    ) -> Self {
+        let line_info = LineInfo::for_lines(&lines);
+        let content_hash = line_info
+            .iter()
+            .fold(0u64, |sum, line| sum.wrapping_add(line.hash));
+        let content_bytes = lines.iter().map(String::len).sum();
+        let crlf_count = endings
+            .iter()
+            .filter(|ending| **ending == LineEnding::Crlf)
+            .count();
         Self {
-            lines: vec![String::new()],
-            endings: Vec::new(),
-            preferred_ending: LineEnding::Lf,
+            lines,
+            endings,
+            preferred_ending,
+            line_info,
+            content_hash,
+            content_bytes,
+            crlf_count,
+        }
+    }
+
+    fn signature(&self) -> TextSignature {
+        TextSignature {
+            hash: self.content_hash,
+            bytes: self.content_bytes,
+            lines: self.lines.len(),
+            endings: self.endings.len(),
+            crlf: self.crlf_count,
+            preferred: self.preferred_ending,
         }
     }
 
     fn parse(text: &str) -> Self {
-        let mut state = Self::parse_for_insertion(text);
+        let (mut lines, endings, preferred) = Self::parse_parts(text);
         if text.ends_with('\n') {
-            // The final empty segment denotes termination of the preceding
-            // line, not another line in a file loaded from disk.
-            state.lines.pop();
+            lines.pop();
         }
-        debug_assert!(state.invariant_holds());
-        state
+        Self::from_parts(lines, endings, preferred)
     }
 
-    /// Splits text for insertion, retaining the segment after its final line
-    /// separator so inserting `"\n"` actually creates another logical line.
-    fn parse_for_insertion(text: &str) -> Self {
+    fn parse_parts(text: &str) -> (Vec<String>, Vec<LineEnding>, LineEnding) {
         let mut lines = Vec::new();
         let mut endings = Vec::new();
         let mut start = 0;
-
         for (newline, _) in text.match_indices('\n') {
-            let before_newline = &text[start..newline];
-            if let Some(line) = before_newline.strip_suffix('\r') {
+            let before = &text[start..newline];
+            if let Some(line) = before.strip_suffix('\r') {
                 lines.push(line.to_owned());
                 endings.push(LineEnding::Crlf);
             } else {
-                lines.push(before_newline.to_owned());
+                lines.push(before.to_owned());
                 endings.push(LineEnding::Lf);
             }
             start = newline + 1;
         }
         lines.push(text[start..].to_owned());
-
-        let lf_count = endings
+        let crlf = endings
             .iter()
-            .filter(|ending| **ending == LineEnding::Lf)
+            .filter(|ending| **ending == LineEnding::Crlf)
             .count();
-        let crlf_count = endings.len() - lf_count;
-        let preferred_ending = if crlf_count > lf_count {
+        let preferred = if crlf * 2 > endings.len() {
             LineEnding::Crlf
-        } else if crlf_count == lf_count && crlf_count > 0 {
-            // On a tie, preserve the first style for newly inserted lines.
+        } else if crlf > 0 && crlf * 2 == endings.len() {
             endings[0]
         } else {
             LineEnding::Lf
         };
-
-        Self {
-            lines,
-            endings,
-            preferred_ending,
-        }
+        (lines, endings, preferred)
     }
 
     fn invariant_holds(&self) -> bool {
         !self.lines.is_empty()
+            && self.line_info.len() == self.lines.len()
             && (self.endings.len() + 1 == self.lines.len()
                 || self.endings.len() == self.lines.len())
     }
@@ -260,176 +387,326 @@ impl TextState {
             }
         }
     }
-
     fn to_bytes(&self) -> Vec<u8> {
-        let capacity = self.byte_len();
-        let mut output = Vec::with_capacity(capacity);
-        self.write_to(&mut output);
-        output
+        let mut out = Vec::with_capacity(self.byte_len());
+        self.write_to(&mut out);
+        out
     }
-
     fn byte_len(&self) -> usize {
-        self.lines.iter().map(String::len).sum::<usize>()
-            + self
-                .endings
-                .iter()
-                .map(|ending| ending.byte_len())
-                .sum::<usize>()
+        self.content_bytes + self.endings.len() + self.crlf_count
     }
-
     fn to_text(&self) -> String {
-        // Every stored line and separator is valid UTF-8.
         String::from_utf8(self.to_bytes()).expect("TextState only contains UTF-8")
     }
 
+    fn grapheme_index(&self, line: usize) -> Option<&GraphemeIndex> {
+        let text = self.lines.get(line)?;
+        Some(self.line_info[line].graphemes.get_or_init(|| {
+            if text.is_ascii() {
+                GraphemeIndex::Ascii
+            } else {
+                let mut offsets: Vec<_> =
+                    text.grapheme_indices(true).map(|(byte, _)| byte).collect();
+                offsets.push(text.len());
+                GraphemeIndex::Unicode(offsets)
+            }
+        }))
+    }
     fn grapheme_count(&self, line: usize) -> Option<usize> {
-        self.lines
-            .get(line)
-            .map(|line| line.graphemes(true).count())
+        Some(match self.grapheme_index(line)? {
+            GraphemeIndex::Ascii => self.lines[line].len(),
+            GraphemeIndex::Unicode(offsets) => offsets.len() - 1,
+        })
     }
-
     fn validate_pos(&self, pos: Pos) -> Result<()> {
-        match self.grapheme_count(pos.line) {
-            Some(count) if pos.grapheme <= count => Ok(()),
-            _ => Err(BufferError::InvalidPosition(pos)),
-        }
+        self.byte_in_line(pos).map(|_| ())
     }
-
     fn byte_in_line(&self, pos: Pos) -> Result<usize> {
-        self.validate_pos(pos)?;
-        let line = &self.lines[pos.line];
-        if pos.grapheme == line.graphemes(true).count() {
-            Ok(line.len())
-        } else {
-            // Validation above proves this index exists.
-            Ok(line
-                .grapheme_indices(true)
-                .nth(pos.grapheme)
-                .map(|(byte, _)| byte)
-                .expect("validated grapheme position"))
+        let line = self
+            .lines
+            .get(pos.line)
+            .ok_or(BufferError::InvalidPosition(pos))?;
+        if pos.grapheme == 0 {
+            return Ok(0);
         }
+        let index = &self.line_info[pos.line].graphemes;
+        if index.get().is_none() && line.is_ascii() {
+            let _ = index.set(GraphemeIndex::Ascii);
+        }
+        let byte = match index.get() {
+            Some(GraphemeIndex::Ascii) => (pos.grapheme <= line.len()).then_some(pos.grapheme),
+            Some(GraphemeIndex::Unicode(offsets)) => offsets.get(pos.grapheme).copied(),
+            // A cursor near the beginning of a cold Unicode line needs only
+            // its prefix. Full counts build an index when callers need EOF.
+            None => line
+                .grapheme_indices(true)
+                .map(|(byte, _)| byte)
+                .chain(std::iter::once(line.len()))
+                .nth(pos.grapheme),
+        };
+        byte.ok_or(BufferError::InvalidPosition(pos))
     }
-
-    fn grapheme_at_or_after_byte(line: &str, byte: usize) -> usize {
-        debug_assert!(byte <= line.len());
-        for (grapheme, (boundary, _)) in line.grapheme_indices(true).enumerate() {
-            if boundary >= byte {
-                return grapheme;
+    fn grapheme_at_or_after_byte(&self, line: usize, byte: usize) -> usize {
+        let text = &self.lines[line];
+        let index = &self.line_info[line].graphemes;
+        if index.get().is_none() && text.is_ascii() {
+            let _ = index.set(GraphemeIndex::Ascii);
+        }
+        match index.get() {
+            Some(GraphemeIndex::Ascii) => byte,
+            Some(GraphemeIndex::Unicode(offsets)) => {
+                offsets.partition_point(|boundary| *boundary < byte)
+            }
+            None => {
+                let mut count = 0;
+                for (grapheme, (boundary, _)) in text.grapheme_indices(true).enumerate() {
+                    if boundary >= byte {
+                        return grapheme;
+                    }
+                    count = grapheme + 1;
+                }
+                count
             }
         }
-        line.graphemes(true).count()
     }
-
-    fn selected_text(&self, range: TextRange) -> Result<String> {
-        let range = range.ordered();
-        self.validate_pos(range.start)?;
-        self.validate_pos(range.end)?;
-        if range.start > range.end {
-            return Err(BufferError::InvalidRange(range));
+    fn selected_bytes(&self, start: BytePoint, end: BytePoint) -> String {
+        if start.line == end.line {
+            return self.lines[start.line][start.byte..end.byte].to_owned();
         }
-
-        let start_byte = self.byte_in_line(range.start)?;
-        let end_byte = self.byte_in_line(range.end)?;
-        if range.start.line == range.end.line {
-            return Ok(self.lines[range.start.line][start_byte..end_byte].to_owned());
-        }
-
-        let mut selected = String::new();
-        selected.push_str(&self.lines[range.start.line][start_byte..]);
-        for line in range.start.line..range.end.line {
+        let mut selected = self.lines[start.line][start.byte..].to_owned();
+        for line in start.line..end.line {
             selected.push_str(self.endings[line].as_str());
-            if line + 1 < range.end.line {
+            if line + 1 < end.line {
                 selected.push_str(&self.lines[line + 1]);
             }
         }
-        selected.push_str(&self.lines[range.end.line][..end_byte]);
-        Ok(selected)
+        selected.push_str(&self.lines[end.line][..end.byte]);
+        selected
+    }
+    fn selected_fragment(&self, start: BytePoint, end: BytePoint) -> TextFragment {
+        if start.line == end.line {
+            return TextFragment {
+                lines: vec![self.lines[start.line][start.byte..end.byte].to_owned()],
+                endings: Vec::new(),
+            };
+        }
+        let mut lines = Vec::with_capacity(end.line - start.line + 1);
+        lines.push(self.lines[start.line][start.byte..].to_owned());
+        lines.extend(self.lines[start.line + 1..end.line].iter().cloned());
+        lines.push(self.lines[end.line][..end.byte].to_owned());
+        TextFragment {
+            lines,
+            endings: self.endings[start.line..end.line].to_vec(),
+        }
+    }
+    fn selected_text(&self, range: TextRange) -> Result<String> {
+        let range = range.ordered();
+        let start = BytePoint {
+            line: range.start.line,
+            byte: self.byte_in_line(range.start)?,
+        };
+        let end = BytePoint {
+            line: range.end.line,
+            byte: self.byte_in_line(range.end)?,
+        };
+        Ok(self.selected_bytes(start, end))
     }
 
-    fn insert(&mut self, at: Pos, text: &str) -> Result<Pos> {
-        let byte = self.byte_in_line(at)?;
-        if text.is_empty() {
-            return Ok(at);
-        }
-
-        let mut inserted = Self::parse_for_insertion(text);
-        let adopt_inserted_ending =
-            self.endings.is_empty() && self.lines.len() == 1 && self.lines[0].is_empty();
-        let inserted_preferred_ending = inserted.preferred_ending;
-        let new_ending = if adopt_inserted_ending {
-            inserted_preferred_ending
-        } else {
-            self.preferred_ending
-        };
-        // Inserted newlines are logical line breaks.  Normalize them to the
-        // buffer's established style so typing or bracketed paste cannot
-        // accidentally turn a CRLF file into a mixed-ending file.  Separators
-        // that were loaded from disk remain individually preserved.
-        inserted.endings.fill(new_ending);
-        if inserted.lines.len() == 1 {
-            self.lines[at.line].insert_str(byte, text);
-            let column = Self::grapheme_at_or_after_byte(&self.lines[at.line], byte + text.len());
-            return Ok(Pos::new(at.line, column));
-        }
-
-        let original = &self.lines[at.line];
-        let prefix = &original[..byte];
-        let suffix = &original[byte..];
-        let mut replacement = inserted.lines;
-        replacement[0].insert_str(0, prefix);
+    /// Applies already validated byte boundaries. Undo uses byte boundaries so
+    /// inserting or removing combining characters cannot invalidate its range.
+    fn splice_fragment(&mut self, start: BytePoint, end: BytePoint, fragment: &TextFragment) {
+        let mut replacement = fragment.lines.clone();
+        let endings = &fragment.endings;
+        replacement[0].insert_str(0, &self.lines[start.line][..start.byte]);
         replacement
             .last_mut()
-            .expect("parsed text always has a line")
-            .push_str(suffix);
-
-        let inserted_line_count = replacement.len();
-        let final_line = replacement.last().expect("replacement is nonempty");
-        let inserted_end_byte = final_line.len() - suffix.len();
-        let last_inserted_graphemes =
-            Self::grapheme_at_or_after_byte(final_line, inserted_end_byte);
-
-        self.lines.splice(at.line..=at.line, replacement);
-        self.endings
-            .splice(at.line..at.line, inserted.endings.iter().copied());
-        if adopt_inserted_ending {
-            self.preferred_ending = inserted_preferred_ending;
+            .unwrap()
+            .push_str(&self.lines[end.line][end.byte..]);
+        for line in start.line..=end.line {
+            self.content_hash = self.content_hash.wrapping_sub(self.line_info[line].hash);
+            self.content_bytes -= self.lines[line].len();
         }
+        for ending in &self.endings[start.line..end.line] {
+            self.crlf_count -= usize::from(*ending == LineEnding::Crlf);
+        }
+        for ending in endings {
+            self.crlf_count += usize::from(*ending == LineEnding::Crlf);
+        }
+        let info = LineInfo::for_lines(&replacement);
+        for (line, info) in replacement.iter().zip(&info) {
+            self.content_hash = self.content_hash.wrapping_add(info.hash);
+            self.content_bytes += line.len();
+        }
+        self.lines.splice(start.line..=end.line, replacement);
+        self.line_info.splice(start.line..=end.line, info);
+        self.endings
+            .splice(start.line..end.line, endings.iter().copied());
         debug_assert!(self.invariant_holds());
-
-        Ok(Pos::new(
-            at.line + inserted_line_count - 1,
-            last_inserted_graphemes,
-        ))
     }
 
-    fn delete(&mut self, range: TextRange) -> Result<String> {
+    fn replace(&mut self, range: TextRange, text: &str) -> Result<(Pos, String, Option<Change>)> {
         let range = range.ordered();
-        self.validate_pos(range.start)?;
-        self.validate_pos(range.end)?;
-        let deleted = self.selected_text(range)?;
-        if range.is_empty() {
-            return Ok(deleted);
-        }
-
-        let start_byte = self.byte_in_line(range.start)?;
-        let end_byte = self.byte_in_line(range.end)?;
-        if range.start.line == range.end.line {
-            self.lines[range.start.line].replace_range(start_byte..end_byte, "");
+        let start = BytePoint {
+            line: range.start.line,
+            byte: self.byte_in_line(range.start)?,
+        };
+        let before_end = BytePoint {
+            line: range.end.line,
+            byte: self.byte_in_line(range.end)?,
+        };
+        let before = self.selected_fragment(start, before_end);
+        let removed = before.to_text();
+        let (parts, mut endings, inserted_preferred) = Self::parse_parts(text);
+        let preferred_before = self.preferred_ending;
+        let empty_after_delete = self.lines.len() - (before_end.line - start.line) == 1
+            && start.byte == 0
+            && before_end.byte == self.lines[before_end.line].len()
+            && self.endings.len() == before_end.line - start.line;
+        let preferred_after = if parts.len() > 1 && empty_after_delete {
+            inserted_preferred
         } else {
-            let mut merged = self.lines[range.start.line][..start_byte].to_owned();
-            merged.push_str(&self.lines[range.end.line][end_byte..]);
-            self.lines
-                .splice(range.start.line..=range.end.line, [merged]);
-            self.endings.drain(range.start.line..range.end.line);
+            preferred_before
+        };
+        endings.fill(preferred_after);
+        let after_end = BytePoint {
+            line: start.line + parts.len() - 1,
+            byte: if parts.len() == 1 {
+                start.byte + parts[0].len()
+            } else {
+                parts.last().unwrap().len()
+            },
+        };
+        let after = TextFragment {
+            lines: parts,
+            endings,
+        };
+        let change = if before != after || preferred_before != preferred_after {
+            self.splice_fragment(start, before_end, &after);
+            self.preferred_ending = preferred_after;
+            Some(Change::Text {
+                start,
+                before_end,
+                after_end,
+                before,
+                after,
+                preferred_before,
+                preferred_after,
+            })
+        } else {
+            None
+        };
+        let cursor = Pos::new(
+            after_end.line,
+            self.grapheme_at_or_after_byte(after_end.line, after_end.byte),
+        );
+        Ok((cursor, removed, change))
+    }
+}
+
+#[derive(Clone, Debug)]
+enum Change {
+    Text {
+        start: BytePoint,
+        before_end: BytePoint,
+        after_end: BytePoint,
+        before: TextFragment,
+        after: TextFragment,
+        preferred_before: LineEnding,
+        preferred_after: LineEnding,
+    },
+    Whole {
+        before: Box<TextState>,
+        after: Box<TextState>,
+    },
+    Endings {
+        before: Vec<LineEnding>,
+        preferred_before: LineEnding,
+        after: LineEnding,
+    },
+}
+
+impl Change {
+    fn apply(&self, state: &mut TextState, forward: bool) {
+        match self {
+            Self::Text {
+                start,
+                before_end,
+                after_end,
+                before,
+                after,
+                preferred_before,
+                preferred_after,
+            } => {
+                state.splice_fragment(
+                    *start,
+                    if forward { *before_end } else { *after_end },
+                    if forward { after } else { before },
+                );
+                state.preferred_ending = if forward {
+                    *preferred_after
+                } else {
+                    *preferred_before
+                };
+            }
+            Self::Whole { before, after } => {
+                *state = if forward {
+                    after.as_ref()
+                } else {
+                    before.as_ref()
+                }
+                .clone()
+            }
+            Self::Endings {
+                before,
+                preferred_before,
+                after,
+            } => {
+                if forward {
+                    state.endings.fill(*after);
+                    state.preferred_ending = *after;
+                } else {
+                    state.endings.clone_from(before);
+                    state.preferred_ending = *preferred_before;
+                }
+                state.crlf_count = state
+                    .endings
+                    .iter()
+                    .filter(|ending| **ending == LineEnding::Crlf)
+                    .count();
+            }
         }
-        debug_assert!(self.invariant_holds());
-        Ok(deleted)
+    }
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Text { before, after, .. } => before.heap_bytes() + after.heap_bytes(),
+            Self::Whole { before, after } => [before, after]
+                .iter()
+                .map(|state| {
+                    std::mem::size_of::<TextState>()
+                        + state.lines.iter().map(String::capacity).sum::<usize>()
+                        + state.lines.capacity() * std::mem::size_of::<String>()
+                        + state.endings.capacity() * std::mem::size_of::<LineEnding>()
+                        + state.line_info.capacity() * std::mem::size_of::<LineInfo>()
+                        + state
+                            .line_info
+                            .iter()
+                            .map(|line| match line.graphemes.get() {
+                                Some(GraphemeIndex::Unicode(offsets)) => {
+                                    offsets.capacity() * std::mem::size_of::<usize>()
+                                }
+                                _ => 0,
+                            })
+                            .sum::<usize>()
+                })
+                .sum(),
+            Self::Endings { before, .. } => before.capacity() * std::mem::size_of::<LineEnding>(),
+        }
     }
 }
 
 #[derive(Clone, Debug)]
 struct UndoNode {
-    state: TextState,
+    changes: Vec<Change>,
     parent: Option<usize>,
     children: Vec<usize>,
     preferred_child: Option<usize>,
@@ -440,50 +717,62 @@ struct UndoHistory {
     nodes: Vec<UndoNode>,
     current: usize,
     limit: usize,
+    byte_limit: usize,
+    retained_bytes: usize,
 }
 
 impl UndoHistory {
     const DEFAULT_LIMIT: usize = 1_000;
-
-    fn new(initial: TextState) -> Self {
+    const DEFAULT_BYTE_LIMIT: usize = 64 * 1024 * 1024;
+    fn new() -> Self {
         Self {
             nodes: vec![UndoNode {
-                state: initial,
+                changes: Vec::new(),
                 parent: None,
                 children: Vec::new(),
                 preferred_child: None,
             }],
             current: 0,
             limit: Self::DEFAULT_LIMIT,
+            byte_limit: Self::DEFAULT_BYTE_LIMIT,
+            retained_bytes: 0,
         }
     }
-
-    fn reset(&mut self, state: TextState) {
-        let limit = self.limit;
-        *self = Self::new(state);
+    fn reset(&mut self) {
+        let (limit, byte_limit) = (self.limit, self.byte_limit);
+        *self = Self::new();
         self.limit = limit;
+        self.byte_limit = byte_limit;
     }
-
-    fn set_limit(&mut self, limit: usize, current_state: &TextState) {
+    fn set_limit(&mut self, limit: usize) {
         self.limit = limit.max(2);
         if self.nodes.len() > self.limit {
-            self.reset(current_state.clone());
+            self.reset();
         }
     }
-
-    fn commit(&mut self, state: TextState) {
-        // Snapshot history is intentionally bounded.  When the tree reaches
-        // the configured cap, retain the pre-change state as a new root so the
-        // change being committed is still immediately undoable.
-        if self.nodes.len() >= self.limit {
-            let before = self.nodes[self.current].state.clone();
-            self.reset(before);
+    fn set_byte_limit(&mut self, limit: usize) {
+        self.byte_limit = limit;
+        if self.retained_bytes > limit {
+            self.reset();
         }
-
+    }
+    fn commit(&mut self, changes: Vec<Change>) {
+        let bytes = changes.capacity() * std::mem::size_of::<Change>()
+            + changes.iter().map(Change::heap_bytes).sum::<usize>();
+        if self.nodes.len() >= self.limit
+            || self.retained_bytes.saturating_add(bytes) > self.byte_limit
+        {
+            self.reset();
+        }
+        // An individual edit larger than the budget remains applied, but must
+        // not retain an unbounded recovery copy in the undo tree.
+        if bytes > self.byte_limit {
+            return;
+        }
         let parent = self.current;
         let child = self.nodes.len();
         self.nodes.push(UndoNode {
-            state,
+            changes,
             parent: Some(parent),
             children: Vec::new(),
             preferred_child: None,
@@ -491,41 +780,50 @@ impl UndoHistory {
         self.nodes[parent].children.push(child);
         self.nodes[parent].preferred_child = Some(child);
         self.current = child;
+        self.retained_bytes += bytes;
     }
-
-    fn undo(&mut self) -> Option<TextState> {
+    fn undo(&mut self, state: &mut TextState) -> bool {
         let child = self.current;
-        let parent = self.nodes[child].parent?;
+        let Some(parent) = self.nodes[child].parent else {
+            return false;
+        };
+        for change in self.nodes[child].changes.iter().rev() {
+            change.apply(state, false);
+        }
         self.nodes[parent].preferred_child = Some(child);
         self.current = parent;
-        Some(self.nodes[parent].state.clone())
+        true
     }
-
-    fn redo(&mut self) -> Option<TextState> {
-        let current = self.current;
-        let child = self.nodes[current]
+    fn redo(&mut self, state: &mut TextState) -> bool {
+        let Some(child) = self.nodes[self.current]
             .preferred_child
-            .or_else(|| self.nodes[current].children.last().copied())?;
-        self.current = child;
-        Some(self.nodes[child].state.clone())
+            .or_else(|| self.nodes[self.current].children.last().copied())
+        else {
+            return false;
+        };
+        self.redo_to(child, state);
+        true
     }
-
-    fn redo_branch(&mut self, branch: usize) -> Option<TextState> {
-        let current = self.current;
-        let child = *self.nodes[current].children.get(branch)?;
-        self.nodes[current].preferred_child = Some(child);
-        self.current = child;
-        Some(self.nodes[child].state.clone())
+    fn redo_branch(&mut self, branch: usize, state: &mut TextState) -> bool {
+        let Some(child) = self.nodes[self.current].children.get(branch).copied() else {
+            return false;
+        };
+        self.redo_to(child, state);
+        true
     }
-
+    fn redo_to(&mut self, child: usize, state: &mut TextState) {
+        self.nodes[self.current].preferred_child = Some(child);
+        for change in &self.nodes[child].changes {
+            change.apply(state, true);
+        }
+        self.current = child;
+    }
     fn redo_branch_count(&self) -> usize {
         self.nodes[self.current].children.len()
     }
-
     fn can_undo(&self) -> bool {
         self.nodes[self.current].parent.is_some()
     }
-
     fn can_redo(&self) -> bool {
         !self.nodes[self.current].children.is_empty()
     }
@@ -533,7 +831,78 @@ impl UndoHistory {
 
 #[derive(Clone, Debug)]
 struct Transaction {
-    before: TextState,
+    before: TextSignature,
+    changes: Vec<Change>,
+}
+
+impl Transaction {
+    fn changed(&self, state: &TextState) -> bool {
+        if self.changes.is_empty() {
+            return false;
+        }
+        if self.before != state.signature() {
+            return true;
+        }
+        // Hashes only reject equality. For a possible net-zero transaction,
+        // reconstruct the original using borrowed unchanged lines, then compare
+        // exact text. This uncommon path copies metadata and touched text only.
+        use std::borrow::Cow;
+        let mut lines: Vec<Cow<'_, str>> = state
+            .lines
+            .iter()
+            .map(|line| Cow::Borrowed(line.as_str()))
+            .collect();
+        let mut endings = state.endings.clone();
+        let mut preferred = state.preferred_ending;
+        for change in self.changes.iter().rev() {
+            match change {
+                Change::Text {
+                    start,
+                    after_end,
+                    before,
+                    preferred_before,
+                    ..
+                } => {
+                    let mut replacement = before.lines.clone();
+                    replacement[0].insert_str(0, &lines[start.line][..start.byte]);
+                    replacement
+                        .last_mut()
+                        .unwrap()
+                        .push_str(&lines[after_end.line][after_end.byte..]);
+                    lines.splice(
+                        start.line..=after_end.line,
+                        replacement.into_iter().map(Cow::Owned),
+                    );
+                    endings.splice(start.line..after_end.line, before.endings.iter().copied());
+                    preferred = *preferred_before;
+                }
+                Change::Whole { before, .. } => {
+                    lines = before
+                        .lines
+                        .iter()
+                        .map(|line| Cow::Borrowed(line.as_str()))
+                        .collect();
+                    endings.clone_from(&before.endings);
+                    preferred = before.preferred_ending;
+                }
+                Change::Endings {
+                    before,
+                    preferred_before,
+                    ..
+                } => {
+                    endings.clone_from(before);
+                    preferred = *preferred_before;
+                }
+            }
+        }
+        preferred != state.preferred_ending
+            || endings != state.endings
+            || lines.len() != state.lines.len()
+            || lines
+                .iter()
+                .zip(&state.lines)
+                .any(|(left, right)| left.as_ref() != right)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -661,7 +1030,7 @@ impl Buffer {
         let state = TextState::empty();
         Self {
             clean_state: state.clone(),
-            history: UndoHistory::new(state.clone()),
+            history: UndoHistory::new(),
             state,
             path: None,
             baseline: None,
@@ -677,7 +1046,7 @@ impl Buffer {
         let state = TextState::parse(text.as_ref());
         Self {
             clean_state: state.clone(),
-            history: UndoHistory::new(state.clone()),
+            history: UndoHistory::new(),
             state,
             path: None,
             baseline: None,
@@ -699,7 +1068,7 @@ impl Buffer {
         let dirty = state != clean_state;
         Self {
             clean_state,
-            history: UndoHistory::new(state.clone()),
+            history: UndoHistory::new(),
             state,
             path: None,
             baseline: None,
@@ -735,7 +1104,7 @@ impl Buffer {
         let state = TextState::parse(text);
         Ok(Self {
             clean_state: state.clone(),
-            history: UndoHistory::new(state.clone()),
+            history: UndoHistory::new(),
             state,
             path: Some(path),
             baseline: Some(disk),
@@ -769,6 +1138,17 @@ impl Buffer {
 
     pub fn grapheme_count(&self, line: usize) -> Option<usize> {
         self.state.grapheme_count(line)
+    }
+
+    /// Byte offset within a line, using its cached grapheme boundaries.
+    pub fn grapheme_byte(&self, pos: Pos) -> Result<usize> {
+        self.state.byte_in_line(pos)
+    }
+
+    /// Stable for an unchanged line, including when other lines are inserted.
+    /// Different line contents and independently created buffers use new keys.
+    pub fn line_cache_key(&self, line: usize) -> Option<u64> {
+        self.state.line_info.get(line).map(|info| info.key)
     }
 
     /// Returns the exact current document text, including original separators.
@@ -857,11 +1237,11 @@ impl Buffer {
     /// Clamps a position to an existing line and that line's grapheme count.
     pub fn clamp_pos(&self, pos: Pos) -> Pos {
         let line = pos.line.min(self.line_count() - 1);
-        Pos::new(
-            line,
-            pos.grapheme
-                .min(self.grapheme_count(line).expect("line exists")),
-        )
+        let candidate = Pos::new(line, pos.grapheme);
+        if self.state.byte_in_line(candidate).is_ok() {
+            return candidate;
+        }
+        Pos::new(line, self.grapheme_count(line).expect("line exists"))
     }
 
     pub fn line_start(&self, line: usize) -> Result<Pos> {
@@ -1013,30 +1393,31 @@ impl Buffer {
             return Err(BufferError::TransactionInProgress);
         }
         self.transaction = Some(Transaction {
-            before: self.state.clone(),
+            before: self.state.signature(),
+            changes: Vec::new(),
         });
         Ok(())
     }
 
-    /// Commits the active transaction.  Returns whether it changed state.
+    /// Commits the active transaction. Returns whether it changed exact text.
     pub fn commit_transaction(&mut self) -> Result<bool> {
         let transaction = self.transaction.take().ok_or(BufferError::NoTransaction)?;
-        if transaction.before == self.state {
-            self.refresh_dirty();
-            return Ok(false);
+        let changed = transaction.changed(&self.state);
+        if changed {
+            self.history.commit(transaction.changes);
+            self.advance_version();
         }
-        self.history.commit(self.state.clone());
-        self.advance_version();
         self.refresh_dirty();
-        Ok(true)
+        Ok(changed)
     }
 
-    /// Restores the state from before the active transaction without creating
-    /// an undo entry.
+    /// Rolls back the recorded byte edits, including contextual grapheme joins.
     pub fn rollback_transaction(&mut self) -> Result<()> {
         let transaction = self.transaction.take().ok_or(BufferError::NoTransaction)?;
-        let changed = self.state != transaction.before;
-        self.state = transaction.before;
+        let changed = transaction.changed(&self.state);
+        for change in transaction.changes.iter().rev() {
+            change.apply(&mut self.state, false);
+        }
         if changed {
             self.advance_revision();
         }
@@ -1052,35 +1433,26 @@ impl Buffer {
     /// Newline sequences in `text` become the buffer's preferred line-ending
     /// style; separators already present in the buffer are left untouched.
     pub fn insert(&mut self, at: Pos, text: &str) -> Result<Pos> {
-        self.state.validate_pos(at)?;
-        if text.is_empty() {
-            return Ok(at);
-        }
-        let position = self.state.insert(at, text)?;
-        self.finish_mutation();
-        Ok(position)
+        self.replace(TextRange::new(at, at), text)
     }
 
-    /// Deletes a half-open range and returns its exact text, including its
-    /// original line separators.
+    /// Deletes a half-open range and returns its exact original separators.
     pub fn delete(&mut self, range: TextRange) -> Result<String> {
-        let range = range.ordered();
-        self.state.validate_pos(range.start)?;
-        self.state.validate_pos(range.end)?;
-        let deleted = self.state.delete(range)?;
-        if !range.is_empty() {
-            self.finish_mutation();
+        let (_, removed, change) = self.state.replace(range, "")?;
+        if let Some(change) = change {
+            self.finish_mutation(change);
         }
-        Ok(deleted)
+        Ok(removed)
     }
 
-    /// Replaces a range as one undoable operation and returns the new cursor.
+    /// Validates both endpoints before changing text; rollback data contains
+    /// only the replaced bytes, even inside a multi-line transaction.
     pub fn replace(&mut self, range: TextRange, text: &str) -> Result<Pos> {
-        let range = range.ordered();
-        self.mutate(|state| {
-            state.delete(range)?;
-            state.insert(range.start, text)
-        })
+        let (cursor, _, change) = self.state.replace(range, text)?;
+        if let Some(change) = change {
+            self.finish_mutation(change);
+        }
+        Ok(cursor)
     }
 
     pub fn delete_grapheme_forward(&mut self, at: Pos) -> Result<Option<String>> {
@@ -1117,21 +1489,28 @@ impl Buffer {
     pub fn replace_all(&mut self, text: &str) -> Result<()> {
         let replacement = TextState::parse(text);
         if replacement != self.state {
-            self.state = replacement;
-            self.finish_mutation();
+            let before = std::mem::replace(&mut self.state, replacement);
+            let after = self.state.clone();
+            self.finish_mutation(Change::Whole {
+                before: Box::new(before),
+                after: Box::new(after),
+            });
         }
         Ok(())
     }
 
-    /// Converts all existing separators and selects the style for future
-    /// inserted lines.
+    /// Converts all existing separators and selects the style for future lines.
     pub fn set_line_ending(&mut self, ending: LineEnding) -> Result<()> {
         if self.state.preferred_ending != ending
             || self.state.endings.iter().any(|current| *current != ending)
         {
-            self.state.preferred_ending = ending;
-            self.state.endings.fill(ending);
-            self.finish_mutation();
+            let change = Change::Endings {
+                before: self.state.endings.clone(),
+                preferred_before: self.state.preferred_ending,
+                after: ending,
+            };
+            change.apply(&mut self.state, true);
+            self.finish_mutation(change);
         }
         Ok(())
     }
@@ -1148,10 +1527,9 @@ impl Buffer {
         if self.transaction.is_some() {
             return Err(BufferError::TransactionInProgress);
         }
-        let Some(state) = self.history.undo() else {
+        if !self.history.undo(&mut self.state) {
             return Ok(false);
-        };
-        self.state = state;
+        }
         self.advance_version();
         self.advance_revision();
         self.refresh_dirty();
@@ -1163,10 +1541,9 @@ impl Buffer {
         if self.transaction.is_some() {
             return Err(BufferError::TransactionInProgress);
         }
-        let Some(state) = self.history.redo() else {
+        if !self.history.redo(&mut self.state) {
             return Ok(false);
-        };
-        self.state = state;
+        }
         self.advance_version();
         self.advance_revision();
         self.refresh_dirty();
@@ -1182,24 +1559,42 @@ impl Buffer {
         if self.transaction.is_some() {
             return Err(BufferError::TransactionInProgress);
         }
-        let Some(state) = self.history.redo_branch(branch) else {
+        if !self.history.redo_branch(branch, &mut self.state) {
             return Ok(false);
-        };
-        self.state = state;
+        }
         self.advance_version();
         self.advance_revision();
         self.refresh_dirty();
         Ok(true)
     }
 
-    /// Bounds the number of in-memory snapshots.  Values below two are raised
-    /// to two so the next change remains undoable.
+    /// Bounds undo-tree nodes. Values below two retain a root and one change.
     pub fn set_undo_limit(&mut self, limit: usize) -> Result<()> {
         if self.transaction.is_some() {
             return Err(BufferError::TransactionInProgress);
         }
-        self.history.set_limit(limit, &self.state);
+        self.history.set_limit(limit);
         Ok(())
+    }
+
+    /// Bounds retained change arrays and their owned data in bytes. Tree-node
+    /// and branch-index metadata is separately bounded by [`Self::set_undo_limit`].
+    /// An individual change exceeding this budget stays applied but clears undo
+    /// history. Active transactions retain rollback data until commit or rollback.
+    pub fn set_undo_byte_limit(&mut self, limit: usize) -> Result<()> {
+        if self.transaction.is_some() {
+            return Err(BufferError::TransactionInProgress);
+        }
+        self.history.set_byte_limit(limit);
+        Ok(())
+    }
+
+    /// Retained change storage, excluding the separately bounded tree metadata.
+    pub fn undo_bytes(&self) -> usize {
+        self.history.retained_bytes
+    }
+    pub fn undo_byte_limit(&self) -> usize {
+        self.history.byte_limit
     }
 
     /// Saves to the associated path after checking the exact on-disk baseline.
@@ -1247,9 +1642,9 @@ impl Buffer {
         })?;
         let state = TextState::parse(text);
         let changed = state != self.state;
-        self.state = state.clone();
         self.clean_state = state.clone();
-        self.history.reset(state);
+        self.state = state;
+        self.history.reset();
         self.baseline = Some(disk);
         self.dirty = false;
         if changed {
@@ -1259,32 +1654,15 @@ impl Buffer {
         Ok(changed)
     }
 
-    fn mutate<T>(&mut self, operation: impl FnOnce(&mut TextState) -> Result<T>) -> Result<T> {
-        let before = self.state.clone();
-        let result = match operation(&mut self.state) {
-            Ok(result) => result,
-            Err(error) => {
-                self.state = before;
-                return Err(error);
-            }
-        };
-        if self.state != before {
-            self.finish_mutation();
-        }
-        Ok(result)
-    }
-
-    fn finish_mutation(&mut self) {
+    fn finish_mutation(&mut self, change: Change) {
         self.advance_revision();
-        if self.transaction.is_none() {
-            self.history.commit(self.state.clone());
+        if let Some(transaction) = &mut self.transaction {
+            transaction.changes.push(change);
+            self.dirty = true;
+        } else {
+            self.history.commit(vec![change]);
             self.advance_version();
             self.refresh_dirty();
-        } else {
-            // During a transaction this is deliberately conservative. Commit
-            // or rollback recomputes exact cleanliness once for the complete
-            // logical edit, avoiding a full-buffer comparison per keystroke.
-            self.dirty = true;
         }
     }
 
@@ -1487,6 +1865,328 @@ fn atomic_write(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn undo_memory_tracks_small_edits_independently_of_document_size() {
+        fn history_bytes(lines: usize) -> usize {
+            let mut buffer = Buffer::from_text("unchanged source line\n".repeat(lines));
+            let initial = buffer.text();
+            for _ in 0..100 {
+                buffer.insert(Pos::ZERO, "x").unwrap();
+            }
+            let bytes = buffer.undo_bytes();
+            assert!(bytes < 64 * 1024, "100 byte edits retained {bytes} bytes");
+            for _ in 0..100 {
+                assert!(buffer.undo().unwrap());
+            }
+            assert_eq!(buffer.text(), initial);
+            assert!(!buffer.is_dirty());
+            bytes
+        }
+        assert_eq!(history_bytes(1), history_bytes(20_000));
+    }
+
+    #[test]
+    fn line_transform_records_only_changed_ranges_in_one_transaction() {
+        let mut buffer = Buffer::from_text("source\r\n".repeat(2_000));
+        let original = buffer.text();
+        buffer.begin_transaction().unwrap();
+        for line in 0..buffer.line_count() {
+            buffer
+                .replace(
+                    TextRange::new(Pos::new(line, 0), Pos::new(line, 6)),
+                    "    source",
+                )
+                .unwrap();
+        }
+        assert!(buffer.commit_transaction().unwrap());
+        assert!(buffer.undo_bytes() < 1024 * 1024);
+        assert_eq!(buffer.text(), "    source\r\n".repeat(2_000));
+        assert!(buffer.undo().unwrap());
+        assert_eq!(buffer.text(), original);
+        assert!(!buffer.can_undo());
+        assert!(buffer.redo().unwrap());
+        assert_eq!(buffer.text(), "    source\r\n".repeat(2_000));
+    }
+
+    #[test]
+    fn delta_history_restores_mixed_endings_and_contextual_graphemes() {
+        let mut buffer = Buffer::from_text("a\r\nb🇺🇳\nc\r\n");
+        let original = buffer.text();
+        buffer.begin_transaction().unwrap();
+        buffer.insert(Pos::new(0, 1), "\u{301}").unwrap();
+        buffer
+            .replace(TextRange::new(Pos::new(1, 1), Pos::new(2, 0)), "👩‍💻\nX")
+            .unwrap();
+        let changed = buffer.text();
+        buffer.commit_transaction().unwrap();
+        assert!(buffer.undo().unwrap());
+        assert_eq!(buffer.text(), original);
+        assert!(buffer.redo().unwrap());
+        assert_eq!(buffer.text(), changed);
+
+        buffer.begin_transaction().unwrap();
+        buffer.replace_all("entirely different\n").unwrap();
+        buffer.set_line_ending(LineEnding::Lf).unwrap();
+        buffer.insert(Pos::ZERO, "prefix ").unwrap();
+        buffer.rollback_transaction().unwrap();
+        assert_eq!(buffer.text(), changed);
+        assert!(buffer.undo().unwrap());
+        assert_eq!(buffer.text(), original);
+    }
+
+    #[test]
+    fn possible_equal_fingerprints_still_compare_exact_line_order() {
+        let mut buffer = Buffer::from_text("left\nright");
+        buffer.begin_transaction().unwrap();
+        buffer.replace_all("right\nleft").unwrap();
+        // The incremental rejection hash is insensitive to line ordering.
+        assert_eq!(
+            buffer.transaction.as_ref().unwrap().before,
+            buffer.state.signature()
+        );
+        assert!(buffer.commit_transaction().unwrap());
+        assert!(buffer.is_dirty());
+        assert!(buffer.undo().unwrap());
+        assert_eq!(buffer.text(), "left\nright");
+
+        buffer.insert(Pos::ZERO, "dirty ").unwrap();
+        buffer.begin_transaction().unwrap();
+        let end = buffer.insert(Pos::ZERO, "temporary\r\n").unwrap();
+        buffer.delete(TextRange::new(Pos::ZERO, end)).unwrap();
+        let version = buffer.version();
+        assert!(!buffer.commit_transaction().unwrap());
+        assert_eq!(buffer.version(), version);
+        assert_eq!(buffer.text(), "dirty left\nright");
+        assert!(buffer.is_dirty());
+    }
+
+    #[test]
+    fn undo_byte_limit_prunes_old_history_and_rejects_oversized_entries() {
+        let mut buffer = Buffer::from_text("abc");
+        buffer.insert(Pos::ZERO, "x").unwrap();
+        let one_change = buffer.undo_bytes();
+        buffer.set_undo_byte_limit(one_change).unwrap();
+        buffer.insert(Pos::ZERO, "y").unwrap();
+        assert!(buffer.undo_bytes() <= one_change);
+        assert!(buffer.undo().unwrap());
+        assert_eq!(buffer.text(), "xabc");
+        assert!(!buffer.can_undo());
+
+        buffer.begin_transaction().unwrap();
+        buffer
+            .insert(Pos::ZERO, &"z".repeat(one_change + 1))
+            .unwrap();
+        buffer.rollback_transaction().unwrap();
+        assert_eq!(buffer.text(), "xabc");
+        buffer
+            .insert(Pos::ZERO, &"z".repeat(one_change + 1))
+            .unwrap();
+        assert_eq!(buffer.undo_bytes(), 0);
+        assert!(!buffer.can_undo());
+        assert!(!buffer.can_redo());
+        assert!(buffer.text().ends_with("xabc"));
+
+        buffer.set_undo_byte_limit(0).unwrap();
+        buffer.insert(Pos::ZERO, "more").unwrap();
+        assert_eq!(buffer.undo_bytes(), 0);
+        assert!(!buffer.can_undo());
+    }
+
+    #[test]
+    fn replacing_invalid_ranges_does_not_mutate_text_or_history() {
+        let mut buffer = Buffer::from_text("a🇺🇳\r\nb");
+        let original = buffer.text();
+        assert!(
+            buffer
+                .replace(TextRange::new(Pos::ZERO, Pos::new(1, 2)), "x")
+                .is_err()
+        );
+        assert_eq!(buffer.text(), original);
+        assert_eq!(buffer.version(), 0);
+        assert_eq!(buffer.revision(), 0);
+        assert!(!buffer.can_undo());
+    }
+
+    #[test]
+    fn replacement_uses_original_byte_boundaries_when_neighbors_can_join() {
+        let mut buffer = Buffer::from_text("🇧b🇬\u{200d}");
+        let original = buffer.text();
+        let cursor = buffer
+            .replace(TextRange::new(Pos::new(0, 1), Pos::new(0, 2)), "b")
+            .unwrap();
+        assert_eq!(buffer.text(), original);
+        assert_eq!(cursor, Pos::new(0, 2));
+        assert!(!buffer.can_undo());
+
+        buffer
+            .replace(TextRange::new(Pos::new(0, 1), Pos::new(0, 2)), "x")
+            .unwrap();
+        assert_eq!(buffer.text(), "🇧x🇬\u{200d}");
+        assert!(buffer.undo().unwrap());
+        assert_eq!(buffer.text(), original);
+    }
+
+    #[test]
+    fn rollback_preserves_literal_cr_separately_from_line_endings() {
+        let mut buffer = Buffer::from_text("\nb");
+        buffer.begin_transaction().unwrap();
+        buffer.insert(Pos::ZERO, "a\r").unwrap();
+        buffer
+            .delete(TextRange::new(Pos::ZERO, Pos::new(1, 0)))
+            .unwrap();
+        buffer.rollback_transaction().unwrap();
+        assert_eq!(buffer.lines(), &["", "b"]);
+        assert_eq!(buffer.line_ending_after(0), Some(LineEnding::Lf));
+        assert_eq!(buffer.text(), "\nb");
+
+        buffer.begin_transaction().unwrap();
+        buffer.insert(Pos::ZERO, "a\r").unwrap();
+        buffer
+            .delete(TextRange::new(Pos::ZERO, Pos::new(1, 0)))
+            .unwrap();
+        buffer.commit_transaction().unwrap();
+        assert!(buffer.undo().unwrap());
+        assert_eq!(buffer.lines(), &["", "b"]);
+        assert!(buffer.redo().unwrap());
+        assert_eq!(buffer.text(), "b");
+
+        let mut buffer = Buffer::from_text("\nb");
+        buffer.insert(Pos::ZERO, "a\r").unwrap();
+        let serialized = buffer.text();
+        buffer.begin_transaction().unwrap();
+        buffer
+            .replace(TextRange::new(Pos::ZERO, Pos::new(1, 0)), "a\r\n")
+            .unwrap();
+        assert_eq!(buffer.text(), "a\nb");
+        assert!(buffer.commit_transaction().unwrap());
+        assert!(buffer.undo().unwrap());
+        assert_eq!(buffer.text(), serialized);
+        assert_eq!(buffer.line(0), Some("a\r"));
+        assert_eq!(buffer.line_ending_after(0), Some(LineEnding::Lf));
+    }
+
+    #[test]
+    fn line_caches_survive_unrelated_edits_and_invalidate_unicode_changes() {
+        let mut buffer = Buffer::from_text("a🇺🇳\nunchanged");
+        assert_eq!(buffer.grapheme_byte(Pos::new(0, 2)).unwrap(), 9);
+        let first = buffer.line_cache_key(0);
+        let second = buffer.line_cache_key(1);
+        buffer.insert(Pos::new(0, 1), "\u{301}").unwrap();
+        assert_ne!(buffer.line_cache_key(0), first);
+        assert_eq!(buffer.line_cache_key(1), second);
+        assert_eq!(buffer.grapheme_count(0), Some(2));
+        assert_eq!(buffer.grapheme_byte(Pos::new(0, 1)).unwrap(), 3);
+        buffer.split_line(Pos::new(0, 1)).unwrap();
+        assert_eq!(buffer.line_cache_key(2), second);
+        assert_eq!(buffer.grapheme_count(1), Some(1));
+        assert_ne!(Buffer::from_text("unchanged").line_cache_key(0), second);
+
+        let ascii = Buffer::from_text("a".repeat(1024 * 1024));
+        assert_eq!(ascii.clamp_pos(Pos::ZERO), Pos::ZERO);
+        assert!(ascii.state.line_info[0].graphemes.get().is_none());
+        assert_eq!(ascii.grapheme_count(0), Some(1024 * 1024));
+        assert!(matches!(
+            ascii.state.line_info[0].graphemes.get(),
+            Some(GraphemeIndex::Ascii)
+        ));
+
+        let mut unicode = Buffer::from_text("e\u{301}".repeat(100_000));
+        let cursor = unicode.insert(Pos::ZERO, "x").unwrap();
+        assert_eq!(cursor, Pos::new(0, 1));
+        assert_eq!(unicode.clamp_pos(cursor), cursor);
+        assert_eq!(unicode.grapheme_byte(cursor).unwrap(), 1);
+        assert!(unicode.state.line_info[0].graphemes.get().is_none());
+    }
+
+    #[test]
+    fn typing_without_newlines_preserves_an_explicit_empty_buffer_style() {
+        let mut buffer = Buffer::new();
+        buffer.set_line_ending(LineEnding::Crlf).unwrap();
+        buffer.insert(Pos::ZERO, "x").unwrap();
+        assert_eq!(buffer.line_ending(), LineEnding::Crlf);
+        buffer.split_line(Pos::new(0, 1)).unwrap();
+        assert_eq!(buffer.text(), "x\r\n");
+        assert!(buffer.undo().unwrap());
+        assert_eq!(buffer.text(), "x");
+        assert_eq!(buffer.line_ending(), LineEnding::Crlf);
+    }
+
+    #[test]
+    fn deterministic_edit_sequences_round_trip_every_history_state() {
+        let mut buffer = Buffer::from_text("a🇺🇳\r\ne\u{301}\n👩‍💻 end\r\n");
+        let mut expected = vec![(buffer.text(), buffer.line_ending(), buffer.line_count())];
+        let fragments = [
+            "x",
+            "\u{301}",
+            "🇺🇳",
+            "\n",
+            "\r\n",
+            "👩‍💻\nnext",
+            "",
+            " ",
+            "\r",
+            "a\r",
+            "\r\r\n",
+        ];
+        let mut seed = 0x91a2_b3c4_d5e6_f708_u64;
+        for step in 0..150 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let line = seed as usize % buffer.line_count();
+            let count = buffer.grapheme_count(line).unwrap();
+            let start = Pos::new(line, (seed >> 12) as usize % (count + 1));
+            let end_line = (line + ((seed >> 24) as usize % 3)).min(buffer.line_count() - 1);
+            let end_count = buffer.grapheme_count(end_line).unwrap();
+            let end = Pos::new(end_line, (seed >> 36) as usize % (end_count + 1));
+            buffer.begin_transaction().unwrap();
+            match step % 11 {
+                0 => buffer.set_line_ending(LineEnding::Lf).unwrap(),
+                1 => buffer.set_line_ending(LineEnding::Crlf).unwrap(),
+                2 => buffer
+                    .replace_all(fragments[step % fragments.len()])
+                    .unwrap(),
+                _ => {
+                    buffer
+                        .replace(
+                            TextRange::new(start, end),
+                            fragments[step % fragments.len()],
+                        )
+                        .unwrap();
+                    // Record a second edit at a position from the updated state.
+                    let at = buffer.end_pos();
+                    buffer
+                        .insert(at, fragments[(step + 3) % fragments.len()])
+                        .unwrap();
+                }
+            }
+            if buffer.commit_transaction().unwrap() {
+                expected.push((buffer.text(), buffer.line_ending(), buffer.line_count()));
+            }
+            assert_eq!(buffer.byte_len(), buffer.text().len());
+            assert!(buffer.state.invariant_holds());
+        }
+        for state in expected[..expected.len() - 1].iter().rev() {
+            assert!(buffer.undo().unwrap());
+            assert_eq!(
+                (buffer.text(), buffer.line_ending(), buffer.line_count()),
+                *state
+            );
+            assert_eq!(buffer.byte_len(), state.0.len());
+        }
+        assert!(!buffer.can_undo());
+        assert!(!buffer.is_dirty());
+        for state in expected.iter().skip(1) {
+            assert!(buffer.redo().unwrap());
+            assert_eq!(
+                (buffer.text(), buffer.line_ending(), buffer.line_count()),
+                *state
+            );
+            assert_eq!(buffer.byte_len(), state.0.len());
+        }
+        assert!(!buffer.can_redo());
+    }
 
     #[test]
     fn parses_and_round_trips_mixed_line_endings() {

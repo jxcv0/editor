@@ -106,9 +106,16 @@ replacement while preserving the existing line endings, final-newline state,
 Unix permissions, and symlink target. `:w!`, `:e!`, `:bd!`, and `:q!` are the
 explicit force/discard paths; review the command reference before using them.
 
+Undo retains changed bytes rather than a complete document per edit. Each
+buffer has both an entry limit and a retained-change byte limit (64 MiB by
+default). Reaching either limit starts a new history with the latest change;
+a single change exceeding the byte limit stays applied but clears history and
+cannot be undone. An open transaction retains its rollback data until it ends.
+
 During periodic maintenance, dirty buffers are queued to private, versioned
 recovery records; named buffers use a path-derived key and scratch/stdin
-buffers use a project-local scratch key. Later maintenance removes records for
+buffers use a project-local scratch key. Live revisions are journaled while
+Insert mode remains open. Later maintenance removes records for
 buffers observed clean, and normal shutdown drains the queued journal work. On launch
 the editor reports how many records exist, but it does not yet provide a
 recovery-selection or application UI. Clean exit writes content-free session
@@ -176,6 +183,7 @@ max_file_bytes = 104857600
 large_file_bytes = 10485760
 message_history = 256
 undo_steps = 1000
+undo_bytes = 67108864
 search_results = 2000
 tool_message_bytes = 8388608
 
@@ -260,7 +268,7 @@ all of `DESIGN.md`'s end-to-end or performance release criteria have passed.
 
 | Area | Current status |
 | --- | --- |
-| UTF-8 buffer, grapheme edits, transactions, branching undo, atomic/conflict-aware saves | Implemented with regression tests. The line-vector text model still needs large-file performance validation. |
+| UTF-8 buffer, grapheme edits, transactions, branching undo, atomic/conflict-aware saves | Implemented with regression tests. Undo stores byte-range changes with entry and byte limits; grapheme indexes are cached per changed line. The line-vector text model still needs broader large-file performance validation. |
 | Modal grammar, registers/macros, search, Visual modes, panes, buffers, leader registry | Usable MVP subset with known deviations documented in `docs/COMMANDS.md`. |
 | Terminal frontend | Raw mode, bracketed paste, resize events, local syntax colors, gutters/status/messages (including modified, large-file, and loaded read-only flags), split/explorer/picker/leader drawing, horizontal cursor tracking, Unicode cell widths, changed-cell output, and a toggled PTY-backed terminal panel are implemented. Mouse forwarding, terminal selection/copy, and suspend/resume remain. |
 | Project discovery, finder, and text/regex search | Root selection is a synchronous ancestor walk before the first frame. Full-tree scanning and text search then run in background threads, stream through bounded cancellable queues, and honor hidden/ignored controls. The interactive grep picker uses regex mode and cancels the previous task when its query changes; previews are not yet rendered. |
@@ -268,7 +276,7 @@ all of `DESIGN.md`'s end-to-end or performance release criteria have passed.
 | `rust-analyzer` | Supervised asynchronous transport, initialization, manual restart, versioned full-text sync, typed requests, diagnostics, basic response UI/edit application, size bounds, and failure status are wired. Snippets, code-action execution, multi-file rename, inlay rendering, request cancellation, and capability-specific disabled states remain. |
 | `codex-watch` | Supervised lifecycle, explicit enable/mode gate, double-action confirmation within five seconds, JSON event parsing, status, and bounded logs are wired. Enablement is not remembered and dirty-buffer conflict review is incomplete. Clean files receive a synchronous metadata poll; detected external changes are reread/reloaded on the foreground thread, including a check after Codex completion. |
 | Recovery and sessions | Dirty named and scratch/stdin buffers are journaled asynchronously, queued journal work is joined at shutdown, and content-free named-file sessions restore active selection, pane cursor/viewports, and explorer metadata. Recovery choice/application, unnamed session buffers, exact split topology/orientation, explicit-discard cleanup, and persistent undo are not release-complete. |
-| Performance/release evidence | `editor-bench` reports warm 1 MiB buffer-open and edit-plus-in-memory-frame p95 proxies. It does not measure process launch through terminal flush, has no target-laptop/CI baseline yet, and therefore does not prove the 50 ms/8 ms release budgets. Fuzz/property coverage also remains release work. |
+| Performance/release evidence | `editor-bench` reports warm 1 MiB buffer-open and component p95 checks for insertion, long-word movement, whole-file indentation, long-line rendering, and finder input. It does not measure process launch through terminal flush or runtime maintenance, has no target-laptop/CI baseline yet, and therefore does not prove the complete 50 ms/8 ms release budgets. Broader fuzz/property coverage remains release work. |
 
 For module ownership and boundaries, see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The dependency/native-boundary

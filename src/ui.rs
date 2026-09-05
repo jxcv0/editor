@@ -3,7 +3,9 @@
 
 use std::{
     borrow::Cow,
+    collections::HashMap,
     io::{self, Stdout, Write},
+    ops::Deref,
     panic,
     time::Duration,
 };
@@ -21,6 +23,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
+    buffer::Buffer,
     command::{self, CommandSource},
     config::parse_hex_color,
     editor::{
@@ -72,9 +75,55 @@ impl Default for Style {
     }
 }
 
+/// Most terminal cells contain a short grapheme. Keep those bytes in the cell
+/// instead of allocating once for every blank and ASCII character in a frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CellSymbol {
+    Inline { bytes: [u8; 15], len: u8 },
+    Extended(Box<str>),
+}
+
+impl CellSymbol {
+    fn new(text: &str) -> Self {
+        if text.len() <= 15 {
+            let mut bytes = [0; 15];
+            bytes[..text.len()].copy_from_slice(text.as_bytes());
+            Self::Inline {
+                bytes,
+                len: text.len() as u8,
+            }
+        } else {
+            Self::Extended(text.into())
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Inline { bytes, len } => {
+                std::str::from_utf8(&bytes[..usize::from(*len)]).expect("stored valid UTF-8")
+            }
+            Self::Extended(text) => text,
+        }
+    }
+}
+
+impl Deref for CellSymbol {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<&str> for CellSymbol {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Cell {
-    symbol: String,
+    symbol: CellSymbol,
     style: Style,
     continuation: bool,
 }
@@ -82,7 +131,7 @@ struct Cell {
 impl Default for Cell {
     fn default() -> Self {
         Self {
-            symbol: " ".into(),
+            symbol: CellSymbol::new(" "),
             style: Style::default(),
             continuation: false,
         }
@@ -152,14 +201,14 @@ impl Canvas {
             return 0;
         };
         self.cells[index] = Cell {
-            symbol: grapheme.into_owned(),
+            symbol: CellSymbol::new(&grapheme),
             style,
             continuation: false,
         };
         for column in 1..width {
             if let Some(index) = self.index(x + column, y) {
                 self.cells[index] = Cell {
-                    symbol: String::new(),
+                    symbol: CellSymbol::new(""),
                     style,
                     continuation: true,
                 };
@@ -342,7 +391,17 @@ impl Renderer {
             changed = true;
             index = next.max(index + 1);
         }
-        self.previous.clone_from(&canvas.cells);
+        // Unchanged extended graphemes should not be cloned either. The common
+        // inline representation needs no per-cell heap allocation on changes.
+        if self.previous.len() != canvas.cells.len() {
+            self.previous.clone_from(&canvas.cells);
+        } else {
+            for (previous, current) in self.previous.iter_mut().zip(&canvas.cells) {
+                if previous != current {
+                    previous.clone_from(current);
+                }
+            }
+        }
         if let Some((x, y)) = cursor.filter(|(x, y)| *x < canvas.width && *y < canvas.height) {
             if self.previous_cursor_style != Some(cursor_style) {
                 queue!(self.stdout, cursor_style)?;
@@ -548,9 +607,166 @@ pub fn cursor_style(editor: &Editor) -> SetCursorStyle {
     }
 }
 
-/// Build a deterministic frame for the current editor state.  Keeping this
-/// separate from terminal output makes rendering snapshot-testable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DisplayPoint {
+    byte: usize,
+    grapheme: usize,
+    column: usize,
+}
+
+struct CachedLine {
+    language: syntax::Language,
+    tab_width: usize,
+    spans: Vec<syntax::Span>,
+    ascii_columns: bool,
+    checkpoints: Vec<DisplayPoint>,
+    scanned: DisplayPoint,
+    used_frame: u64,
+}
+
+impl CachedLine {
+    fn new(line: &str, language: syntax::Language, tab_width: usize, frame: u64) -> Self {
+        Self {
+            language,
+            tab_width,
+            spans: syntax::highlight_line(language, line),
+            ascii_columns: line.is_ascii() && !line.contains('\t'),
+            checkpoints: vec![DisplayPoint::default()],
+            scanned: DisplayPoint::default(),
+            used_frame: frame,
+        }
+    }
+
+    fn advance(&self, point: DisplayPoint, grapheme: &str) -> DisplayPoint {
+        DisplayPoint {
+            byte: point.byte + grapheme.len(),
+            grapheme: point.grapheme + 1,
+            column: point.column
+                + if grapheme == "\t" {
+                    self.tab_width - point.column % self.tab_width
+                } else {
+                    UnicodeWidthStr::width(grapheme).max(1)
+                },
+        }
+    }
+
+    /// Extend only as far as a requested position. Opening a long Unicode line
+    /// at its start must not first build an index of the entire line.
+    fn extend(&mut self, line: &str, grapheme: usize, column: usize) {
+        for text in line[self.scanned.byte..].graphemes(true) {
+            if self.scanned.grapheme >= grapheme && self.scanned.column >= column {
+                break;
+            }
+            self.scanned = self.advance(self.scanned, text);
+            if self.scanned.grapheme.is_multiple_of(256) {
+                self.checkpoints.push(self.scanned);
+            }
+        }
+    }
+
+    fn at_grapheme(&mut self, line: &str, grapheme: usize) -> DisplayPoint {
+        if self.ascii_columns {
+            let index = grapheme.min(line.len());
+            return DisplayPoint {
+                byte: index,
+                grapheme: index,
+                column: index,
+            };
+        }
+        self.extend(line, grapheme, 0);
+        let checkpoint = self
+            .checkpoints
+            .partition_point(|point| point.grapheme <= grapheme);
+        let mut point = self.checkpoints[checkpoint.saturating_sub(1)];
+        for text in line[point.byte..].graphemes(true) {
+            if point.grapheme >= grapheme {
+                break;
+            }
+            point = self.advance(point, text);
+        }
+        point
+    }
+
+    fn at_column(&mut self, line: &str, column: usize) -> DisplayPoint {
+        if self.ascii_columns {
+            let index = column.min(line.len());
+            return DisplayPoint {
+                byte: index,
+                grapheme: index,
+                column: index,
+            };
+        }
+        self.extend(line, 0, column);
+        let checkpoint = self
+            .checkpoints
+            .partition_point(|point| point.column <= column);
+        let mut point = self.checkpoints[checkpoint.saturating_sub(1)];
+        for text in line[point.byte..].graphemes(true) {
+            let next = self.advance(point, text);
+            if next.column > column {
+                break;
+            }
+            point = next;
+        }
+        point
+    }
+}
+
+/// Retains line syntax and sparse display indexes across frames. Line keys come
+/// from the buffer, so edits invalidate only the text that actually changed.
+#[derive(Default)]
+pub struct FrameBuilder {
+    lines: HashMap<u64, CachedLine>,
+    frame: u64,
+}
+
+impl FrameBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn draw_editor(
+        &mut self,
+        editor: &mut Editor,
+        width: u16,
+        height: u16,
+    ) -> (Canvas, Option<(u16, u16)>) {
+        self.frame = self.frame.wrapping_add(1);
+        let result = build_frame(self, editor, width, height);
+        if self.lines.len() > 256 {
+            self.lines.retain(|_, line| line.used_frame == self.frame);
+        }
+        result
+    }
+
+    fn line(&mut self, buffer: &Buffer, number: usize, tab_width: usize) -> &mut CachedLine {
+        let key = buffer.line_cache_key(number).expect("visible line exists");
+        let language = syntax::language_for_path(buffer.path());
+        let text = buffer.line(number).expect("visible line exists");
+        let line = self
+            .lines
+            .entry(key)
+            .or_insert_with(|| CachedLine::new(text, language, tab_width, self.frame));
+        if line.tab_width != tab_width || line.language != language {
+            *line = CachedLine::new(text, language, tab_width, self.frame);
+        }
+        line.used_frame = self.frame;
+        line
+    }
+}
+
+/// Build a standalone deterministic frame. Interactive frontends should retain
+/// a `FrameBuilder` to reuse unchanged line data between frames.
 pub fn draw_editor(editor: &mut Editor, width: u16, height: u16) -> (Canvas, Option<(u16, u16)>) {
+    FrameBuilder::new().draw_editor(editor, width, height)
+}
+
+fn build_frame(
+    builder: &mut FrameBuilder,
+    editor: &mut Editor,
+    width: u16,
+    height: u16,
+) -> (Canvas, Option<(u16, u16)>) {
     let palette = Palette::from_editor(editor);
     let base = Style::new(palette.foreground, palette.background);
     let mut canvas = Canvas::new(width, height, base);
@@ -596,11 +812,11 @@ pub fn draw_editor(editor: &mut Editor, width: u16, height: u16) -> (Canvas, Opt
 
     let mut pane_rects = Vec::new();
     layout_rects(&editor.layout, content, &mut pane_rects);
-    sync_viewports(editor, &pane_rects);
+    sync_viewports(builder, editor, &pane_rects);
     let mut editor_cursor = None;
     for (pane_id, rect) in &pane_rects {
         if let Some(pane) = editor.panes.iter().find(|pane| pane.id == *pane_id) {
-            let cursor = render_pane(&mut canvas, editor, pane, *rect, palette);
+            let cursor = render_pane(builder, &mut canvas, editor, pane, *rect, palette);
             if *pane_id == editor.active_pane {
                 editor_cursor = cursor;
             }
@@ -934,7 +1150,7 @@ fn render_split_lines(canvas: &mut Canvas, layout: &Layout, rect: Rect, palette:
     }
 }
 
-fn sync_viewports(editor: &mut Editor, rects: &[(u64, Rect)]) {
+fn sync_viewports(builder: &mut FrameBuilder, editor: &mut Editor, rects: &[(u64, Rect)]) {
     for (id, rect) in rects {
         let Some(pane_index) = editor.panes.iter().position(|pane| pane.id == *id) else {
             continue;
@@ -948,17 +1164,10 @@ fn sync_viewports(editor: &mut Editor, rects: &[(u64, Rect)]) {
             .map(|anchor| buffer.clamp_pos(anchor));
         let line = buffer.line(cursor.line).unwrap_or("");
         let tab_width = editor.config.editor.tab_width.max(1);
-        let cursor_column =
-            line.graphemes(true)
-                .take(cursor.grapheme)
-                .fold(0_usize, |column, grapheme| {
-                    column
-                        + if grapheme == "\t" {
-                            tab_width - (column % tab_width)
-                        } else {
-                            UnicodeWidthStr::width(grapheme).max(1)
-                        }
-                });
+        let cursor_column = builder
+            .line(buffer, cursor.line, tab_width)
+            .at_grapheme(line, cursor.grapheme)
+            .column;
         let gutter = (buffer.line_count().max(1).to_string().len() as u16 + 3)
             .min(rect.width.saturating_sub(1));
         let visible_lines = usize::from(rect.height.max(1));
@@ -982,6 +1191,7 @@ fn sync_viewports(editor: &mut Editor, rects: &[(u64, Rect)]) {
 }
 
 fn render_pane(
+    builder: &mut FrameBuilder,
     canvas: &mut Canvas,
     editor: &Editor,
     pane: &Pane,
@@ -997,7 +1207,6 @@ fn render_pane(
     let gutter = (digits + 3).min(rect.width.saturating_sub(1));
     let content_x = rect.x.saturating_add(gutter);
     let content_width = rect.width.saturating_sub(gutter);
-    let language = syntax::language_for_path(buffer.path());
     let diagnostics = editor
         .diagnostics
         .iter()
@@ -1051,11 +1260,18 @@ fn render_pane(
             );
         }
         let line = buffer.line(line_number).unwrap_or("");
-        let spans = syntax::highlight_line(language, line);
-        let mut display_column = 0_usize;
-        for (grapheme_index, (byte, grapheme)) in line.grapheme_indices(true).enumerate() {
+        let tab_width = editor.config.editor.tab_width.max(1);
+        let cached = builder.line(buffer, line_number, tab_width);
+        let start = cached.at_column(line, pane.viewport_column);
+        let cursor_column =
+            active_line.then(|| cached.at_grapheme(line, pane.cursor.grapheme).column);
+        let mut spans = cached.spans.iter().peekable();
+        let mut display_column = start.column;
+        for (offset, (byte, grapheme)) in line[start.byte..].grapheme_indices(true).enumerate() {
+            let grapheme_index = start.grapheme + offset;
+            let byte = start.byte + byte;
             let width = if grapheme == "\t" {
-                editor.config.editor.tab_width - (display_column % editor.config.editor.tab_width)
+                tab_width - (display_column % tab_width)
             } else {
                 UnicodeWidthStr::width(grapheme).max(1)
             };
@@ -1069,9 +1285,12 @@ fn render_pane(
                 break;
             }
             let selected = is_selected(editor, pane, line_number, grapheme_index);
+            while spans.peek().is_some_and(|span| span.end <= byte) {
+                spans.next();
+            }
             let kind = spans
-                .iter()
-                .find(|span| byte >= span.start && byte < span.end)
+                .peek()
+                .filter(|span| byte >= span.start && byte < span.end)
                 .map(|span| span.kind)
                 .unwrap_or(Highlight::Plain);
             let mut style = syntax_style(kind, palette);
@@ -1135,18 +1354,7 @@ fn render_pane(
             }
         }
         if pane.id == editor.active_pane && active_line {
-            let before = line.graphemes(true).take(pane.cursor.grapheme).fold(
-                0_usize,
-                |column, grapheme| {
-                    column
-                        + if grapheme == "\t" {
-                            editor.config.editor.tab_width
-                                - (column % editor.config.editor.tab_width)
-                        } else {
-                            UnicodeWidthStr::width(grapheme).max(1)
-                        }
-                },
-            );
+            let before = cursor_column.expect("active line has cursor column");
             let x = content_x.saturating_add(before.saturating_sub(pane.viewport_column) as u16);
             if x < rect.x.saturating_add(rect.width) {
                 cursor = Some((x, rect.y + row));
@@ -1592,6 +1800,147 @@ mod tests {
         assert_eq!(canvas.cells[1].symbol, "界");
         assert!(canvas.cells[2].continuation);
         assert_eq!(canvas.cells[3].symbol, "b");
+    }
+
+    #[test]
+    fn canvas_preserves_graphemes_larger_than_inline_cell_storage() {
+        let mut canvas = Canvas::new(4, 1, Style::default());
+        let family = "👩‍👩‍👧‍👦";
+        assert_eq!(canvas.put_grapheme(0, 0, family, Style::default()), 2);
+        assert_eq!(canvas.cells[0].symbol.as_str(), family);
+        assert!(canvas.cells[1].continuation);
+        assert_eq!(canvas.cells[0].clone().symbol.as_str(), family);
+    }
+
+    #[test]
+    fn display_index_preserves_tabs_wide_and_combining_graphemes() {
+        let text = "a界\t e\u{301}👩‍💻".repeat(700);
+        let mut line = CachedLine::new(&text, syntax::Language::Plain, 4, 0);
+        assert_eq!(
+            line.at_column(&text, 2),
+            DisplayPoint {
+                byte: 1,
+                grapheme: 1,
+                column: 1
+            }
+        );
+        assert!(
+            line.scanned.byte < 20,
+            "first lookup must not index an entire long line"
+        );
+        assert_eq!(
+            line.at_column(&text, 7),
+            DisplayPoint {
+                byte: 9,
+                grapheme: 5,
+                column: 6
+            }
+        );
+        assert_eq!(
+            line.at_grapheme(&text, 3500),
+            DisplayPoint {
+                byte: 11664,
+                grapheme: 3500,
+                column: 4667
+            }
+        );
+        assert_eq!(
+            line.at_column(&text, 5000),
+            DisplayPoint {
+                byte: 12500,
+                grapheme: 3750,
+                column: 5000
+            }
+        );
+        assert_eq!(line.at_grapheme(&text, 0), DisplayPoint::default());
+        assert_eq!(
+            line.at_column(&text, 3),
+            DisplayPoint {
+                byte: 4,
+                grapheme: 2,
+                column: 3
+            }
+        );
+    }
+
+    #[test]
+    fn cached_syntax_updates_before_insert_transaction_is_committed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cache.rs");
+        std::fs::write(&path, "let value = 1;").unwrap();
+        let mut editor = Editor::new(Config::default(), directory.path().to_owned());
+        editor.open_path(&path).unwrap();
+        let mut builder = FrameBuilder::new();
+        let (before, _) = builder.draw_editor(&mut editor, 40, 5);
+        assert_eq!(
+            before.cells[4].style.fg,
+            Palette::from_editor(&editor).keyword
+        );
+        let version = editor.active_buffer().version();
+        editor.active_buffer_mut().begin_transaction().unwrap();
+        editor
+            .active_buffer_mut()
+            .insert(crate::buffer::Pos::ZERO, "//")
+            .unwrap();
+        let (after, _) = builder.draw_editor(&mut editor, 40, 5);
+        assert_eq!(editor.active_buffer().version(), version);
+        assert!(row(&after, 0).contains("//let value"));
+        assert_eq!(
+            after.cells[4].style.fg,
+            Palette::from_editor(&editor).comment
+        );
+    }
+
+    #[test]
+    fn display_cache_tracks_tab_width_and_replaced_scratch_buffers() {
+        let mut editor = Editor::new(Config::default(), PathBuf::from("/work"));
+        editor.buffers[0].buffer = Buffer::from_text("\tx");
+        editor.config.editor.tab_width = 4;
+        editor.active_pane_mut().cursor = crate::buffer::Pos::new(0, 1);
+        let mut builder = FrameBuilder::new();
+        assert_eq!(builder.draw_editor(&mut editor, 40, 5).1, Some((8, 0)));
+        editor.config.editor.tab_width = 8;
+        assert_eq!(builder.draw_editor(&mut editor, 40, 5).1, Some((12, 0)));
+        editor.buffers[0].buffer = Buffer::from_text("replacement");
+        let (canvas, cursor) = builder.draw_editor(&mut editor, 40, 5);
+        assert_eq!(cursor, Some((5, 0)));
+        assert!(row(&canvas, 0).contains("replacement"));
+    }
+
+    #[test]
+    fn scrolling_releases_old_offscreen_line_indexes() {
+        let mut editor = Editor::new(Config::default(), PathBuf::from("/work"));
+        editor.buffers[0].buffer = Buffer::from_text("text\n".repeat(1000));
+        let mut builder = FrameBuilder::new();
+        for line in (0..1000).step_by(50) {
+            editor.active_pane_mut().cursor = crate::buffer::Pos::new(line, 0);
+            builder.draw_editor(&mut editor, 120, 40);
+            assert!(builder.lines.len() <= 256);
+        }
+    }
+
+    #[test]
+    fn long_line_scrolling_keeps_bounded_syntax_and_visible_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("long.rs");
+        let text = format!("{}END", "let value = 1; ".repeat(70_000));
+        std::fs::write(&path, &text).unwrap();
+        let mut editor = Editor::new(Config::default(), directory.path().to_owned());
+        editor.open_path(&path).unwrap();
+        let mut builder = FrameBuilder::new();
+        let (first, _) = builder.draw_editor(&mut editor, 120, 40);
+        assert!(row(&first, 0).contains("let value"));
+        editor.active_pane_mut().cursor = crate::buffer::Pos::new(0, text.len() - 1);
+        let (last, cursor) = builder.draw_editor(&mut editor, 120, 40);
+        assert!(row(&last, 0).contains("END"));
+        assert_eq!(cursor, Some((119, 0)));
+        assert!(
+            builder
+                .lines
+                .values()
+                .flat_map(|line| &line.spans)
+                .all(|span| span.end <= syntax::MAX_HIGHLIGHT_BYTES)
+        );
     }
 
     #[test]

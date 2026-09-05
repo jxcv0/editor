@@ -388,7 +388,8 @@ pub struct Editor {
     last_macro: Option<char>,
     macro_depth: usize,
     next_pane_id: PaneId,
-    project_files: Vec<PathBuf>,
+    file_finder: Option<crate::project::FileFinder>,
+    file_finder_active: bool,
     project_search_results: Vec<PickerItem>,
     recent_files: Vec<PathBuf>,
 }
@@ -400,10 +401,17 @@ impl Editor {
         let show_ignored = config.ui.show_ignored;
         let terminal_background =
             parse_hex_color(&config.ui.theme.background).unwrap_or((0x11, 0x13, 0x18));
+        let mut scratch = Buffer::new();
+        scratch
+            .set_undo_limit(config.limits.undo_steps)
+            .expect("new buffer has no transaction");
+        scratch
+            .set_undo_byte_limit(config.limits.undo_bytes)
+            .expect("new buffer has no transaction");
         Self {
             config,
             buffers: vec![BufferSlot {
-                buffer: Buffer::new(),
+                buffer: scratch,
                 display_name: "[scratch]".into(),
                 large_file: false,
             }],
@@ -456,7 +464,8 @@ impl Editor {
             last_macro: None,
             macro_depth: 0,
             next_pane_id: 2,
-            project_files: Vec::new(),
+            file_finder: None,
+            file_finder_active: false,
             project_search_results: Vec::new(),
             recent_files: Vec::new(),
         }
@@ -488,8 +497,11 @@ impl Editor {
     pub fn set_project_files(&mut self, mut files: Vec<PathBuf>) {
         files.sort();
         files.dedup();
-        self.project_files = files.clone();
-        self.explorer.files = files;
+        self.explorer.files.clear();
+        if let Some(finder) = &self.file_finder {
+            finder.reset(self.explorer.root.clone());
+        }
+        self.append_project_files(files);
         self.explorer.selected = self
             .explorer
             .selected
@@ -501,6 +513,64 @@ impl Editor {
         {
             self.refresh_picker();
         }
+    }
+
+    /// Incorporate only the new scan batch. The ranking worker owns its index;
+    /// the explorer keeps the traversal order without repeatedly sorting or
+    /// cloning paths discovered by earlier batches.
+    pub fn append_project_files(&mut self, files: Vec<PathBuf>) {
+        if files.is_empty() {
+            return;
+        }
+        self.explorer.files.extend(files.iter().cloned());
+        self.file_finder
+            .get_or_insert_with(|| crate::project::FileFinder::new(self.explorer.root.clone()))
+            .append(files);
+    }
+
+    /// Publish results only for the current query and current project index.
+    /// Returns whether visible picker contents changed.
+    pub fn poll_file_finder(&mut self) -> bool {
+        let Some(finder) = &self.file_finder else {
+            return false;
+        };
+        if !self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.kind == PickerKind::Files)
+        {
+            if self.file_finder_active {
+                finder.cancel();
+                self.file_finder_active = false;
+            }
+            return false;
+        }
+        let Some(result) = finder.try_recv() else {
+            return false;
+        };
+        let Some(picker) = self
+            .picker
+            .as_mut()
+            .filter(|picker| picker.kind == PickerKind::Files && picker.query == result.query)
+        else {
+            return false;
+        };
+        if result.generation != finder.generation() {
+            return false;
+        }
+        picker.items = result
+            .files
+            .into_iter()
+            .map(|matched| PickerItem {
+                label: matched.relative_path.display().to_string(),
+                detail: format!("score {}", matched.score),
+                path: Some(matched.path),
+                line: None,
+                insert_text: None,
+            })
+            .collect();
+        picker.selected = picker.selected.min(picker.items.len().saturating_sub(1));
+        true
     }
 
     pub fn set_project_search_results(&mut self, items: Vec<PickerItem>) {
@@ -628,6 +698,7 @@ impl Editor {
             Buffer::new_file(&canonical)?
         };
         buffer.set_undo_limit(self.config.limits.undo_steps)?;
+        buffer.set_undo_byte_limit(self.config.limits.undo_bytes)?;
         let display_name = canonical
             .strip_prefix(&self.explorer.root)
             .unwrap_or(&canonical)
@@ -654,8 +725,15 @@ impl Editor {
     }
 
     pub fn open_scratch_text(&mut self, name: impl Into<String>, text: &str) -> usize {
+        let mut buffer = Buffer::from_unsaved_text(text);
+        buffer
+            .set_undo_limit(self.config.limits.undo_steps)
+            .expect("new buffer has no transaction");
+        buffer
+            .set_undo_byte_limit(self.config.limits.undo_bytes)
+            .expect("new buffer has no transaction");
         self.buffers.push(BufferSlot {
-            buffer: Buffer::from_unsaved_text(text),
+            buffer,
             display_name: name.into(),
             large_file: false,
         });
@@ -1871,87 +1949,83 @@ impl Editor {
         Some(pos)
     }
 
-    fn word_forward(&self, mut pos: Pos) -> Option<Pos> {
-        let buffer = self.active_buffer();
-        let initial = grapheme_class(grapheme_at(buffer, pos));
-        if initial != 0 {
-            loop {
-                let next = buffer.next_pos(pos).ok()??;
-                if grapheme_class(grapheme_at(buffer, next)) != initial {
-                    pos = next;
-                    break;
-                }
-                pos = next;
+    fn word_forward(&self, pos: Pos) -> Option<Pos> {
+        let mut graphemes = word_graphemes(self.active_buffer(), pos);
+        let (_, initial) = graphemes.next()?;
+        let mut in_initial_run = initial != 0;
+        let mut end = pos;
+        for (next, class) in graphemes {
+            end = next;
+            if in_initial_run && class == initial {
+                continue;
+            }
+            in_initial_run = false;
+            if class != 0 {
+                return Some(next);
             }
         }
-        while grapheme_class(grapheme_at(buffer, pos)) == 0 {
-            // Keep the insertion-point boundary at EOF for operator motions.
-            // Normal movement clamps it later, while `dw` needs it to include
-            // the final grapheme of the buffer.
-            let Some(next) = buffer.next_pos(pos).ok()? else {
-                return Some(pos);
-            };
-            pos = next;
-        }
-        Some(pos)
+        // Operators need the insertion-point boundary at EOF to include the
+        // final grapheme. Normal movement clamps that boundary afterwards.
+        Some(end)
     }
 
-    fn word_backward(&self, mut pos: Pos) -> Option<Pos> {
+    fn word_backward(&self, pos: Pos) -> Option<Pos> {
         let buffer = self.active_buffer();
-        pos = buffer.previous_pos(pos).ok()??;
-        while grapheme_class(grapheme_at(buffer, pos)) == 0 {
-            let Some(previous) = buffer.previous_pos(pos).ok()? else {
-                return Some(Pos::ZERO);
+        let mut run_class = None;
+        let mut start = Pos::ZERO;
+        for line_number in (0..=pos.line).rev() {
+            let mut graphemes = buffer.line(line_number)?.graphemes(true);
+            let mut column = graphemes.clone().count();
+            let before = if line_number == pos.line {
+                pos.grapheme.min(column)
+            } else {
+                column
             };
-            pos = previous;
-        }
-        let class = grapheme_class(grapheme_at(buffer, pos));
-        while let Some(previous) = buffer.previous_pos(pos).ok()? {
-            if grapheme_class(grapheme_at(buffer, previous)) != class {
-                break;
+            // Locate the starting boundary once, then retain the iterator as
+            // we move backwards instead of restarting segmentation per step.
+            while column > before {
+                graphemes.next_back();
+                column -= 1;
             }
-            pos = previous;
+            for grapheme in graphemes.rev() {
+                column -= 1;
+                let class = grapheme_class(Some(grapheme));
+                if let Some(current) = run_class {
+                    if current != class {
+                        return Some(start);
+                    }
+                } else if class == 0 {
+                    continue;
+                } else {
+                    run_class = Some(class);
+                }
+                start = Pos::new(line_number, column);
+            }
+            // A line separator ends a non-whitespace run.
+            if run_class.is_some() {
+                return Some(start);
+            }
         }
-        Some(self.normal_clamp(pos))
+        Some(Pos::ZERO)
     }
 
-    fn word_end(&self, mut pos: Pos) -> Option<Pos> {
-        let buffer = self.active_buffer();
-        let initial_class = grapheme_class(grapheme_at(buffer, pos));
-        if initial_class != 0 {
-            let mut moved_within_run = false;
-            loop {
-                let Some(next) = buffer.next_pos(pos).ok()? else {
-                    return Some(self.normal_clamp(pos));
-                };
-                if grapheme_class(grapheme_at(buffer, next)) != initial_class {
-                    break;
+    fn word_end(&self, pos: Pos) -> Option<Pos> {
+        let mut graphemes = word_graphemes(self.active_buffer(), pos);
+        graphemes.next()?;
+        let mut run_class = None;
+        let mut end = pos;
+        for (next, class) in graphemes {
+            if let Some(current) = run_class {
+                if current != class {
+                    return Some(self.normal_clamp(end));
                 }
-                pos = next;
-                moved_within_run = true;
-            }
-            if moved_within_run {
-                return Some(self.normal_clamp(pos));
-            }
-        }
-        let fallback = pos;
-        loop {
-            let Some(next) = buffer.next_pos(pos).ok()? else {
-                return Some(self.normal_clamp(fallback));
-            };
-            pos = next;
-            if grapheme_class(grapheme_at(buffer, pos)) != 0 {
-                break;
+                end = next;
+            } else if class != 0 {
+                run_class = Some(class);
+                end = next;
             }
         }
-        let class = grapheme_class(grapheme_at(buffer, pos));
-        while let Some(next) = buffer.next_pos(pos).ok()? {
-            if grapheme_class(grapheme_at(buffer, next)) != class {
-                break;
-            }
-            pos = next;
-        }
-        Some(self.normal_clamp(pos))
+        Some(self.normal_clamp(end))
     }
 
     fn match_pair(&self, pos: Pos) -> Option<Pos> {
@@ -3453,24 +3527,15 @@ impl Editor {
         let current_buffer_diagnostics = picker.current_buffer_diagnostics;
         let limit = self.config.limits.search_results;
         let items = match kind {
-            PickerKind::Files => crate::project::rank_paths(&query, &self.project_files, limit)
-                .into_iter()
-                .map(|matched| {
-                    let label = matched
-                        .path
-                        .strip_prefix(&self.explorer.root)
-                        .unwrap_or(&matched.path)
-                        .display()
-                        .to_string();
-                    PickerItem {
-                        label,
-                        detail: format!("score {}", matched.score),
-                        path: Some(matched.path),
-                        line: None,
-                        insert_text: None,
-                    }
-                })
-                .collect(),
+            PickerKind::Files => {
+                self.file_finder_active = true;
+                self.file_finder
+                    .get_or_insert_with(|| {
+                        crate::project::FileFinder::new(self.explorer.root.clone())
+                    })
+                    .request(query, limit);
+                Vec::new()
+            }
             PickerKind::Buffers => self
                 .buffers
                 .iter()
@@ -3716,6 +3781,29 @@ impl Editor {
     }
 }
 
+/// Stream word classes with a whitespace boundary at each logical line end.
+/// Each visited line is segmented once, including when a motion crosses it.
+fn word_graphemes(buffer: &Buffer, from: Pos) -> impl Iterator<Item = (Pos, u8)> + '_ {
+    (from.line..buffer.line_count()).flat_map(move |line_number| {
+        let skip = if line_number == from.line {
+            from.grapheme
+        } else {
+            0
+        };
+        buffer
+            .line(line_number)
+            .unwrap_or("")
+            .graphemes(true)
+            .map(Some)
+            .chain(std::iter::once(None))
+            .enumerate()
+            .skip(skip)
+            .map(move |(column, grapheme)| {
+                (Pos::new(line_number, column), grapheme_class(grapheme))
+            })
+    })
+}
+
 fn grapheme_at(buffer: &Buffer, pos: Pos) -> Option<&str> {
     buffer.line(pos.line)?.graphemes(true).nth(pos.grapheme)
 }
@@ -3799,6 +3887,41 @@ mod tests {
             keys(&mut editor, sequence);
             assert_eq!(editor.active_buffer().text(), "three");
         }
+    }
+
+    #[test]
+    fn word_motions_cross_unicode_runs_and_empty_lines() {
+        let mut editor = editor("ábc  👩‍💻!\n\n  next word");
+        for expected in [Pos::new(0, 5), Pos::new(2, 2), Pos::new(2, 7)] {
+            keys(&mut editor, "w");
+            assert_eq!(editor.active_pane().cursor, expected);
+        }
+        for expected in [Pos::new(2, 2), Pos::new(0, 5), Pos::ZERO] {
+            keys(&mut editor, "b");
+            assert_eq!(editor.active_pane().cursor, expected);
+        }
+        for expected in [
+            Pos::new(0, 2),
+            Pos::new(0, 6),
+            Pos::new(2, 5),
+            Pos::new(2, 10),
+        ] {
+            keys(&mut editor, "e");
+            assert_eq!(editor.active_pane().cursor, expected);
+        }
+    }
+
+    #[test]
+    fn word_operators_handle_long_words_and_final_graphemes() {
+        let word = "a\u{301}".repeat(4_000);
+        let mut editor = editor(&format!("{word} tail"));
+        keys(&mut editor, "dw");
+        assert_eq!(editor.active_buffer().text(), "tail");
+        keys(&mut editor, "u");
+        keys(&mut editor, "e");
+        assert_eq!(editor.active_pane().cursor, Pos::new(0, 3_999));
+        keys(&mut editor, "b");
+        assert_eq!(editor.active_pane().cursor, Pos::ZERO);
     }
 
     #[test]
@@ -4184,6 +4307,56 @@ mod tests {
             editor.take_request(),
             EditorRequest::DocumentSaved(path) if path == file.canonicalize().unwrap()
         ));
+    }
+
+    #[test]
+    fn file_picker_publishes_only_current_query_results() {
+        let mut editor = editor("");
+        editor.set_project_files(vec![PathBuf::from("old.rs"), PathBuf::from("new.rs")]);
+        editor.open_picker(PickerKind::Files);
+        editor.picker.as_mut().unwrap().query = "old".into();
+        editor.refresh_picker();
+
+        fn wait_for_results(editor: &mut Editor) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !editor.poll_file_finder() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "file finder did not publish"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+
+        wait_for_results(&mut editor);
+        assert_eq!(editor.picker.as_ref().unwrap().items[0].label, "old.rs");
+        editor.picker.as_mut().unwrap().query = "new".into();
+        editor.refresh_picker();
+        assert!(editor.picker.as_ref().unwrap().items.is_empty());
+        wait_for_results(&mut editor);
+        assert_eq!(editor.picker.as_ref().unwrap().items[0].label, "new.rs");
+
+        editor.append_project_files(vec![PathBuf::from("newer.rs")]);
+        wait_for_results(&mut editor);
+        assert_eq!(editor.picker.as_ref().unwrap().items.len(), 2);
+
+        editor.refresh_picker();
+        editor.show_picker_items(
+            PickerKind::Symbols,
+            vec![PickerItem {
+                label: "keep this symbol".into(),
+                detail: String::new(),
+                path: None,
+                line: None,
+                insert_text: None,
+            }],
+        );
+        assert!(!editor.poll_file_finder());
+        assert_eq!(
+            editor.picker.as_ref().unwrap().items[0].label,
+            "keep this symbol"
+        );
+        assert!(!editor.file_finder_active);
     }
 
     #[test]

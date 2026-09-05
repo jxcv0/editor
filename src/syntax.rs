@@ -41,7 +41,16 @@ pub fn language_for_path(path: Option<&Path>) -> Language {
     }
 }
 
+/// A pathological generated line must not delay a frame to color offscreen text.
+/// Text beyond this prefix remains readable with the plain-text style.
+pub const MAX_HIGHLIGHT_BYTES: usize = 16 * 1024;
+
 pub fn highlight_line(language: Language, line: &str) -> Vec<Span> {
+    let mut end = line.len().min(MAX_HIGHLIGHT_BYTES);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let line = &line[..end];
     match language {
         Language::Rust => rust(line),
         Language::Toml => toml(line),
@@ -276,5 +285,26 @@ mod tests {
             language_for_path(Some(Path::new("src/main.rs"))),
             Language::Rust
         );
+    }
+
+    #[test]
+    fn pathological_lines_have_a_bounded_utf8_safe_highlight_prefix() {
+        let line = format!(
+            "{}{}let hidden = 1;",
+            " ".repeat(MAX_HIGHLIGHT_BYTES - 1),
+            "界"
+        );
+        for language in [Language::Rust, Language::Toml, Language::Markdown] {
+            let spans = highlight_line(language, &line);
+            assert!(spans.iter().all(|span| span.end <= MAX_HIGHLIGHT_BYTES));
+            assert!(spans.iter().all(|span| {
+                line.is_char_boundary(span.start) && line.is_char_boundary(span.end)
+            }));
+        }
+
+        let line = "let value = 1; ".repeat(MAX_HIGHLIGHT_BYTES);
+        let spans = highlight_line(Language::Rust, &line);
+        assert!(!spans.is_empty());
+        assert!(spans.iter().all(|span| span.end <= MAX_HIGHLIGHT_BYTES));
     }
 }

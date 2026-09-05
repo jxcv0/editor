@@ -79,6 +79,8 @@ pub struct LimitsConfig {
     pub large_file_bytes: u64,
     pub message_history: usize,
     pub undo_steps: usize,
+    /// Maximum retained undo payload per buffer; zero disables retained edits.
+    pub undo_bytes: usize,
     pub search_results: usize,
     pub tool_message_bytes: usize,
 }
@@ -159,6 +161,7 @@ impl Default for LimitsConfig {
             large_file_bytes: 10 * 1024 * 1024,
             message_history: 256,
             undo_steps: 1_000,
+            undo_bytes: 64 * 1024 * 1024,
             search_results: 2_000,
             tool_message_bytes: 8 * 1024 * 1024,
         }

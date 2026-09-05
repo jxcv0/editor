@@ -787,6 +787,358 @@ fn compare_fuzzy_paths(left: &FuzzyPathMatch, right: &FuzzyPathMatch) -> Orderin
         .then_with(|| left.relative_path.cmp(&right.relative_path))
 }
 
+/// A ranked file from the cached project index. Only retained results own paths.
+#[derive(Debug)]
+pub struct RankedFile {
+    pub path: PathBuf,
+    pub relative_path: PathBuf,
+    pub score: i64,
+}
+
+#[derive(Debug)]
+pub struct FileFinderResult {
+    pub generation: u64,
+    pub query: String,
+    pub files: Vec<RankedFile>,
+}
+
+#[derive(Default)]
+struct FinderInbox {
+    root: Option<PathBuf>,
+    paths: Vec<PathBuf>,
+    query: Option<Option<(String, usize)>>,
+}
+
+/// One worker owns the normalized path index and matcher scratch storage. Query
+/// replacement is constant work on the caller: stale ranking observes the
+/// generation counter, and only the newest queued query is retained.
+pub struct FileFinder {
+    inbox: Arc<std::sync::Mutex<FinderInbox>>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    closing: Arc<AtomicBool>,
+    wake: Sender<()>,
+    results: Receiver<FileFinderResult>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl FileFinder {
+    pub fn new(root: PathBuf) -> Self {
+        let inbox = Arc::new(std::sync::Mutex::new(FinderInbox::default()));
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let closing = Arc::new(AtomicBool::new(false));
+        let (wake, wake_rx) = bounded(1);
+        let (result_tx, results) = bounded(1);
+        let stale_results = results.clone();
+        let worker_inbox = Arc::clone(&inbox);
+        let worker_generation = Arc::clone(&generation);
+        let worker_closing = Arc::clone(&closing);
+        let worker = thread::Builder::new()
+            .name("project-file-rank".into())
+            .spawn(move || {
+                let mut root = root;
+                let mut candidates = Vec::new();
+                let mut query = None;
+                let mut scratch = ScoreScratch::default();
+                while wake_rx.recv().is_ok() {
+                    if worker_closing.load(AtomicOrdering::Acquire) {
+                        break;
+                    }
+                    let (updates, generation) = {
+                        let mut inbox = worker_inbox.lock().unwrap_or_else(|e| e.into_inner());
+                        let generation = worker_generation.load(AtomicOrdering::Acquire);
+                        (std::mem::take(&mut *inbox), generation)
+                    };
+                    if let Some(new_root) = updates.root {
+                        root = new_root;
+                        candidates.clear();
+                    }
+                    for path in updates.paths {
+                        if worker_closing.load(AtomicOrdering::Acquire) {
+                            return;
+                        }
+                        candidates.push(PathCandidate::new(path, &root));
+                    }
+                    if let Some(new_query) = updates.query {
+                        query = new_query;
+                    }
+                    let Some((text, limit)) = &query else {
+                        continue;
+                    };
+                    let cancelled = || {
+                        worker_generation.load(AtomicOrdering::Acquire) != generation
+                            || worker_closing.load(AtomicOrdering::Acquire)
+                    };
+                    let Some(files) =
+                        rank_candidates(text, &candidates, *limit, &mut scratch, &cancelled)
+                    else {
+                        continue;
+                    };
+                    let result = FileFinderResult {
+                        generation,
+                        query: text.clone(),
+                        files,
+                    };
+                    // A slow UI needs the newest result, not a queue of results
+                    // for queries it has already replaced.
+                    if let Err(crossbeam_channel::TrySendError::Full(result)) =
+                        result_tx.try_send(result)
+                    {
+                        let _ = stale_results.try_recv();
+                        let _ = result_tx.try_send(result);
+                    }
+                }
+            })
+            .expect("failed to spawn file-ranking worker");
+        Self {
+            inbox,
+            generation,
+            closing,
+            wake,
+            results,
+            worker: Some(worker),
+        }
+    }
+
+    pub fn reset(&self, root: PathBuf) {
+        self.update(|inbox| {
+            inbox.root = Some(root);
+            inbox.paths.clear();
+        });
+    }
+
+    pub fn append(&self, paths: Vec<PathBuf>) {
+        if !paths.is_empty() {
+            self.update(|inbox| inbox.paths.extend(paths));
+        }
+    }
+
+    pub fn request(&self, query: String, limit: usize) {
+        self.update(|inbox| inbox.query = Some(Some((query, limit))));
+    }
+
+    pub fn cancel(&self) {
+        self.update(|inbox| inbox.query = Some(None));
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(AtomicOrdering::Acquire)
+    }
+
+    pub fn try_recv(&self) -> Option<FileFinderResult> {
+        self.results.try_recv().ok()
+    }
+
+    fn update(&self, change: impl FnOnce(&mut FinderInbox)) {
+        {
+            let mut inbox = self.inbox.lock().unwrap_or_else(|e| e.into_inner());
+            change(&mut inbox);
+            self.generation.fetch_add(1, AtomicOrdering::AcqRel);
+        }
+        let _ = self.wake.try_send(());
+    }
+}
+
+impl Drop for FileFinder {
+    fn drop(&mut self) {
+        self.closing.store(true, AtomicOrdering::Release);
+        let _ = self.wake.try_send(());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+struct PathCandidate {
+    path: PathBuf,
+    relative_path: PathBuf,
+    characters: Vec<(usize, char)>,
+    bonuses: Vec<i64>,
+    folded: String,
+    folded_basename: String,
+}
+
+impl PathCandidate {
+    fn new(path: PathBuf, root: &Path) -> Self {
+        let relative_path = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+        let text = relative_path.to_string_lossy();
+        let characters: Vec<_> = text.char_indices().collect();
+        let bonuses = (0..characters.len())
+            .map(|index| fuzzy_character_bonus(&characters, index, characters[index].1) - 1)
+            .collect();
+        let folded = text.to_lowercase();
+        let folded_basename = candidate_basename(&characters).to_lowercase();
+        Self {
+            path,
+            relative_path,
+            characters,
+            bonuses,
+            folded,
+            folded_basename,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ScoreScratch {
+    previous: Vec<i64>,
+    current: Vec<i64>,
+}
+
+impl ScoreScratch {
+    fn score(
+        &mut self,
+        query: &[char],
+        folded_query: &str,
+        candidate: &PathCandidate,
+        cancelled: &impl Fn() -> bool,
+    ) -> Option<i64> {
+        if query.is_empty() {
+            return Some(0);
+        }
+        let width = candidate.characters.len();
+        if query.len() > width {
+            return None;
+        }
+        // Most paths can be rejected without entering dynamic programming.
+        let mut next = 0;
+        for &needle in query {
+            while next < width && !chars_equal_folded(needle, candidate.characters[next].1) {
+                next += 1;
+            }
+            if next == width {
+                return None;
+            }
+            next += 1;
+        }
+        const IMPOSSIBLE: i64 = i64::MIN / 4;
+        self.previous.resize(width, IMPOSSIBLE);
+        self.previous.fill(IMPOSSIBLE);
+        self.current.resize(width, IMPOSSIBLE);
+        for (query_index, &needle) in query.iter().enumerate() {
+            if cancelled() {
+                return None;
+            }
+            self.current.fill(IMPOSSIBLE);
+            let mut best_prefix = IMPOSSIBLE;
+            for index in 0..width {
+                if query_index > 0 && index >= 2 && self.previous[index - 2] != IMPOSSIBLE {
+                    best_prefix = best_prefix.max(self.previous[index - 2] + (index - 2) as i64);
+                }
+                let hay = candidate.characters[index].1;
+                if !chars_equal_folded(needle, hay) {
+                    continue;
+                }
+                let intrinsic = candidate.bonuses[index] + i64::from(needle == hay);
+                if query_index == 0 {
+                    self.current[index] = intrinsic - index as i64;
+                    continue;
+                }
+                let mut best = IMPOSSIBLE;
+                if index > 0 && self.previous[index - 1] != IMPOSSIBLE {
+                    best = self.previous[index - 1] + 15;
+                }
+                if best_prefix != IMPOSSIBLE {
+                    best = best.max(best_prefix + 1 - index as i64);
+                }
+                if best != IMPOSSIBLE {
+                    self.current[index] = best + intrinsic;
+                }
+            }
+            std::mem::swap(&mut self.previous, &mut self.current);
+        }
+        let mut score = self
+            .previous
+            .iter()
+            .enumerate()
+            .filter(|(_, score)| **score != IMPOSSIBLE)
+            .map(|(index, score)| score - ((width - index - 1) as i64 / 4))
+            .max()?;
+        if candidate.folded == folded_query {
+            score += 80;
+        } else if candidate.folded.starts_with(folded_query) {
+            score += 30;
+        }
+        if candidate.folded_basename == folded_query {
+            score += 50;
+        }
+        Some(score)
+    }
+}
+
+#[derive(Eq, PartialEq)]
+struct RankedCandidate<'a> {
+    index: usize,
+    score: i64,
+    path: &'a Path,
+}
+
+impl Ord for RankedCandidate<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // The heap root is the worst retained match.
+        other
+            .score
+            .cmp(&self.score)
+            .then_with(|| self.path.cmp(other.path))
+            .then_with(|| self.index.cmp(&other.index))
+    }
+}
+
+impl PartialOrd for RankedCandidate<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn rank_candidates(
+    text: &str,
+    candidates: &[PathCandidate],
+    limit: usize,
+    scratch: &mut ScoreScratch,
+    cancelled: &impl Fn() -> bool,
+) -> Option<Vec<RankedFile>> {
+    let query: Vec<_> = text.chars().collect();
+    let folded_query = text.to_lowercase();
+    let mut ranked = std::collections::BinaryHeap::with_capacity(limit.min(candidates.len()));
+    if limit == 0 {
+        return Some(Vec::new());
+    }
+    for (index, candidate) in candidates.iter().enumerate() {
+        if cancelled() {
+            return None;
+        }
+        let Some(score) = scratch.score(&query, &folded_query, candidate, cancelled) else {
+            continue;
+        };
+        let found = RankedCandidate {
+            index,
+            score,
+            path: &candidate.relative_path,
+        };
+        if ranked.len() < limit {
+            ranked.push(found);
+        } else if ranked.peek().is_some_and(|worst| found < *worst) {
+            *ranked.peek_mut().expect("nonempty limited heap") = found;
+        }
+    }
+    if cancelled() {
+        return None;
+    }
+    Some(
+        ranked
+            .into_sorted_vec()
+            .into_iter()
+            .map(|matched| {
+                let candidate = &candidates[matched.index];
+                RankedFile {
+                    path: candidate.path.clone(),
+                    relative_path: candidate.relative_path.clone(),
+                    score: matched.score,
+                }
+            })
+            .collect(),
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct FileFindOptions {
     pub scan: ScanOptions,
@@ -927,14 +1279,13 @@ pub struct TextSearchMatch {
 }
 
 /// Search project text on a background thread. Invalid regex syntax is
-/// reported synchronously; walking and file errors arrive as stream events.
+/// delivered as stream events, alongside walking and file errors.
 pub fn search_project(
     root: impl AsRef<Path>,
     query: impl Into<String>,
     mut options: TextSearchOptions,
 ) -> Result<BackgroundTask<TextSearchMatch>, regex::Error> {
     let query = query.into();
-    let matcher = compile_search_pattern(&query, options.mode, options.case_sensitive)?;
     let root = make_absolute_lossy(root.as_ref());
     options.scan.include_files = true;
     options.scan.include_directories = false;
@@ -947,6 +1298,23 @@ pub fn search_project(
         .name("project-search".into())
         .spawn(move || {
             let mut summary = TaskSummary::default();
+            let matcher = match compile_search_pattern(&query, options.mode, options.case_sensitive)
+            {
+                Ok(matcher) => matcher,
+                Err(error) => {
+                    summary.errors = 1;
+                    send_cancellable(
+                        &sender,
+                        &cancellation,
+                        StreamEvent::Error(ProjectError {
+                            path: None,
+                            message: format!("Invalid project search: {error}"),
+                        }),
+                    );
+                    finish_task(&sender, &cancellation, &status, summary);
+                    return;
+                }
+            };
             // An empty interactive query should not enumerate every position
             // in every file. It simply completes until the user types input.
             if query.is_empty() || options.max_results == 0 {
@@ -1315,6 +1683,147 @@ mod tests {
         let ranked = rank_paths("fb", &paths, 2);
         assert_eq!(ranked.len(), 2);
         assert_eq!(ranked[0].relative_path, PathBuf::from("src/foo_bar.rs"));
+    }
+
+    #[test]
+    fn cached_ranking_preserves_fuzzy_scores_and_top_order() {
+        let paths = [
+            "src/farawayboat.rs",
+            "src/foo_bar.rs",
+            "src/fizz_buzz.rs",
+            "src/main.rs",
+            "src/Äpfel.rs",
+            "src/İtem.rs",
+            "src/日本語.rs",
+        ];
+        let candidates: Vec<_> = paths
+            .iter()
+            .map(|path| PathCandidate::new(PathBuf::from(path), Path::new("")))
+            .collect();
+        let mut scratch = ScoreScratch::default();
+        for query in ["", "fb", "main.rs", "ä", "İt", "日本", "missing"] {
+            let actual = rank_candidates(query, &candidates, 3, &mut scratch, &|| false).unwrap();
+            let expected = rank_paths(query, paths, 3);
+            assert_eq!(
+                actual
+                    .iter()
+                    .map(|item| (&item.relative_path, item.score))
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|item| (&item.relative_path, item.score))
+                    .collect::<Vec<_>>(),
+                "query {query:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn ranking_cancels_before_scanning_the_rest_of_the_index() {
+        let candidates: Vec<_> = (0..100)
+            .map(|index| {
+                PathCandidate::new(PathBuf::from(format!("src/file{index}.rs")), Path::new(""))
+            })
+            .collect();
+        let checks = std::cell::Cell::new(0);
+        let cancelled = || {
+            checks.set(checks.get() + 1);
+            checks.get() >= 10
+        };
+        assert!(
+            rank_candidates(
+                "file",
+                &candidates,
+                5,
+                &mut ScoreScratch::default(),
+                &cancelled
+            )
+            .is_none()
+        );
+        assert!(checks.get() <= 11);
+    }
+
+    fn current_finder_result(finder: &FileFinder) -> FileFinderResult {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(result) = finder.try_recv()
+                && result.generation == finder.generation()
+            {
+                return result;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "file finder did not finish"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn finder_replaces_queued_results_and_uses_latest_query_and_index() {
+        let finder = FileFinder::new(PathBuf::from("/project"));
+        finder.append(vec![PathBuf::from("/project/old.rs")]);
+        finder.request("old".into(), 10);
+        // Leave the old result in the bounded channel to exercise replacement.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while finder.results.is_empty() {
+            assert!(std::time::Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        finder.request("unwanted".into(), 10);
+        finder.request("new".into(), 10);
+        finder.append(vec![PathBuf::from("/project/new.rs")]);
+        let result = current_finder_result(&finder);
+        assert_eq!(result.query, "new");
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].relative_path, Path::new("new.rs"));
+
+        finder.reset(PathBuf::from("/different"));
+        finder.append(vec![PathBuf::from("/different/newer.rs")]);
+        let result = current_finder_result(&finder);
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].relative_path, Path::new("newer.rs"));
+    }
+
+    #[test]
+    fn finder_index_updates_rerank_the_active_query() {
+        let finder = FileFinder::new(PathBuf::from("/project"));
+        finder.request("needle".into(), 10);
+        assert!(current_finder_result(&finder).files.is_empty());
+        finder.append(vec![PathBuf::from("/project/needle.rs")]);
+        assert_eq!(current_finder_result(&finder).files.len(), 1);
+        finder.cancel();
+        finder.append(vec![PathBuf::from("/project/another_needle.rs")]);
+        finder.request("needle".into(), 1);
+        assert_eq!(current_finder_result(&finder).files.len(), 1);
+    }
+
+    #[test]
+    fn invalid_regex_is_reported_by_the_background_search() {
+        let temp = TestDirectory::new("invalid-regex");
+        let task = search_project(
+            temp.path(),
+            "[",
+            TextSearchOptions {
+                mode: SearchMode::Regex,
+                ..TextSearchOptions::default()
+            },
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match task.try_recv() {
+                Some(StreamEvent::Error(error)) => {
+                    assert!(error.message.contains("Invalid project search"));
+                    break;
+                }
+                Some(event) => panic!("expected regex error, got {event:?}"),
+                None => {
+                    assert!(std::time::Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
     }
 
     #[test]

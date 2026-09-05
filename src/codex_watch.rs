@@ -662,6 +662,9 @@ impl CodexWorker {
         let mut fatal_error = None;
         for event in runtime.child.drain_events(64) {
             let result = match event {
+                ProcessEvent::WriteError(error) => {
+                    Err(format!("failed writing codex-watch stdin: {error}"))
+                }
                 ProcessEvent::Output {
                     stream: OutputStream::Stdout,
                     bytes,

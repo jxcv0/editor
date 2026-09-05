@@ -98,8 +98,10 @@ impl Journal {
         }
     }
 
-    pub fn remove(&self, key: impl Into<String>) {
-        let _ = self.sender.try_send(JournalAction::Remove(key.into()));
+    pub fn remove(&self, key: impl Into<String>) -> bool {
+        self.sender
+            .try_send(JournalAction::Remove(key.into()))
+            .is_ok()
     }
 }
 
