@@ -126,15 +126,15 @@ impl Default for UiConfig {
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
-            background: "#111318".into(),
-            foreground: "#d8dee9".into(),
-            muted: "#667085".into(),
-            accent: "#7aa2f7".into(),
-            status: "#24283b".into(),
+            background: "#101619".into(),
+            foreground: "#dce4e3".into(),
+            muted: "#77858a".into(),
+            accent: "#8bd5b6".into(),
+            status: "#1b252b".into(),
             error: "#f7768e".into(),
             warning: "#e0af68".into(),
-            info: "#7dcfff".into(),
-            selection: "#33415c".into(),
+            info: "#8bbfd8".into(),
+            selection: "#2b4548".into(),
         }
     }
 }

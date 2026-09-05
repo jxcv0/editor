@@ -164,15 +164,15 @@ show_hidden = false
 show_ignored = false
 
 [ui.theme]
-background = "#111318"
-foreground = "#d8dee9"
-muted = "#667085"
-accent = "#7aa2f7"
-status = "#24283b"
+background = "#101619"
+foreground = "#dce4e3"
+muted = "#77858a"
+accent = "#8bd5b6"
+status = "#1b252b"
 error = "#f7768e"
 warning = "#e0af68"
-info = "#7dcfff"
-selection = "#33415c"
+info = "#8bbfd8"
+selection = "#2b4548"
 
 [tools.rust_analyzer]
 path = "rust-analyzer"

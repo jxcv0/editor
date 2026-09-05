@@ -36,6 +36,19 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Color(pub u8, pub u8, pub u8);
 
+impl Color {
+    /// Derive quiet surfaces from the user's theme, including custom light themes.
+    fn mix(self, other: Self, percent: u16) -> Self {
+        let channel =
+            |a: u8, b: u8| ((u16::from(a) * (100 - percent) + u16::from(b) * percent) / 100) as u8;
+        Self(
+            channel(self.0, other.0),
+            channel(self.1, other.1),
+            channel(self.2, other.2),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Style {
     pub fg: Color,
@@ -71,7 +84,7 @@ impl Style {
 
 impl Default for Style {
     fn default() -> Self {
-        Self::new(Color(216, 222, 233), Color(17, 19, 24))
+        Self::new(Color(220, 228, 227), Color(16, 22, 25))
     }
 }
 
@@ -557,6 +570,9 @@ struct Palette {
     warning: Color,
     info: Color,
     selection: Color,
+    surface: Color,
+    border: Color,
+    cursor_line: Color,
     keyword: Color,
     string: Color,
     comment: Color,
@@ -572,21 +588,27 @@ impl Palette {
                 .map(|(r, g, b)| Color(r, g, b))
                 .unwrap_or(fallback)
         };
+        let background = color(&theme.background, Color(16, 22, 25));
+        let status = color(&theme.status, Color(27, 37, 43));
+        let muted = color(&theme.muted, Color(119, 133, 138));
         Self {
-            background: color(&theme.background, Color(17, 19, 24)),
-            foreground: color(&theme.foreground, Color(216, 222, 233)),
-            muted: color(&theme.muted, Color(102, 112, 133)),
-            accent: color(&theme.accent, Color(122, 162, 247)),
-            status: color(&theme.status, Color(36, 40, 59)),
+            background,
+            foreground: color(&theme.foreground, Color(220, 228, 227)),
+            muted,
+            accent: color(&theme.accent, Color(139, 213, 182)),
+            status,
             error: color(&theme.error, Color(247, 118, 142)),
             warning: color(&theme.warning, Color(224, 175, 104)),
-            info: color(&theme.info, Color(125, 207, 255)),
-            selection: color(&theme.selection, Color(51, 65, 92)),
-            keyword: Color(187, 154, 247),
-            string: Color(158, 206, 106),
-            comment: Color(86, 95, 137),
-            type_name: Color(42, 195, 222),
-            number: Color(255, 158, 100),
+            info: color(&theme.info, Color(139, 191, 216)),
+            selection: color(&theme.selection, Color(43, 69, 72)),
+            surface: background.mix(status, 55),
+            border: background.mix(muted, 35),
+            cursor_line: background.mix(status, 65),
+            keyword: Color(195, 166, 221),
+            string: Color(186, 216, 154),
+            comment: muted,
+            type_name: Color(226, 194, 141),
+            number: Color(223, 169, 143),
         }
     }
 }
@@ -801,7 +823,7 @@ fn build_frame(
                 0,
                 content.height,
                 "│",
-                Style::new(palette.muted, palette.background),
+                Style::new(palette.border, palette.surface),
             );
         }
         content.x = explorer_width.saturating_add(1);
@@ -872,8 +894,9 @@ fn build_frame(
 
     let cursor = if let Some(picker) = &editor.picker {
         let rect = picker_rect(width, height, picker.kind);
-        let prompt_width = UnicodeWidthStr::width(picker.query.as_str()) as u16;
-        Some((
+        let query = text_tail(&picker.query, rect.width.saturating_sub(7));
+        let prompt_width = UnicodeWidthStr::width(query.as_ref()) as u16;
+        (rect.width >= 8 && rect.height >= 6).then_some((
             rect.x
                 .saturating_add(4)
                 .saturating_add(prompt_width)
@@ -891,6 +914,7 @@ fn build_frame(
                     .min(width.saturating_sub(1)),
                 height - 1,
             )),
+            Mode::Leader => None,
             _ if editor.focus == Focus::Terminal => terminal_cursor,
             _ if editor.focus == Focus::Editor => editor_cursor,
             _ => None,
@@ -945,10 +969,10 @@ fn render_terminal(
     } else {
         "  Ctrl-W j focus  <Space>t hide".into()
     };
-    canvas.text(
+    let title_width = canvas.text(
         header.x.saturating_add(1),
         header.y,
-        &format!("TERMINAL  {status}{suffix}"),
+        "TERMINAL",
         header.width.saturating_sub(2),
         Style::new(
             if editor.focus == Focus::Terminal {
@@ -960,6 +984,29 @@ fn render_terminal(
         )
         .bold(),
     );
+    let status_x = header.x.saturating_add(title_width).saturating_add(1);
+    let status_width = canvas.text(
+        status_x,
+        header.y,
+        &format!("  · {status}"),
+        header.width.saturating_sub(title_width).saturating_sub(2),
+        Style::new(palette.muted, palette.status),
+    );
+    let hint_width = UnicodeWidthStr::width(suffix.as_str()) as u16;
+    if title_width
+        .saturating_add(status_width)
+        .saturating_add(hint_width)
+        .saturating_add(3)
+        <= header.width
+    {
+        canvas.text(
+            header.x + header.width - hint_width - 1,
+            header.y,
+            &suffix,
+            hint_width,
+            Style::new(palette.muted, palette.status),
+        );
+    }
 
     if body.height == 0 {
         return None;
@@ -1101,7 +1148,7 @@ fn layout_rects(layout: &Layout, rect: Rect, output: &mut Vec<(u64, Rect)>) {
 }
 
 fn render_split_lines(canvas: &mut Canvas, layout: &Layout, rect: Rect, palette: Palette) {
-    let style = Style::new(palette.muted, palette.background);
+    let style = Style::new(palette.border, palette.background);
     if let Layout::Split {
         orientation,
         ratio,
@@ -1222,16 +1269,27 @@ fn render_pane(
     for row in 0..rect.height {
         let line_number = pane.viewport_line + usize::from(row);
         if line_number >= buffer.line_count() {
-            canvas.text(
-                rect.x + gutter.saturating_sub(2),
-                rect.y + row,
-                "~",
-                1,
-                Style::new(palette.muted, palette.background),
-            );
             continue;
         }
         let active_line = line_number == pane.cursor.line;
+        let focused_line =
+            active_line && pane.id == editor.active_pane && editor.focus == Focus::Editor;
+        let line_background = if focused_line {
+            palette.cursor_line
+        } else {
+            palette.background
+        };
+        if focused_line {
+            canvas.fill(
+                Rect {
+                    y: rect.y + row,
+                    height: 1,
+                    ..rect
+                },
+                " ",
+                Style::new(palette.foreground, line_background),
+            );
+        }
         let number = if active_line || !editor.config.ui.relative_numbers {
             line_number + 1
         } else {
@@ -1239,14 +1297,24 @@ fn render_pane(
         };
         let number_text = format!("{number:>width$}", width = usize::from(digits));
         let number_style = Style::new(
-            if active_line {
+            if focused_line {
                 palette.accent
             } else {
                 palette.muted
             },
-            palette.background,
+            line_background,
         );
-        canvas.text(rect.x, rect.y + row, &number_text, digits, number_style);
+        canvas.text(
+            rect.x,
+            rect.y + row,
+            &number_text,
+            digits,
+            if focused_line {
+                number_style.bold()
+            } else {
+                number_style
+            },
+        );
         if gutter > digits && working_lines.is_some_and(|lines| lines.contains(&line_number)) {
             const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             canvas.text(
@@ -1254,7 +1322,7 @@ fn render_pane(
                 rect.y + row,
                 FRAMES[editor.codex_spinner_frame % FRAMES.len()],
                 1,
-                Style::new(palette.info, palette.background),
+                Style::new(palette.info, line_background),
             );
         }
         let severity = diagnostics
@@ -1269,7 +1337,7 @@ fn render_pane(
                 rect.y + row,
                 symbol,
                 1,
-                Style::new(color, palette.background),
+                Style::new(color, line_background),
             );
         }
         let line = buffer.line(line_number).unwrap_or("");
@@ -1307,6 +1375,7 @@ fn render_pane(
                 .map(|span| span.kind)
                 .unwrap_or(Highlight::Plain);
             let mut style = syntax_style(kind, palette);
+            style.bg = line_background;
             if selected {
                 style.bg = palette.selection;
             }
@@ -1360,7 +1429,7 @@ fn render_pane(
                     rect.y + row,
                     &label,
                     content_width.saturating_sub(inline_column as u16),
-                    Style::new(color, palette.background),
+                    Style::new(color, line_background),
                 );
                 inline_column = inline_column.saturating_add(usize::from(written));
                 rendered_diagnostic = true;
@@ -1440,14 +1509,19 @@ fn syntax_style(kind: Highlight, palette: Palette) -> Style {
         Highlight::Punctuation | Highlight::Plain => palette.foreground,
     };
     let mut style = Style::new(color, palette.background);
-    if matches!(kind, Highlight::Keyword | Highlight::Heading) {
+    if matches!(kind, Highlight::Heading) {
         style.bold = true;
     }
     style
 }
 
 fn render_explorer(canvas: &mut Canvas, editor: &Editor, rect: Rect, palette: Palette) {
-    canvas.fill(rect, " ", Style::new(palette.foreground, palette.status));
+    canvas.fill(rect, " ", Style::new(palette.foreground, palette.surface));
+    canvas.fill(
+        Rect { height: 1, ..rect },
+        " ",
+        Style::new(palette.foreground, palette.status),
+    );
     let title = editor
         .explorer
         .root
@@ -1476,18 +1550,21 @@ fn render_explorer(canvas: &mut Canvas, editor: &Editor, rect: Rect, palette: Pa
     {
         let y = rect.y + 1 + (row - start) as u16;
         let selected = row == editor.explorer.selected && editor.focus == Focus::Explorer;
+        let active_file = editor.active_buffer().path() == Some(entry.path.as_path());
         let style = Style::new(
-            if selected {
-                palette.background
-            } else if entry.is_directory() {
+            if selected || active_file {
                 palette.accent
+            } else if entry.is_directory() {
+                palette.info
             } else {
                 palette.foreground
             },
             if selected {
-                palette.accent
-            } else {
+                palette.selection
+            } else if active_file {
                 palette.status
+            } else {
+                palette.surface
             },
         );
         let marker = if entry.is_directory() {
@@ -1516,7 +1593,16 @@ fn render_explorer(canvas: &mut Canvas, editor: &Editor, rect: Rect, palette: Pa
             " ",
             style,
         );
-        canvas.text(rect.x, y, &label, rect.width, style);
+        canvas.text(rect.x, y, &label, rect.width.saturating_sub(1), style);
+        if active_file && rect.width > 1 {
+            canvas.text(
+                rect.x + rect.width - 1,
+                y,
+                "●",
+                1,
+                Style::new(palette.accent, style.bg),
+            );
+        }
     }
     let flags = format!(
         "{}hidden {}ignored",
@@ -1537,18 +1623,40 @@ fn render_explorer(canvas: &mut Canvas, editor: &Editor, rect: Rect, palette: Pa
             rect.y + rect.height - 1,
             &flags,
             rect.width.saturating_sub(2),
-            Style::new(palette.muted, palette.status),
+            Style::new(palette.muted, palette.surface),
         );
     }
+}
+
+/// Keep the end of a path or query visible without splitting a grapheme.
+fn text_tail(text: &str, width: u16) -> Cow<'_, str> {
+    if UnicodeWidthStr::width(text) <= usize::from(width) {
+        return Cow::Borrowed(text);
+    }
+    if width == 0 {
+        return Cow::Borrowed("");
+    }
+    let mut used = 1;
+    let mut start = text.len();
+    for (index, grapheme) in text.grapheme_indices(true).rev() {
+        let cells = UnicodeWidthStr::width(grapheme).max(1);
+        if used + cells > usize::from(width) {
+            break;
+        }
+        used += cells;
+        start = index;
+    }
+    Cow::Owned(format!("…{}", &text[start..]))
 }
 
 fn render_status(canvas: &mut Canvas, editor: &Editor, rect: Rect, palette: Palette) {
     canvas.fill(rect, " ", Style::new(palette.foreground, palette.status));
     let mode_color = match editor.mode {
         Mode::Normal => palette.accent,
-        Mode::Insert => Color(158, 206, 106),
-        Mode::Visual(_) => Color(187, 154, 247),
+        Mode::Insert => palette.info,
+        Mode::Visual(_) => palette.keyword,
         Mode::OperatorPending => palette.warning,
+        Mode::Replace => palette.error,
         _ => palette.info,
     };
     let mode = format!(" {} ", editor.mode.label());
@@ -1570,43 +1678,69 @@ fn render_status(canvas: &mut Canvas, editor: &Editor, rect: Rect, palette: Pale
         },
         if slot.large_file { " [LARGE]" } else { "" }
     );
-    let path = format!(" {}{}", slot.display_name, flags);
-    canvas.text(
-        rect.x + mode_width,
-        rect.y,
-        &path,
-        rect.width.saturating_sub(mode_width),
-        Style::new(palette.foreground, palette.status),
-    );
+    let flags_width = UnicodeWidthStr::width(flags.as_str()) as u16;
+    let left = rect.x.saturating_add(mode_width).saturating_add(1);
+    let mut right = rect.x.saturating_add(rect.width);
     let pane = editor.active_pane();
-    let right = if rect.width > 90 {
-        format!(
-            "RA:{}  CODEX:{}  {}:{}",
-            editor.rust_analyzer_status,
-            editor.codex_watch_status,
-            pane.cursor.line + 1,
-            pane.cursor.grapheme + 1
-        )
-    } else if rect.width > 55 {
-        format!(
-            "RA:{}  {}:{}",
-            editor.rust_analyzer_status,
-            pane.cursor.line + 1,
-            pane.cursor.grapheme + 1
-        )
-    } else {
-        format!("{}:{}", pane.cursor.line + 1, pane.cursor.grapheme + 1)
-    };
-    let right_width = UnicodeWidthStr::width(right.as_str()) as u16;
-    if right_width < rect.width {
+    let position = format!(" {}:{} ", pane.cursor.line + 1, pane.cursor.grapheme + 1);
+    let position_width = UnicodeWidthStr::width(position.as_str()) as u16;
+    if position_width <= right.saturating_sub(left) {
+        right -= position_width;
         canvas.text(
-            rect.x + rect.width - right_width - 1,
+            right,
             rect.y,
-            &right,
-            right_width,
-            Style::new(palette.muted, palette.status),
+            &position,
+            position_width,
+            Style::new(palette.info, palette.surface),
         );
     }
+    // Reserve space for the path and safety flags before adding optional tools.
+    // Long tool failures must never overwrite the mode, filename, or position.
+    for (name, status, minimum_width) in [
+        ("CODEX", editor.codex_watch_status.as_str(), 90),
+        ("RA", editor.rust_analyzer_status.as_str(), 55),
+    ] {
+        let label = format!("  {name} · {status} ");
+        let label_width = UnicodeWidthStr::width(label.as_str()).min(usize::from(u16::MAX)) as u16;
+        if rect.width < minimum_width
+            || label_width.saturating_add(flags_width).saturating_add(14)
+                > right.saturating_sub(left)
+        {
+            continue;
+        }
+        right -= label_width;
+        let color = if status.starts_with("failed") {
+            palette.error
+        } else if matches!(status, "ready" | "completed") {
+            palette.accent
+        } else {
+            palette.muted
+        };
+        canvas.text(
+            right,
+            rect.y,
+            &label,
+            label_width,
+            Style::new(color, palette.status),
+        );
+    }
+    let available = right.saturating_sub(left).saturating_sub(1);
+    let path_width = available.saturating_sub(flags_width);
+    let path = text_tail(&slot.display_name, path_width);
+    let written = canvas.text(
+        left,
+        rect.y,
+        &path,
+        path_width,
+        Style::new(palette.foreground, palette.status),
+    );
+    canvas.text(
+        left.saturating_add(written),
+        rect.y,
+        &flags,
+        available.saturating_sub(written),
+        Style::new(palette.warning, palette.status),
+    );
 }
 
 fn render_command_line(canvas: &mut Canvas, editor: &Editor, rect: Rect, palette: Palette) {
@@ -1622,6 +1756,16 @@ fn render_command_line(canvas: &mut Canvas, editor: &Editor, rect: Rect, palette
         Mode::Leader => format!("<Space>{}", editor.leader_prefix),
         _ => editor.current_message().unwrap_or("").to_owned(),
     };
+    if text.is_empty() && rect.width >= 40 {
+        canvas.text(
+            rect.x + 1,
+            rect.y,
+            "Space  commands",
+            rect.width.saturating_sub(2),
+            Style::new(palette.muted, palette.background),
+        );
+        return;
+    }
     let style = if text.to_ascii_lowercase().contains("error")
         || text.starts_with("Unknown")
         || text.contains("unavailable")
@@ -1630,7 +1774,39 @@ fn render_command_line(canvas: &mut Canvas, editor: &Editor, rect: Rect, palette
     } else {
         Style::new(palette.foreground, palette.background)
     };
-    canvas.text(rect.x, rect.y, &text, rect.width, style);
+    let prompt = matches!(editor.mode, Mode::Command | Mode::Search { .. });
+    let padding = u16::from(!prompt);
+    canvas.text(
+        rect.x.saturating_add(padding),
+        rect.y,
+        &text,
+        rect.width.saturating_sub(padding),
+        style,
+    );
+    if prompt {
+        canvas.text(
+            rect.x,
+            rect.y,
+            &text[..1],
+            1,
+            Style::new(palette.accent, palette.background).bold(),
+        );
+    }
+}
+
+fn render_popup(canvas: &mut Canvas, rect: Rect, palette: Palette) {
+    let shadow = Rect {
+        x: rect.x.saturating_add(2),
+        y: rect.y.saturating_add(1),
+        ..rect
+    };
+    canvas.fill(
+        shadow,
+        " ",
+        Style::new(palette.muted, palette.background.mix(Color(0, 0, 0), 25)),
+    );
+    canvas.fill(rect, " ", Style::new(palette.foreground, palette.status));
+    canvas.border(rect, Style::new(palette.border, palette.status));
 }
 
 fn render_leader(canvas: &mut Canvas, editor: &Editor, palette: Palette) {
@@ -1648,16 +1824,18 @@ fn render_leader(canvas: &mut Canvas, editor: &Editor, palette: Palette) {
     let desired_height = u16::try_from(entries.len())
         .unwrap_or(u16::MAX)
         .saturating_add(3);
-    let rect = overlay_rect(canvas.width, canvas.height, 44, desired_height);
+    let rect = overlay_rect(canvas.width, canvas.height, 50, desired_height);
     if rect.width == 0 || rect.height == 0 {
         return;
     }
-    canvas.fill(rect, " ", Style::new(palette.foreground, palette.status));
-    canvas.border(rect, Style::new(palette.muted, palette.status));
+    render_popup(canvas, rect, palette);
+    if rect.width < 8 || rect.height < 4 {
+        return;
+    }
     canvas.text(
         rect.x.saturating_add(2),
         rect.y,
-        " which key ",
+        &format!(" Commands · Space{} ", editor.leader_prefix),
         rect.width.saturating_sub(4),
         Style::new(palette.accent, palette.status).bold(),
     );
@@ -1684,21 +1862,44 @@ fn render_leader(canvas: &mut Canvas, editor: &Editor, palette: Palette) {
             palette.foreground
         };
         let mut label = if entry.group {
-            format!("+ {}", entry.label)
+            format!("{} ›", entry.label)
         } else {
             entry.label.into()
         };
         if unavailable {
             label.push_str(&format!("  [{}]", editor.rust_analyzer_status));
         }
+        let y = rect.y.saturating_add(1).saturating_add(row as u16);
         canvas.text(
             rect.x.saturating_add(2),
-            rect.y.saturating_add(1).saturating_add(row as u16),
-            &format!("{}  {}", entry.key, label),
-            rect.width.saturating_sub(4),
+            y,
+            &format!(" {} ", if entry.key == ' ' { '␣' } else { entry.key }),
+            3,
+            Style::new(
+                if unavailable {
+                    palette.muted
+                } else {
+                    palette.accent
+                },
+                palette.surface,
+            )
+            .bold(),
+        );
+        canvas.text(
+            rect.x.saturating_add(7),
+            y,
+            &label,
+            rect.width.saturating_sub(9),
             Style::new(color, palette.status),
         );
     }
+    canvas.text(
+        rect.x + 2,
+        rect.y + rect.height - 1,
+        " Esc close ",
+        rect.width.saturating_sub(4),
+        Style::new(palette.muted, palette.status),
+    );
 }
 
 fn picker_rect(width: u16, height: u16, kind: PickerKind) -> Rect {
@@ -1715,8 +1916,10 @@ fn render_picker(canvas: &mut Canvas, editor: &Editor, palette: Palette) {
     if rect.width == 0 || rect.height == 0 {
         return;
     }
-    canvas.fill(rect, " ", Style::new(palette.foreground, palette.status));
-    canvas.border(rect, Style::new(palette.accent, palette.status));
+    render_popup(canvas, rect, palette);
+    if rect.width < 8 || rect.height < 6 {
+        return;
+    }
     let title = match picker.kind {
         PickerKind::Files => " Project files ",
         PickerKind::Buffers => " Buffers ",
@@ -1744,8 +1947,8 @@ fn render_picker(canvas: &mut Canvas, editor: &Editor, palette: Palette) {
     canvas.text(
         rect.x.saturating_add(4),
         rect.y.saturating_add(2),
-        &picker.query,
-        rect.width.saturating_sub(6),
+        &text_tail(&picker.query, rect.width.saturating_sub(7)),
+        rect.width.saturating_sub(7),
         Style::new(palette.foreground, palette.status),
     );
     if rect.height > 4 {
@@ -1754,7 +1957,7 @@ fn render_picker(canvas: &mut Canvas, editor: &Editor, palette: Palette) {
             rect.y.saturating_add(3),
             rect.width.saturating_sub(2),
             "─",
-            Style::new(palette.muted, palette.status),
+            Style::new(palette.border, palette.status),
         );
     }
     let item_height = if picker.kind == PickerKind::References {
@@ -1771,13 +1974,9 @@ fn render_picker(canvas: &mut Canvas, editor: &Editor, palette: Palette) {
             .saturating_add((index - start) as u16 * item_height);
         let selected = index == picker.selected;
         let style = Style::new(
+            palette.foreground,
             if selected {
-                palette.background
-            } else {
-                palette.foreground
-            },
-            if selected {
-                palette.accent
+                palette.selection
             } else {
                 palette.status
             },
@@ -1792,11 +1991,20 @@ fn render_picker(canvas: &mut Canvas, editor: &Editor, palette: Palette) {
             " ",
             style,
         );
+        if selected {
+            canvas.text(
+                rect.x + 1,
+                y,
+                "▎",
+                1,
+                Style::new(palette.accent, palette.selection),
+            );
+        }
         canvas.text(
-            rect.x.saturating_add(2),
+            rect.x.saturating_add(3),
             y,
             &item.label,
-            rect.width.saturating_sub(4),
+            rect.width.saturating_sub(5),
             if picker.kind == PickerKind::References && !selected {
                 Style::new(palette.muted, palette.status)
             } else {
@@ -1824,6 +2032,30 @@ fn render_picker(canvas: &mut Canvas, editor: &Editor, palette: Palette) {
             },
             rect.width.saturating_sub(4),
             Style::new(palette.muted, palette.status),
+        );
+    }
+    let count = if picker.items.is_empty() {
+        " 0 results ".into()
+    } else {
+        format!(" {}/{} ", picker.selected + 1, picker.items.len())
+    };
+    let count_width = UnicodeWidthStr::width(count.as_str()) as u16;
+    let footer_width = rect.width.saturating_sub(4);
+    if count_width <= footer_width {
+        let y = rect.y + rect.height - 1;
+        canvas.text(
+            rect.x + 2,
+            y,
+            " ↑↓ select  Enter confirm  Esc close ",
+            footer_width.saturating_sub(count_width).saturating_sub(1),
+            Style::new(palette.muted, palette.status),
+        );
+        canvas.text(
+            rect.x + rect.width - count_width - 2,
+            y,
+            &count,
+            count_width,
+            Style::new(palette.accent, palette.status),
         );
     }
 }
@@ -2116,6 +2348,48 @@ mod tests {
     }
 
     #[test]
+    fn status_reserves_filename_flags_and_position_before_long_tool_errors() {
+        let mut editor = Editor::new(Config::default(), PathBuf::from("/work"));
+        editor
+            .active_buffer_mut()
+            .insert(crate::buffer::Pos::ZERO, "x")
+            .unwrap();
+        editor.buffers[0].display_name = format!("{}界面.rs", "long/e\u{301}/".repeat(30));
+        editor.buffers[0].large_file = true;
+        editor.rust_analyzer_status = format!("failed: {}", "unavailable ".repeat(50));
+        editor.codex_watch_status = editor.rust_analyzer_status.clone();
+        for width in [40, 60, 100, 140] {
+            let (canvas, _) = draw_editor(&mut editor, width, 10);
+            let status = row(&canvas, 8);
+            assert!(status.starts_with(" NORMAL "));
+            assert!(status.contains("界面.rs [+] [LARGE]"), "{status}");
+            assert!(status.ends_with(" 1:1 "));
+            assert_eq!(UnicodeWidthStr::width(status.as_str()), usize::from(width));
+        }
+    }
+
+    #[test]
+    fn active_line_respects_focus_and_visual_selection() {
+        let mut editor = Editor::new(Config::default(), PathBuf::from("/work"));
+        editor.buffers[0].buffer = Buffer::from_text("abc\ndef");
+        let palette = Palette::from_editor(&editor);
+        let (normal, _) = draw_editor(&mut editor, 40, 8);
+        assert_eq!(normal.cells[4].style.bg, palette.cursor_line);
+        assert_eq!(normal.cells[39].style.bg, palette.cursor_line);
+        assert_eq!(normal.cells[44].style.bg, palette.background);
+
+        editor.handle_key(Key::char('v'));
+        let (visual, _) = draw_editor(&mut editor, 40, 8);
+        assert_eq!(visual.cells[4].style.bg, palette.selection);
+        assert_eq!(visual.cells[5].style.bg, palette.cursor_line);
+
+        editor.handle_key(Key::plain(KeyCode::Esc));
+        editor.focus = Focus::Explorer;
+        let (unfocused, _) = draw_editor(&mut editor, 40, 8);
+        assert_eq!(unfocused.cells[4].style.bg, palette.background);
+    }
+
+    #[test]
     fn explorer_divider_is_vertical() {
         let mut editor = Editor::new(Config::default(), PathBuf::from("/work"));
         editor.explorer.open = true;
@@ -2185,9 +2459,9 @@ mod tests {
             .map(|y| row(&canvas, y))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(frame.contains("which key"));
-        assert!(frame.contains("+ buffers"));
-        assert!(frame.contains("t  Terminal"));
+        assert!(frame.contains("Commands · Space"));
+        assert!(frame.contains("buffers ›"));
+        assert!(frame.contains("Terminal"));
         assert!(matches!(editor.mode, Mode::Leader));
     }
 
@@ -2205,7 +2479,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(frame.contains("TERMINAL  running"));
+        assert!(frame.contains("TERMINAL  · running"));
         assert!(frame.contains("prompt> red"));
         assert!(cursor.is_some_and(|(_, y)| (12..18).contains(&y)));
         assert_eq!(editor.terminal.screen().size(), (5, 60));
@@ -2252,6 +2526,23 @@ mod tests {
             );
             let (canvas, _) = draw_editor(&mut picker, width, height);
             assert_eq!((canvas.width, canvas.height), (width, height));
+        }
+    }
+
+    #[test]
+    fn long_picker_queries_keep_their_tail_and_cursor_inside_the_border() {
+        let mut editor = Editor::new(Config::default(), PathBuf::from("/work"));
+        editor.show_picker_items(PickerKind::Files, Vec::new());
+        editor.picker.as_mut().unwrap().query = format!("{}界e\u{301}", "long/".repeat(30));
+        for width in [20, 40, 100] {
+            let (canvas, cursor) = draw_editor(&mut editor, width, 20);
+            let rect = picker_rect(width, 20, PickerKind::Files);
+            let query_row = row(&canvas, rect.y + 2);
+            assert!(query_row.contains("界e\u{301}"), "{query_row}");
+            let (x, y) = cursor.unwrap();
+            assert!(x < rect.x + rect.width - 1);
+            assert_eq!(y, rect.y + 2);
+            assert_eq!(canvas.cells[usize::from(y * width + x)].symbol, " ");
         }
     }
 

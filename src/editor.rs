@@ -395,7 +395,7 @@ impl Editor {
         let show_hidden = config.ui.show_hidden;
         let show_ignored = config.ui.show_ignored;
         let terminal_background =
-            parse_hex_color(&config.ui.theme.background).unwrap_or((0x11, 0x13, 0x18));
+            parse_hex_color(&config.ui.theme.background).unwrap_or((0x10, 0x16, 0x19));
         let mut scratch = Buffer::new();
         scratch
             .set_undo_limit(config.limits.undo_steps)
