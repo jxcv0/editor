@@ -430,6 +430,7 @@ commands available in the current context.
 | `<Space><Space>` | Project files | Open the project-file finder |
 | `<Space>/` | Project text | Open streaming project grep |
 | `<Space>e` | Explorer | Open, focus, or close the project explorer |
+| `<Space>t` | Terminal | Toggle the PTY-backed bottom terminal panel |
 | `<Space>b` | Buffers | `bb` switch, `bd` close, `bn` next, `bp` previous |
 | `<Space>c` | Code | `ca` action, `cf` format, `cr` rename |
 | `<Space>f` | Files | `ff` find project file, `fr` open a recent file |
@@ -447,11 +448,12 @@ retaining validation for collisions and unreachable bindings.
 
 ## Requirement 22 — Process security, diagnostics, and privacy
 
-External tools shall be treated as supervised, fallible processes rather than
+External tool integrations shall be treated as supervised, fallible processes rather than
 trusted extensions of the editor core.
 
-- Processes shall be launched directly with explicit argument vectors, never
-  through an implicit shell.
+- Tool processes shall be launched directly with explicit argument vectors,
+  never through an implicit shell. An integrated terminal may directly launch
+  the user's configured shell only after an explicit terminal command.
 - The resolved executable, arguments, project root, and relevant mode flags
   shall be inspectable before enabling a project integration.
 - Untrusted project configuration shall not alter commands, arguments,
@@ -474,8 +476,8 @@ trusted extensions of the editor core.
 ## Requirement 23 — MVP boundary and release criteria
 
 The initial release intentionally excludes full Vim/Neovim compatibility,
-Vimscript or Lua, a plugin/package manager, a Git client, an embedded terminal,
-debugger integration, remote or collaborative editing, a GUI, general-purpose
+Vimscript or Lua, a plugin/package manager, a Git client, debugger integration,
+remote or collaborative editing, a GUI, general-purpose
 task running, and first-class language integrations beyond Rust. These are not
 architectural promises against future work, but none may delay the focused Rust
 workflow.
