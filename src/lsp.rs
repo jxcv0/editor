@@ -333,6 +333,9 @@ impl RustAnalyzerClient {
                 "an LSP response must contain exactly one of result or error".to_owned(),
             ));
         }
+        if let Some(payload) = result.as_ref().or(error.as_ref()) {
+            self.check_json_size(payload)?;
+        }
         self.enqueue(LspCommand::Response { id, result, error })
     }
 
@@ -877,8 +880,18 @@ impl LspWorker {
             PumpOutcome::Keep => self.runtime = Some(runtime),
             PumpOutcome::Stop { timeout_error } => {
                 let generation = runtime.generation;
-                if timeout_error.is_none() {
-                    let _ = send_notification(&mut runtime, &self.config, "exit", Value::Null);
+                if timeout_error.is_none()
+                    && send_notification(&mut runtime, &self.config, "exit", Value::Null).is_ok()
+                {
+                    runtime.child.close_stdin();
+                    // A flushed pipe only proves the exit notification was
+                    // delivered to the kernel. Give the server time to read
+                    // it and finish its cleanup before sending any signal.
+                    let deadline = Instant::now() + self.config.process_limits.shutdown_timeout;
+                    while matches!(runtime.child.try_wait(), Ok(None)) && Instant::now() < deadline
+                    {
+                        thread::sleep(Duration::from_millis(1));
+                    }
                 }
                 let _ = runtime.child.terminate(Duration::from_millis(100));
                 if let Some(error) = &timeout_error {
@@ -1269,11 +1282,12 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_owned();
     }
-    let mut end = max_bytes;
+    let suffix = if max_bytes >= "…".len() { "…" } else { "" };
+    let mut end = max_bytes - suffix.len();
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…", &text[..end])
+    format!("{}{suffix}", &text[..end])
 }
 
 fn lock_unpoison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -1449,10 +1463,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        JsonRpcFrameDecoder, JsonRpcFrameError, LspPosition, LspRange, LspTextChange,
-        apply_text_changes, encode_json_rpc, path_to_file_uri,
-    };
+    use super::*;
     use serde_json::json;
     use std::path::Path;
 
@@ -1530,6 +1541,839 @@ mod tests {
         assert_eq!(
             path_to_file_uri(Path::new("/tmp/a b.rs")),
             "file:///tmp/a%20b.rs"
+        );
+    }
+    #[cfg(unix)]
+    fn peer_config(directory: &Path, mode: &str) -> RustAnalyzerConfig {
+        let mut config = RustAnalyzerConfig::new(directory);
+        config.executable = "/bin/sh".into();
+        // libtest owns stdout. Keep its output on stderr while fd 3 carries
+        // only framed LSP; all variable arguments remain separate argv values.
+        // Timeout tests intentionally kill this fixture. Discard its profile
+        // so an interrupted child cannot leave a partial LLVM coverage file.
+        config.args = vec![
+            "-c".into(),
+            "LLVM_PROFILE_FILE=/dev/null exec \"$1\" --exact lsp::tests::lsp_test_peer --nocapture --skip \"$2\" 3>&1 1>&2"
+                .into(),
+            "editor-lsp-test".into(),
+            std::env::current_exe().unwrap().into_os_string(),
+            format!("lsp-peer:{mode}").into(),
+        ];
+        config.initialize_timeout = Duration::from_secs(2);
+        config.process_limits.shutdown_timeout = Duration::from_millis(200);
+        config
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lsp_test_peer() {
+        use std::io::{Read, Write};
+        use std::os::fd::FromRawFd;
+        let Some(mode) =
+            std::env::args().find_map(|arg| arg.strip_prefix("lsp-peer:").map(str::to_owned))
+        else {
+            return;
+        };
+        // SAFETY: peer_config's shell wrapper creates fd 3 exclusively for
+        // this peer before exec; this File is its sole Rust owner.
+        let mut output = unsafe { std::fs::File::from_raw_fd(3) };
+        let mut decoder = JsonRpcFrameDecoder::new(16 * 1024, 8 * 1024 * 1024);
+        let mut input = std::io::stdin().lock();
+        let mut bytes = [0; 113]; // Deliberately fragment the initialize request.
+        let mut initialized = false;
+        loop {
+            let length = input.read(&mut bytes).unwrap();
+            if length == 0 {
+                return;
+            }
+            for message in decoder.push(&bytes[..length]).unwrap() {
+                let method = message.get("method").and_then(Value::as_str).unwrap_or("");
+                let id = message.get("id").cloned().unwrap_or(Value::Null);
+                let params = message.get("params").cloned().unwrap_or(Value::Null);
+                let response = match method {
+                    "initialize" => match mode.as_str() {
+                        "initialize-error" => Some(
+                            json!({"jsonrpc":"2.0","id":id,"error":{"code":-32002,"message":"fixture rejected initialization"}}),
+                        ),
+                        "initialize-no-result" => Some(json!({"jsonrpc":"2.0","id":id})),
+                        "initialize-timeout" => None,
+                        "bad-frame" => {
+                            output.write_all(b"Content-Length: 4\r\n\r\nnope").unwrap();
+                            output.flush().unwrap();
+                            None
+                        }
+                        "bad-version" => Some(json!({"jsonrpc":"1.0","id":id,"result":{}})),
+                        "bad-object" => Some(json!([])),
+                        "unclassifiable" => Some(json!({"jsonrpc":"2.0","unexpected":true})),
+                        _ => {
+                            let observed =
+                                json!({"jsonrpc":"2.0","method":"test/initialize","params":params});
+                            output
+                                .write_all(&encode_json_rpc(&observed, 8 * 1024 * 1024).unwrap())
+                                .unwrap();
+                            Some(
+                                json!({"jsonrpc":"2.0","id":id,"result":{"capabilities":{"textDocumentSync":2}}}),
+                            )
+                        }
+                    },
+                    "initialized" => {
+                        initialized = true;
+                        writeln!(std::io::stderr(), "fixture initialized").unwrap();
+                        Some(json!({"jsonrpc":"2.0","method":"test/initialized","params":params}))
+                    }
+                    "textDocument/didOpen" | "textDocument/didChange" | "textDocument/didClose" => {
+                        assert!(initialized, "document synchronization preceded initialized");
+                        Some(
+                            json!({"jsonrpc":"2.0","method":"test/observed","params":{"method":method,"params":params}}),
+                        )
+                    }
+                    "test/echo" => Some(json!({"jsonrpc":"2.0","id":id,"result":params})),
+                    "test/error" => Some(
+                        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"fixture method unavailable"}}),
+                    ),
+                    "test/note" => {
+                        Some(json!({"jsonrpc":"2.0","method":"test/noted","params":params}))
+                    }
+                    "test/server-request" => {
+                        let request = json!({"jsonrpc":"2.0","id":"server-7","method":"workspace/configuration","params":{"items":[{"section":"rust-analyzer"}]}});
+                        output
+                            .write_all(&encode_json_rpc(&request, 8 * 1024 * 1024).unwrap())
+                            .unwrap();
+                        Some(json!({"jsonrpc":"2.0","id":id,"result":null}))
+                    }
+                    "test/crash" => std::process::exit(23),
+                    "shutdown" if mode == "shutdown-timeout" => None,
+                    "shutdown" => Some(json!({"jsonrpc":"2.0","id":id,"result":null})),
+                    "exit" => {
+                        let mut exits = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open("peer-exits")
+                            .unwrap();
+                        writeln!(exits, "{}", std::process::id()).unwrap();
+                        std::process::exit(0);
+                    }
+                    "" if message.get("id").is_some() => Some(
+                        json!({"jsonrpc":"2.0","method":"test/server-response","params":message}),
+                    ),
+                    _ => panic!("unexpected peer message: {message}"),
+                };
+                if let Some(response) = response {
+                    let frame = encode_json_rpc(&response, 8 * 1024 * 1024).unwrap();
+                    // Exercise a response split inside Content-Length.
+                    output.write_all(&frame[..7.min(frame.len())]).unwrap();
+                    output.flush().unwrap();
+                    output.write_all(&frame[7.min(frame.len())..]).unwrap();
+                    output.flush().unwrap();
+                    if method == "shutdown" && mode == "delayed-exit" {
+                        // Acknowledging shutdown does not mean the subsequent
+                        // exit notification has already been consumed.
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_event(
+        client: &RustAnalyzerClient,
+        description: &str,
+        predicate: impl Fn(&LspEvent) -> bool,
+    ) -> LspEvent {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut seen = Vec::new();
+        loop {
+            match client.try_recv() {
+                Ok(event) if predicate(&event) => return event,
+                Ok(event) => seen.push(event),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(1))
+                }
+                Err(error) => {
+                    panic!("worker stopped waiting for {description}: {error}; seen {seen:?}")
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {description}; status {:?}; stderr {:?}; seen {seen:?}",
+                client.status(),
+                client.captured_stderr()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_state(client: &RustAnalyzerClient, state: RustAnalyzerState) -> RustAnalyzerStatus {
+        match wait_event(
+            client,
+            &format!("{state:?}"),
+            |event| matches!(event, LspEvent::Status(status) if status.state == state),
+        ) {
+            LspEvent::Status(status) => status,
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn observed(client: &RustAnalyzerClient, method: &str) -> Value {
+        match wait_event(
+            client,
+            method,
+            |event| matches!(event, LspEvent::Notification { method: observed, params } if observed == "test/observed" && params["method"] == method),
+        ) {
+            LspEvent::Notification { params, .. } => params["params"].clone(),
+            _ => unreachable!(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_initializes_and_synchronizes_versioned_documents() {
+        let directory = tempfile::tempdir().unwrap();
+        let client = RustAnalyzerClient::new(peer_config(directory.path(), "normal")).unwrap();
+        let uri = path_to_file_uri(&directory.path().join("source.rs"));
+        assert_eq!(client.status().state, RustAnalyzerState::Stopped);
+        assert_eq!(client.config().workspace_root, directory.path());
+        client.open_document(&uri, "rust", 1, "initial").unwrap();
+        client
+            .change_document(&uri, 2, vec![LspTextChange::full("a😀b\nsecond")])
+            .unwrap();
+        client.start().unwrap();
+        let initialization = wait_event(
+            &client,
+            "initialize payload",
+            |event| matches!(event, LspEvent::Notification { method, .. } if method == "test/initialize"),
+        );
+        let LspEvent::Notification { params, .. } = initialization else {
+            unreachable!()
+        };
+        assert_eq!(params["rootUri"], path_to_file_uri(directory.path()));
+        assert_eq!(
+            params["capabilities"]["general"]["positionEncodings"],
+            json!(["utf-16"])
+        );
+        assert_eq!(params["clientInfo"]["name"], "editor");
+        let ready = wait_state(&client, RustAnalyzerState::Ready);
+        assert_eq!(ready.generation, 1);
+        assert!(ready.pid.is_some());
+        let opened = observed(&client, "textDocument/didOpen");
+        assert_eq!(
+            opened["textDocument"],
+            json!({"uri":uri,"languageId":"rust","version":2,"text":"a😀b\nsecond"})
+        );
+        let change = LspTextChange::incremental(
+            LspRange {
+                start: LspPosition {
+                    line: 0,
+                    character: 3,
+                },
+                end: LspPosition {
+                    line: 0,
+                    character: 4,
+                },
+            },
+            "!",
+        );
+        client
+            .change_document(&uri, 3, vec![change.clone()])
+            .unwrap();
+        let changed = observed(&client, "textDocument/didChange");
+        assert_eq!(changed["textDocument"]["version"], 3);
+        assert_eq!(changed["contentChanges"], json!([change]));
+        client
+            .change_document(&uri, 3, vec![LspTextChange::full("stale")])
+            .unwrap();
+        wait_event(
+            &client,
+            "stale change rejection",
+            |event| matches!(event, LspEvent::Error(error) if error.contains("ignored stale change")),
+        );
+        client
+            .open_document(&uri, "rust", 2, "stale reopen")
+            .unwrap();
+        wait_event(
+            &client,
+            "stale open rejection",
+            |event| matches!(event, LspEvent::Error(error) if error.contains("ignored stale open")),
+        );
+        client
+            .open_document(&uri, "rust", 4, "replacement")
+            .unwrap();
+        assert_eq!(
+            observed(&client, "textDocument/didClose")["textDocument"]["uri"],
+            uri
+        );
+        assert_eq!(
+            observed(&client, "textDocument/didOpen")["textDocument"]["text"],
+            "replacement"
+        );
+        client.close_document(&uri).unwrap();
+        assert_eq!(
+            observed(&client, "textDocument/didClose")["textDocument"]["uri"],
+            uri
+        );
+        client
+            .change_document(&uri, 5, vec![LspTextChange::full("closed")])
+            .unwrap();
+        wait_event(
+            &client,
+            "closed document rejection",
+            |event| matches!(event, LspEvent::Error(error) if error.contains("unopened LSP document")),
+        );
+        client.shutdown().unwrap();
+        assert_eq!(
+            wait_state(&client, RustAnalyzerState::Stopped).last_error,
+            None
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("peer-exits"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_reopens_the_latest_valid_snapshot_and_forgets_closed_documents() {
+        let directory = tempfile::tempdir().unwrap();
+        let client = RustAnalyzerClient::new(peer_config(directory.path(), "normal")).unwrap();
+        client.start().unwrap();
+        let first = wait_state(&client, RustAnalyzerState::Ready);
+        client
+            .open_document("file:///keep.rs", "rust", 1, "a😀b\r\n")
+            .unwrap();
+        observed(&client, "textDocument/didOpen");
+        client
+            .open_document("file:///closed.rs", "rust", 1, "closed")
+            .unwrap();
+        observed(&client, "textDocument/didOpen");
+        client.close_document("file:///closed.rs").unwrap();
+        observed(&client, "textDocument/didClose");
+        client
+            .change_document(
+                "file:///keep.rs",
+                2,
+                vec![LspTextChange::incremental(
+                    LspRange {
+                        start: LspPosition {
+                            line: 0,
+                            character: 3,
+                        },
+                        end: LspPosition {
+                            line: 0,
+                            character: 4,
+                        },
+                    },
+                    "!",
+                )],
+            )
+            .unwrap();
+        observed(&client, "textDocument/didChange");
+        client
+            .change_document(
+                "file:///keep.rs",
+                3,
+                vec![LspTextChange::incremental(
+                    LspRange {
+                        start: LspPosition {
+                            line: 0,
+                            character: 2,
+                        },
+                        end: LspPosition {
+                            line: 0,
+                            character: 3,
+                        },
+                    },
+                    "bad",
+                )],
+            )
+            .unwrap();
+        wait_event(
+            &client,
+            "invalid surrogate boundary",
+            |event| matches!(event, LspEvent::Error(error) if error.contains("invalid incremental change")),
+        );
+        client.restart().unwrap();
+        let second = wait_state(&client, RustAnalyzerState::Ready);
+        assert_eq!(second.generation, first.generation + 1);
+        assert_ne!(second.pid, first.pid);
+        let reopened = observed(&client, "textDocument/didOpen");
+        assert_eq!(
+            reopened["textDocument"],
+            json!({"uri":"file:///keep.rs","languageId":"rust","version":2,"text":"a😀!\r\n"})
+        );
+        let barrier = client.request("test/echo", json!("barrier")).unwrap();
+        let mut reopened_closed = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match client.try_recv() {
+                Ok(LspEvent::Notification { method, params })
+                    if method == "test/observed" && params["method"] == "textDocument/didOpen" =>
+                {
+                    reopened_closed |=
+                        params["params"]["textDocument"]["uri"] == "file:///closed.rs"
+                }
+                Ok(LspEvent::Response { id, .. }) if id == barrier => break,
+                Ok(_) => {}
+                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+            }
+            assert!(Instant::now() < deadline);
+        }
+        assert!(!reopened_closed);
+        client.shutdown().unwrap();
+        wait_state(&client, RustAnalyzerState::Stopped);
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("peer-exits"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn client_routes_responses_notifications_and_server_requests_bidirectionally() {
+        let directory = tempfile::tempdir().unwrap();
+        let client = RustAnalyzerClient::new(peer_config(directory.path(), "normal")).unwrap();
+        client.start().unwrap();
+        wait_state(&client, RustAnalyzerState::Ready);
+        let original_pid = client.status().pid;
+        client.start().unwrap();
+        let id = client
+            .request("test/echo", json!({"unicode":"😀","number":7}))
+            .unwrap();
+        let response = wait_event(
+            &client,
+            "echo response",
+            |event| matches!(event, LspEvent::Response { id: response, .. } if *response == id),
+        );
+        assert!(
+            matches!(response, LspEvent::Response { result: Some(result), error: None, .. } if result == json!({"unicode":"😀","number":7}))
+        );
+        assert_eq!(client.status().pid, original_pid);
+        assert_eq!(client.status().generation, 1);
+        let failure = client.request("test/error", Value::Null).unwrap();
+        assert!(failure > id);
+        let response = wait_event(
+            &client,
+            "error response",
+            |event| matches!(event, LspEvent::Response { id, .. } if *id == failure),
+        );
+        assert!(
+            matches!(response, LspEvent::Response { result: None, error: Some(error), .. } if error["code"] == -32601)
+        );
+        client.notify("test/note", json!({"saved":true})).unwrap();
+        wait_event(
+            &client,
+            "notification",
+            |event| matches!(event, LspEvent::Notification { method, params } if method == "test/noted" && params["saved"] == true),
+        );
+        client.request("test/server-request", Value::Null).unwrap();
+        let server = wait_event(&client, "server request", |event| {
+            matches!(event, LspEvent::ServerRequest { .. })
+        });
+        assert!(
+            matches!(server, LspEvent::ServerRequest { id, method, params } if id == "server-7" && method == "workspace/configuration" && params["items"][0]["section"] == "rust-analyzer")
+        );
+        client
+            .respond(json!("server-7"), Some(json!([{"checkOnSave":true}])), None)
+            .unwrap();
+        wait_event(
+            &client,
+            "successful server reply",
+            |event| matches!(event, LspEvent::Notification { method, params } if method == "test/server-response" && params["result"][0]["checkOnSave"] == true),
+        );
+        client
+            .respond(
+                json!("server-error"),
+                None,
+                Some(json!({"code":-32602,"message":"unsupported"})),
+            )
+            .unwrap();
+        wait_event(
+            &client,
+            "failed server reply",
+            |event| matches!(event, LspEvent::Notification { method, params } if method == "test/server-response" && params["id"] == "server-error" && params["error"]["code"] == -32602),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !client.captured_stderr().0.contains("fixture initialized") {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(client.captured_stderr().1, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialization_and_protocol_failures_are_reported_without_panicking_the_worker() {
+        for (mode, expected) in [
+            ("initialize-error", "initialization failed"),
+            ("initialize-no-result", "initialize response has no result"),
+            ("bad-frame", "invalid LSP frame"),
+            ("bad-version", "no valid jsonrpc version"),
+            ("bad-object", "not a JSON object"),
+            (
+                "unclassifiable",
+                "neither a request, response, nor notification",
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let client = RustAnalyzerClient::new(peer_config(directory.path(), mode)).unwrap();
+            client.start().unwrap();
+            let failed = wait_state(&client, RustAnalyzerState::Failed);
+            assert!(
+                failed.last_error.as_ref().unwrap().contains(expected),
+                "{mode}: {failed:?}"
+            );
+            assert_eq!(failed.pid, None);
+            let request = client.request("test/echo", Value::Null).unwrap();
+            wait_event(
+                &client,
+                "request after protocol failure",
+                |event| matches!(event, LspEvent::RequestFailed { id, reason } if *id == request && reason.contains(expected)),
+            );
+            client.shutdown().unwrap();
+            wait_state(&client, RustAnalyzerState::Stopped);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialization_and_shutdown_timeouts_leave_a_reusable_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = peer_config(directory.path(), "initialize-timeout");
+        config.initialize_timeout = Duration::from_millis(100);
+        let client = RustAnalyzerClient::new(config).unwrap();
+        client.start().unwrap();
+        let failure = wait_state(&client, RustAnalyzerState::Failed);
+        assert!(failure.last_error.unwrap().contains("did not initialize"));
+        client.restart().unwrap();
+        assert_eq!(wait_state(&client, RustAnalyzerState::Failed).generation, 2);
+
+        let mut config = peer_config(directory.path(), "shutdown-timeout");
+        config.process_limits.shutdown_timeout = Duration::from_millis(100);
+        let client = RustAnalyzerClient::new(config).unwrap();
+        client.start().unwrap();
+        wait_state(&client, RustAnalyzerState::Ready);
+        client.shutdown().unwrap();
+        let stopped = wait_state(&client, RustAnalyzerState::Stopped);
+        assert!(
+            stopped
+                .last_error
+                .unwrap()
+                .contains("did not acknowledge shutdown")
+        );
+        assert_eq!(stopped.pid, None);
+        client.start().unwrap();
+        assert_eq!(wait_state(&client, RustAnalyzerState::Ready).generation, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_missing_and_crashed_servers_report_errors_and_can_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut missing = RustAnalyzerConfig::new(directory.path());
+        missing.executable = directory.path().join("missing-rust-analyzer");
+        let client = RustAnalyzerClient::new(missing).unwrap();
+        let request = client.request("test/echo", Value::Null).unwrap();
+        wait_event(
+            &client,
+            "request while stopped",
+            |event| matches!(event, LspEvent::RequestFailed { id, reason } if *id == request && reason.contains("stopped")),
+        );
+        client.notify("test/note", Value::Null).unwrap();
+        wait_event(
+            &client,
+            "notification while stopped",
+            |event| matches!(event, LspEvent::Error(error) if error.contains("cannot send test/note")),
+        );
+        client.respond(json!(1), Some(Value::Null), None).unwrap();
+        client.start().unwrap();
+        let missing = wait_state(&client, RustAnalyzerState::Failed);
+        assert!(missing.last_error.unwrap().contains("failed to launch"));
+        client.shutdown().unwrap();
+        wait_state(&client, RustAnalyzerState::Stopped);
+
+        let client = RustAnalyzerClient::new(peer_config(directory.path(), "normal")).unwrap();
+        client.start().unwrap();
+        wait_state(&client, RustAnalyzerState::Ready);
+        client.request("test/crash", Value::Null).unwrap();
+        assert!(
+            wait_state(&client, RustAnalyzerState::Failed)
+                .last_error
+                .is_some()
+        );
+        client.restart().unwrap();
+        assert_eq!(wait_state(&client, RustAnalyzerState::Ready).generation, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_encoded_request_reports_its_id_and_fails_the_connection() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = peer_config(directory.path(), "normal");
+        config.max_message_bytes = 2048;
+        let client = RustAnalyzerClient::new(config).unwrap();
+        client.start().unwrap();
+        wait_state(&client, RustAnalyzerState::Ready);
+        let id = client.request("x".repeat(4096), Value::Null).unwrap();
+        wait_event(
+            &client,
+            "oversized request failure",
+            |event| matches!(event, LspEvent::RequestFailed { id: failed, reason } if *failed == id && reason.contains("limit")),
+        );
+        assert_eq!(wait_state(&client, RustAnalyzerState::Failed).pid, None);
+    }
+
+    #[test]
+    fn client_validates_input_and_exposes_queue_pressure_without_blocking() {
+        let config = Arc::new(RustAnalyzerConfig {
+            max_message_bytes: 8,
+            ..RustAnalyzerConfig::new(".")
+        });
+        let (commands, receiver) = std::sync::mpsc::sync_channel(1);
+        let (events_sender, events) = std::sync::mpsc::sync_channel(1);
+        let client = RustAnalyzerClient {
+            config,
+            commands,
+            events,
+            status: Arc::new(Mutex::new(RustAnalyzerStatus::default())),
+            stderr: Arc::new(Mutex::new(BoundedLog::new(8))),
+            dropped_events: Arc::new(AtomicUsize::new(0)),
+            next_request_id: AtomicU64::new(1),
+            closing: Arc::new(AtomicBool::new(false)),
+            worker: None,
+        };
+        assert!(matches!(
+            client.request("", Value::Null),
+            Err(LspClientError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            client.notify("", Value::Null),
+            Err(LspClientError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            client.change_document("file:///a", 1, vec![]),
+            Err(LspClientError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            client.respond(json!(1), None, None),
+            Err(LspClientError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            client.respond(json!(1), Some(Value::Null), Some(Value::Null)),
+            Err(LspClientError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            client.open_document("file:///a", "rust", 1, "123456789"),
+            Err(LspClientError::MessageTooLarge { size: 9, limit: 8 })
+        ));
+        assert!(matches!(
+            client.change_document(
+                "file:///a",
+                2,
+                vec![LspTextChange::full("12345"), LspTextChange::full("6789")]
+            ),
+            Err(LspClientError::MessageTooLarge { size: 9, limit: 8 })
+        ));
+        assert!(matches!(
+            client.request("method", json!("1234567")),
+            Err(LspClientError::MessageTooLarge { .. })
+        ));
+        assert!(matches!(
+            client.notify("method", json!("1234567")),
+            Err(LspClientError::MessageTooLarge { .. })
+        ));
+        assert!(matches!(
+            client.respond(json!(1), Some(json!("1234567")), None),
+            Err(LspClientError::MessageTooLarge { .. })
+        ));
+        assert!(matches!(
+            client.respond(json!(1), None, Some(json!("1234567"))),
+            Err(LspClientError::MessageTooLarge { .. })
+        ));
+        client.start().unwrap();
+        assert_eq!(client.restart(), Err(LspClientError::QueueFull));
+        drop(receiver);
+        assert_eq!(client.shutdown(), Err(LspClientError::WorkerStopped));
+
+        let publisher = EventPublisher {
+            sender: events_sender,
+            dropped: Arc::clone(&client.dropped_events),
+            status: Arc::clone(&client.status),
+        };
+        publisher.emit(LspEvent::Error("first".into()));
+        publisher.emit(LspEvent::Error("dropped".into()));
+        publisher.transition(RustAnalyzerState::Failed, None, 7, Some("😀".repeat(2000)));
+        assert!(matches!(client.try_recv(), Ok(LspEvent::EventsDropped(2))));
+        assert_eq!(client.status().generation, 7);
+        let error = client.status().last_error.unwrap();
+        assert!(error.len() <= MAX_STATUS_ERROR_BYTES);
+        assert!(error.is_char_boundary(error.len()));
+        assert!(
+            matches!(client.drain_events(1).as_slice(), [LspEvent::Error(error)] if error == "first")
+        );
+        assert!(client.drain_events(0).is_empty());
+        drop(publisher);
+        assert!(client.try_recv().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialization_can_be_interrupted_and_restarted_before_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        let client =
+            RustAnalyzerClient::new(peer_config(directory.path(), "initialize-timeout")).unwrap();
+        client.start().unwrap();
+        assert_eq!(
+            wait_state(&client, RustAnalyzerState::Initializing).generation,
+            1
+        );
+        let request = client.request("test/echo", Value::Null).unwrap();
+        wait_event(
+            &client,
+            "request before initialize response",
+            |event| matches!(event, LspEvent::RequestFailed { id, reason } if *id == request && reason.contains("still initializing")),
+        );
+        client.restart().unwrap();
+        assert_eq!(
+            wait_state(&client, RustAnalyzerState::Initializing).generation,
+            2
+        );
+        client.shutdown().unwrap();
+        let stopped = wait_state(&client, RustAnalyzerState::Stopped);
+        assert_eq!(stopped.pid, None);
+        assert_eq!(stopped.last_error, None);
+        assert_eq!(stopped.generation, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graceful_shutdown_waits_for_the_peer_to_consume_exit_after_acknowledging_shutdown() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = peer_config(directory.path(), "delayed-exit");
+        config.process_limits.shutdown_timeout = Duration::from_secs(1);
+        let client = RustAnalyzerClient::new(config).unwrap();
+        client.start().unwrap();
+        wait_state(&client, RustAnalyzerState::Ready);
+        client.shutdown().unwrap();
+        let stopped = wait_state(&client, RustAnalyzerState::Stopped);
+        assert_eq!(stopped.last_error, None);
+        assert_eq!(stopped.pid, None);
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("peer-exits"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn status_error_truncation_respects_utf8_and_includes_its_suffix_in_the_limit() {
+        for text in ["ascii message", "😀😀😀😀", "a😀b😀c", ""] {
+            for limit in 0..20 {
+                let truncated = truncate_utf8(text, limit);
+                assert!(truncated.len() <= limit, "{text:?}, {limit}: {truncated:?}");
+                if text.len() <= limit {
+                    assert_eq!(truncated, text);
+                }
+            }
+        }
+        assert_eq!(truncate_utf8("abcdef", 4), "a…");
+        assert_eq!(truncate_utf8("😀", 3), "…");
+    }
+
+    #[test]
+    fn decoder_rejects_malformed_headers_and_reports_partial_streams() {
+        for (header, expected) in [
+            (
+                b"not a header\r\n\r\n".as_slice(),
+                JsonRpcFrameError::InvalidHeader("not a header".into()),
+            ),
+            (
+                b"Content-Type: json\r\n\r\n".as_slice(),
+                JsonRpcFrameError::MissingContentLength,
+            ),
+            (
+                b"Content-Length: -1\r\n\r\n".as_slice(),
+                JsonRpcFrameError::InvalidContentLength,
+            ),
+            (
+                b"Content-Length: \r\n\r\n".as_slice(),
+                JsonRpcFrameError::InvalidContentLength,
+            ),
+            (
+                b"Content-Length: 999999999999999999999999999999999\r\n\r\n".as_slice(),
+                JsonRpcFrameError::InvalidContentLength,
+            ),
+            (
+                b"\xff: invalid\r\n\r\n".as_slice(),
+                JsonRpcFrameError::HeaderNotUtf8,
+            ),
+        ] {
+            let error = JsonRpcFrameDecoder::new(128, 128).push(header).unwrap_err();
+            assert_eq!(error, expected);
+            assert!(!error.to_string().is_empty());
+        }
+        for header in [
+            b"unterminated".as_slice(),
+            b"Content-Length: 2\r\n\r\n{}".as_slice(),
+        ] {
+            let mut decoder = JsonRpcFrameDecoder::new(4, 128);
+            assert_eq!(
+                decoder.push(header),
+                Err(JsonRpcFrameError::HeaderTooLarge { limit: 4 })
+            );
+            assert_eq!(decoder.buffered_bytes(), 0);
+        }
+        for partial in [
+            b"Content-Len".as_slice(),
+            b"Content-Length: 4\r\n\r\nnu".as_slice(),
+        ] {
+            let mut decoder = JsonRpcFrameDecoder::new(128, 128);
+            assert!(decoder.push(partial).unwrap().is_empty());
+            assert!(decoder.buffered_bytes() > 0);
+            assert_eq!(decoder.finish(), Err(JsonRpcFrameError::TruncatedFrame));
+        }
+        let mut decoder = JsonRpcFrameDecoder::new(128, 128);
+        let error = decoder.push(b"Content-Length: 4\r\n\r\nnope").unwrap_err();
+        assert!(matches!(error, JsonRpcFrameError::InvalidJson(_)));
+        assert_eq!(
+            encode_json_rpc(&json!("😀"), 5),
+            Err(JsonRpcFrameError::MessageTooLarge { size: 6, limit: 5 })
+        );
+    }
+
+    #[test]
+    fn text_changes_validate_ranges_and_apply_sequential_utf16_coordinates() {
+        let range = |start, end| LspRange { start, end };
+        let pos = |line, character| LspPosition { line, character };
+        let changes = [
+            LspTextChange::full("a😀b\r\nsecond\n"),
+            LspTextChange::incremental(range(pos(0, 1), pos(0, 3)), "XY"),
+            LspTextChange::incremental(range(pos(1, 0), pos(2, 0)), "last"),
+        ];
+        assert_eq!(apply_text_changes("old", &changes).unwrap(), "aXYb\r\nlast");
+        for invalid in [
+            range(pos(0, 2), pos(0, 3)),
+            range(pos(0, 4), pos(0, 1)),
+            range(pos(2, 0), pos(2, 1)),
+            range(pos(9, 0), pos(9, 0)),
+        ] {
+            assert!(
+                apply_text_changes("a😀b\n", &[LspTextChange::incremental(invalid, "x")]).is_err()
+            );
+        }
+        assert_eq!(utf16_position_to_byte("one\r\ntwo", pos(1, 3)).unwrap(), 8);
+        assert_eq!(utf16_position_to_byte("one\n", pos(1, 0)).unwrap(), 4);
+        assert_eq!(
+            path_to_file_uri(Path::new("/tmp/😀?#.rs")),
+            "file:///tmp/%F0%9F%98%80%3F%23.rs"
         );
     }
 }

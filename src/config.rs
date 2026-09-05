@@ -313,7 +313,7 @@ fn merge_value(lower: &mut toml::Value, upper: toml::Value) {
 
 pub fn parse_hex_color(value: &str) -> Option<(u8, u8, u8)> {
     let hex = value.strip_prefix('#')?;
-    if hex.len() != 6 {
+    if hex.len() != 6 || !hex.is_ascii() {
         return None;
     }
     Some((
@@ -330,7 +330,13 @@ mod tests {
     #[test]
     fn colors_are_strict() {
         assert_eq!(parse_hex_color("#7aa2f7"), Some((122, 162, 247)));
-        assert_eq!(parse_hex_color("blue"), None);
+        assert_eq!(parse_hex_color("#ABCDEF"), Some((171, 205, 239)));
+        for invalid in [
+            "blue", "#12345", "#1234567", "#gg0000", "#00gg00", "#0000gg", "#aéabc", "#aaaéb",
+            "#aaaaé",
+        ] {
+            assert_eq!(parse_hex_color(invalid), None, "accepted {invalid:?}");
+        }
     }
 
     #[test]

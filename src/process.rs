@@ -476,6 +476,9 @@ impl SupervisedChild {
         if let Some(exit) = self.try_wait()? {
             self.readers_stopped.store(true, Ordering::Release);
             self.stdin.stop();
+            // Reaping the group leader does not imply its descendants exited.
+            // Explicit termination still owns cleanup of inherited pipe peers.
+            signal_process_group(self.child.id(), TerminationSignal::Kill);
             self.reap_finished_readers();
             return Ok(exit);
         }
@@ -490,6 +493,7 @@ impl SupervisedChild {
             if let Some(exit) = self.try_wait()? {
                 self.readers_stopped.store(true, Ordering::Release);
                 self.stdin.stop();
+                signal_process_group(self.child.id(), TerminationSignal::Kill);
                 self.reap_finished_readers();
                 return Ok(exit);
             }
@@ -610,18 +614,17 @@ fn send_pipe_event(
     stopped: &AtomicBool,
 ) -> bool {
     // Stdout carries framed protocols: discarding any chunk corrupts all
-    // subsequent messages. Backpressure belongs on this dedicated reader,
-    // never on the input thread. Keep retries cancellable during shutdown.
+    // subsequent messages. Both streams' EOF/error markers are also reliable,
+    // allowing owners to finish draining a child without guessing about lost
+    // terminal events. Backpressure belongs on this dedicated reader, never
+    // on the input thread. Keep retries cancellable during shutdown.
     let reliable = matches!(
         &event,
         ProcessEvent::Output {
             stream: OutputStream::Stdout,
             ..
-        } | ProcessEvent::Eof(OutputStream::Stdout)
-            | ProcessEvent::ReadError {
-                stream: OutputStream::Stdout,
-                ..
-            }
+        } | ProcessEvent::Eof(_)
+            | ProcessEvent::ReadError { .. }
     );
     loop {
         if stopped.load(Ordering::Acquire) {
@@ -826,6 +829,73 @@ impl BoundedLineDecoder {
 mod tests {
     use super::*;
 
+    #[test]
+    fn full_output_queue_preserves_eof_and_read_error_markers_on_both_streams() {
+        struct TerminalReader {
+            emitted: bool,
+            fail: bool,
+        }
+        impl Read for TerminalReader {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                if !self.emitted {
+                    self.emitted = true;
+                    bytes[0] = b'x';
+                    return Ok(1);
+                }
+                if self.fail {
+                    Err(io::Error::other("terminal read error"))
+                } else {
+                    Ok(0)
+                }
+            }
+        }
+        for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+            for fail in [false, true] {
+                let (sender, receiver) = mpsc::sync_channel(1);
+                let dropped = Arc::new(AtomicUsize::new(0));
+                let reader = spawn_pipe_reader(
+                    "test-terminal-event",
+                    TerminalReader {
+                        emitted: false,
+                        fail,
+                    },
+                    stream,
+                    1,
+                    sender,
+                    Arc::clone(&dropped),
+                    Arc::new(AtomicBool::new(false)),
+                )
+                .unwrap();
+                // The first byte fills the sole slot before the terminal event.
+                thread::sleep(Duration::from_millis(10));
+                assert!(
+                    matches!(receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    ProcessEvent::Output { stream: delivered, bytes } if delivered == stream && bytes == b"x")
+                );
+                let terminal = receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("terminal pipe marker was dropped");
+                match terminal {
+                    ProcessEvent::Eof(delivered) => {
+                        assert_eq!(delivered, stream);
+                        assert!(!fail);
+                    }
+                    ProcessEvent::ReadError {
+                        stream: delivered,
+                        error,
+                    } => {
+                        assert_eq!(delivered, stream);
+                        assert!(fail);
+                        assert_eq!(error.to_string(), "terminal read error");
+                    }
+                    event => panic!("expected terminal marker, got {event:?}"),
+                }
+                reader.join().unwrap();
+                assert_eq!(dropped.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+
     // Re-execute only this test as a real pipe peer. Keeping the peer in Rust
     // avoids requiring Python or a shell for bidirectional I/O regressions.
     #[test]
@@ -848,6 +918,24 @@ mod tests {
                 );
             }
             Ok("no-read") => thread::sleep(Duration::from_secs(10)),
+            Ok("leader-with-descendant") => {
+                let descendant = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "process::tests::process_pipe_test_peer",
+                        "--nocapture",
+                    ])
+                    .env("EDITOR_PROCESS_PIPE_TEST_MODE", "no-read")
+                    .env("LLVM_PROFILE_FILE", "/dev/null")
+                    .spawn()
+                    .unwrap();
+                std::fs::write(
+                    std::env::var_os("EDITOR_PROCESS_DESCENDANT_PID_FILE").unwrap(),
+                    descendant.id().to_string(),
+                )
+                .unwrap();
+                std::process::exit(0);
+            }
             Ok("exit") => std::process::exit(0),
             _ => {}
         }
@@ -861,7 +949,8 @@ mod tests {
                     "process::tests::process_pipe_test_peer",
                     "--nocapture",
                 ])
-                .env("EDITOR_PROCESS_PIPE_TEST_MODE", mode),
+                .env("EDITOR_PROCESS_PIPE_TEST_MODE", mode)
+                .env("LLVM_PROFILE_FILE", "/dev/null"),
             limits,
         )
         .unwrap()
@@ -939,6 +1028,56 @@ mod tests {
         let started = Instant::now();
         child.terminate(Duration::from_millis(50)).unwrap();
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn termination_cleans_up_descendants_after_the_group_leader_has_exited() {
+        let directory = tempfile::tempdir().unwrap();
+        let pid_file = directory.path().join("descendant.pid");
+        let mut child = SupervisedChild::spawn(
+            ProcessSpec::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::tests::process_pipe_test_peer",
+                    "--nocapture",
+                ])
+                .env("EDITOR_PROCESS_PIPE_TEST_MODE", "leader-with-descendant")
+                .env("EDITOR_PROCESS_DESCENDANT_PID_FILE", pid_file.as_os_str())
+                .env("LLVM_PROFILE_FILE", "/dev/null"),
+            ProcessLimits::default(),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        let descendant: u32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        let alive = || {
+            std::fs::read_to_string(format!("/proc/{descendant}/stat"))
+                .ok()
+                .is_some_and(|stat| {
+                    stat.rsplit_once(')')
+                        .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z'))
+                })
+        };
+        assert!(
+            alive(),
+            "peer must still hold inherited pipes after leader exit"
+        );
+        child.terminate(Duration::ZERO).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while alive() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let survived = alive();
+        // Also clean up on failure so the regression test cannot leave a peer.
+        signal_process_group(child.pid(), TerminationSignal::Kill);
+        assert!(
+            !survived,
+            "termination left an inherited-pipe descendant alive"
+        );
     }
 
     #[test]

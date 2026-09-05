@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_STATUS_ERROR_BYTES: usize = 4 * 1024;
 
@@ -382,6 +382,9 @@ struct CodexRuntime {
     decoder: BoundedLineDecoder,
     kind: CodexRunKind,
     generation: u64,
+    stdout_closed: bool,
+    stderr_closed: bool,
+    exit_drain_deadline: Option<Instant>,
 }
 
 struct CodexPublisher {
@@ -570,6 +573,9 @@ impl CodexWorker {
                     decoder: BoundedLineDecoder::new(self.config.max_event_line_bytes),
                     kind,
                     generation: self.generation,
+                    stdout_closed: false,
+                    stderr_closed: false,
+                    exit_drain_deadline: None,
                 });
                 self.publisher.transition(
                     match kind {
@@ -705,16 +711,23 @@ impl CodexWorker {
                     stream: OutputStream::Stderr,
                     error,
                 } => {
+                    runtime.stderr_closed = true;
                     self.publisher.emit(CodexWatchEvent::Error(format!(
                         "failed reading codex-watch stderr: {error}"
                     )));
                     Ok(())
                 }
-                ProcessEvent::Eof(OutputStream::Stdout) => match runtime.decoder.finish() {
-                    Some(line) if !line.is_empty() => self.consume_line(&line),
-                    _ => Ok(()),
-                },
-                ProcessEvent::Eof(OutputStream::Stderr) => Ok(()),
+                ProcessEvent::Eof(OutputStream::Stdout) => {
+                    runtime.stdout_closed = true;
+                    match runtime.decoder.finish() {
+                        Some(line) if !line.is_empty() => self.consume_line(&line),
+                        _ => Ok(()),
+                    }
+                }
+                ProcessEvent::Eof(OutputStream::Stderr) => {
+                    runtime.stderr_closed = true;
+                    Ok(())
+                }
             };
             if let Err(error) = result {
                 fatal_error = Some(error);
@@ -742,6 +755,38 @@ impl CodexWorker {
         match runtime.child.try_wait() {
             Ok(None) => self.runtime = Some(runtime),
             Ok(Some(exit)) => {
+                // Process exit does not mean the pipe reader has delivered all
+                // bytes. Keep pumping bounded batches through both EOFs so a
+                // final event or stderr error cannot disappear after a fast
+                // exit. Descendants retaining pipes cannot defer exit forever.
+                if !runtime.stdout_closed || !runtime.stderr_closed {
+                    let deadline = *runtime.exit_drain_deadline.get_or_insert_with(|| {
+                        Instant::now()
+                            + self
+                                .config
+                                .process_limits
+                                .shutdown_timeout
+                                .max(Duration::from_secs(2))
+                    });
+                    if Instant::now() < deadline {
+                        self.runtime = Some(runtime);
+                        return;
+                    }
+                    let error = "codex-watch output remained open after process exit".to_owned();
+                    let _ = runtime.child.terminate(Duration::ZERO);
+                    self.publisher.transition(
+                        CodexWatchState::Failed,
+                        self.enabled,
+                        self.run_mode,
+                        None,
+                        None,
+                        runtime.generation,
+                        exit.code,
+                        Some(error.clone()),
+                    );
+                    self.publisher.emit(CodexWatchEvent::Error(error));
+                    return;
+                }
                 let previous_state = lock_unpoison(&self.publisher.status).state;
                 let (state, error) = match runtime.kind {
                     CodexRunKind::Once
@@ -900,11 +945,17 @@ fn truncate_utf8(text: &str, max_bytes: usize) -> String {
     if text.len() <= max_bytes {
         return text.to_owned();
     }
-    let mut end = max_bytes;
+    let ellipsis = "…";
+    let suffix = if max_bytes >= ellipsis.len() {
+        ellipsis
+    } else {
+        ""
+    };
+    let mut end = max_bytes - suffix.len();
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…", &text[..end])
+    format!("{}{suffix}", &text[..end])
 }
 
 fn lock_unpoison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -915,17 +966,490 @@ fn lock_unpoison<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CodexEventParseError, CodexRunKind, CodexRunMode, CodexWatchConfig, parse_event_line,
-    };
+    use super::*;
     use serde_json::json;
-    use std::ffi::OsString;
+    use std::time::Instant;
+
+    fn worker(config: CodexWatchConfig) -> (CodexWorker, Receiver<CodexWatchEvent>) {
+        let (_commands, command_rx) = mpsc::sync_channel(4);
+        let (events, event_rx) = mpsc::sync_channel(config.event_queue_capacity.max(1));
+        let config = Arc::new(config);
+        let worker = CodexWorker {
+            captured_output: Arc::new(Mutex::new(BoundedLog::new(config.captured_output_bytes))),
+            config,
+            commands: command_rx,
+            publisher: CodexPublisher {
+                sender: events,
+                dropped: Arc::new(AtomicUsize::new(0)),
+                status: Arc::new(Mutex::new(CodexWatchStatus::default())),
+            },
+            closing: Arc::new(AtomicBool::new(false)),
+            runtime: None,
+            enabled: false,
+            run_mode: None,
+            generation: 0,
+        };
+        (worker, event_rx)
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !condition() {
+            assert!(Instant::now() < deadline, "codex-watch test timed out");
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn wait_error(watch: &CodexWatch, expected: &str) {
+        wait_until(|| {
+            watch.drain_events(128).iter().any(|event| {
+            matches!(event, CodexWatchEvent::Error(message) if message.contains(expected))
+        })
+        });
+    }
+
+    #[cfg(unix)]
+    fn echo_config(root: &std::path::Path) -> CodexWatchConfig {
+        // A pipe echo process lets tests supply event bytes directly without
+        // installing codex-watch or changing inherited environment/configuration.
+        let mut config = CodexWatchConfig::new(root);
+        config.executable = PathBuf::from("/bin/cat");
+        config.json_events_arg = "-".into();
+        config.run_once_arg = "-".into();
+        config.dry_run_args.clear();
+        config.workspace_write_args.clear();
+        config.process_limits.shutdown_timeout = Duration::from_millis(50);
+        config
+    }
+
+    #[test]
+    fn controller_requires_enablement_and_explicit_mode_before_spawning() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = CodexWatchConfig::new(directory.path());
+        config.executable = directory.path().join("missing-codex-watch");
+        let watch = CodexWatch::new(config).unwrap();
+        assert_eq!(watch.config().project_root, directory.path());
+        assert_eq!(watch.status(), CodexWatchStatus::default());
+        watch.start().unwrap();
+        wait_error(&watch, "disabled for this project");
+        assert_eq!(watch.status().generation, 0);
+        watch.enable().unwrap();
+        watch.enable().unwrap();
+        watch.start().unwrap();
+        wait_error(&watch, "select dry-run or workspace-write");
+        assert_eq!(watch.status().generation, 0);
+        assert_eq!(watch.status().state, CodexWatchState::Stopped);
+        watch.set_run_mode(CodexRunMode::DryRun).unwrap();
+        watch.run_once().unwrap();
+        wait_until(|| watch.status().state == CodexWatchState::Failed);
+        let status = watch.status();
+        assert!(status.last_error.unwrap().contains("failed to launch"));
+        assert!(status.pid.is_none());
+        assert_eq!(status.generation, 1);
+        watch.disable().unwrap();
+        watch.stop().unwrap();
+        wait_until(|| watch.status().state == CodexWatchState::Disabled);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn running_controller_rejects_permission_changes_and_supports_restart_stop_disable() {
+        let directory = tempfile::tempdir().unwrap();
+        let watch = CodexWatch::new(echo_config(directory.path())).unwrap();
+        watch.set_run_mode(CodexRunMode::DryRun).unwrap();
+        wait_until(|| watch.status().run_mode == Some(CodexRunMode::DryRun));
+        assert_eq!(watch.status().state, CodexWatchState::Disabled);
+        watch.enable().unwrap();
+        watch.start().unwrap();
+        wait_until(|| watch.status().state == CodexWatchState::Watching);
+        let first = watch.status();
+        assert!(first.pid.is_some());
+        assert_eq!(first.active_kind, Some(CodexRunKind::Watch));
+        watch.set_run_mode(CodexRunMode::WorkspaceWrite).unwrap();
+        wait_error(&watch, "stop codex-watch before changing");
+        assert_eq!(watch.status().run_mode, Some(CodexRunMode::DryRun));
+        watch.start().unwrap();
+        wait_error(&watch, "already running");
+        watch.restart().unwrap();
+        wait_until(|| {
+            watch.status().generation == 2 && watch.status().state == CodexWatchState::Watching
+        });
+        assert_ne!(watch.status().pid, first.pid);
+        watch.stop().unwrap();
+        wait_until(|| watch.status().state == CodexWatchState::Stopped);
+        assert!(watch.status().pid.is_none());
+        watch.set_run_mode(CodexRunMode::WorkspaceWrite).unwrap();
+        watch.restart().unwrap();
+        wait_until(|| {
+            watch.status().generation == 3 && watch.status().state == CodexWatchState::Watching
+        });
+        assert_eq!(watch.status().run_mode, Some(CodexRunMode::WorkspaceWrite));
+        watch.disable().unwrap();
+        wait_until(|| watch.status().state == CodexWatchState::Disabled);
+        assert!(watch.status().pid.is_none());
+        assert!(!watch.status().enabled);
+        watch.enable().unwrap();
+        watch.start().unwrap();
+        wait_until(|| watch.status().state == CodexWatchState::Watching);
+        let status = Arc::clone(&watch.status);
+        drop(watch);
+        assert_eq!(lock_unpoison(&status).state, CodexWatchState::Stopped);
+        assert!(lock_unpoison(&status).pid.is_none());
+    }
+
+    #[test]
+    fn json_lifecycle_preserves_payload_and_bounds_utf8_status_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut worker, events) = worker(CodexWatchConfig::new(directory.path()));
+        for (kind, state) in [
+            ("watch-started", CodexWatchState::Watching),
+            ("task_start", CodexWatchState::Processing),
+            ("completed", CodexWatchState::Completed),
+            ("running", CodexWatchState::Processing),
+            ("success", CodexWatchState::Completed),
+        ] {
+            worker
+                .consume_line(
+                    serde_json::to_string(&json!({"type": kind, "task_id": 9}))
+                        .unwrap()
+                        .as_bytes(),
+                )
+                .unwrap();
+            assert_eq!(lock_unpoison(&worker.publisher.status).state, state);
+            let delivered: Vec<_> = events.try_iter().collect();
+            assert!(delivered.iter().any(|event| matches!(event, CodexWatchEvent::Json(event) if event.kind == kind && event.payload["task_id"] == 9)));
+        }
+        worker
+            .consume_line(br#"{"type":"progress","percent":50}"#)
+            .unwrap();
+        assert_eq!(
+            lock_unpoison(&worker.publisher.status).state,
+            CodexWatchState::Completed
+        );
+        let message = "é".repeat(MAX_STATUS_ERROR_BYTES);
+        worker
+            .consume_line(
+                serde_json::to_string(&json!({"type":"failed", "reason":message}))
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .unwrap();
+        let status = lock_unpoison(&worker.publisher.status).clone();
+        assert_eq!(status.state, CodexWatchState::Failed);
+        let error = status.last_error.unwrap();
+        assert!(error.len() <= MAX_STATUS_ERROR_BYTES);
+        assert!(error.ends_with('…'));
+        assert!(
+            worker
+                .consume_line(&[0xff])
+                .unwrap_err()
+                .contains("not UTF-8")
+        );
+        assert!(
+            worker
+                .consume_line(b"not JSON")
+                .unwrap_err()
+                .contains("invalid codex-watch JSON")
+        );
+        assert_eq!(
+            parse_event_line(br#"{"type":""}"#, 128),
+            Err(CodexEventParseError::MissingKind)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pump_decodes_fragmented_events_and_rejects_oversized_streams() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = echo_config(directory.path());
+        config.max_event_line_bytes = 128;
+        config.process_limits.output_chunk_bytes = 3;
+        let (mut worker, events) = worker(config);
+        worker.handle_command(CodexCommand::SetEnabled(true));
+        worker.handle_command(CodexCommand::SetRunMode(CodexRunMode::DryRun));
+        worker.handle_command(CodexCommand::Start);
+        worker
+            .runtime
+            .as_mut()
+            .unwrap()
+            .child
+            .write_all(b"\n{\"type\":\"task_started\",\"id\":42}\r\n")
+            .unwrap();
+        wait_until(|| {
+            worker.pump();
+            events.try_iter().any(
+                |event| matches!(event, CodexWatchEvent::Json(event) if event.payload["id"] == 42),
+            )
+        });
+        assert_eq!(
+            lock_unpoison(&worker.publisher.status).state,
+            CodexWatchState::Processing
+        );
+        worker
+            .runtime
+            .as_mut()
+            .unwrap()
+            .child
+            .write_all(&[b'x'; 129])
+            .unwrap();
+        wait_until(|| {
+            worker.pump();
+            worker.runtime.is_none()
+        });
+        let status = lock_unpoison(&worker.publisher.status).clone();
+        assert_eq!(status.state, CodexWatchState::Failed);
+        assert!(
+            status
+                .last_error
+                .unwrap()
+                .contains("invalid codex-watch event stream")
+        );
+    }
+
+    #[test]
+    fn bounded_ui_queue_reports_loss_without_losing_current_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = CodexWatchConfig::new(directory.path());
+        config.event_queue_capacity = 1;
+        config.captured_output_bytes = 4;
+        let watch = CodexWatch::new(config).unwrap();
+        watch.set_run_mode(CodexRunMode::DryRun).unwrap();
+        watch.enable().unwrap();
+        wait_until(|| watch.status().enabled && watch.dropped_events.load(Ordering::Acquire) > 0);
+        assert!(matches!(
+            watch.try_recv(),
+            Ok(CodexWatchEvent::EventsDropped(_))
+        ));
+        assert_eq!(watch.status().state, CodexWatchState::Stopped);
+        assert_eq!(watch.drain_events(1).len(), 1);
+        lock_unpoison(&watch.captured_output).push(b"123456");
+        assert_eq!(watch.captured_output(), ("3456".into(), 2));
+        watch.clear_captured_output();
+        assert_eq!(watch.captured_output(), (String::new(), 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_process_drains_its_final_unterminated_json_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = echo_config(directory.path());
+        config.process_limits.output_chunk_bytes = 1;
+        config.process_limits.event_queue_capacity = 4096;
+        let (mut worker, events) = worker(config);
+        worker.handle_command(CodexCommand::SetEnabled(true));
+        worker.handle_command(CodexCommand::SetRunMode(CodexRunMode::DryRun));
+        worker.handle_command(CodexCommand::RunOnce);
+        let mut payload = b"{\"type\":\"progress\"}\n".repeat(8);
+        payload.extend_from_slice(br#"{"type":"completed","task_id":99}"#);
+        let runtime = worker.runtime.as_mut().unwrap();
+        runtime.child.write_all(&payload).unwrap();
+        runtime.child.close_stdin();
+        wait_until(|| runtime.child.try_wait().unwrap().is_some());
+        wait_until(|| {
+            worker.pump();
+            worker.runtime.is_none()
+        });
+        let final_status = lock_unpoison(&worker.publisher.status).clone();
+        assert_eq!(final_status.state, CodexWatchState::Completed);
+        assert_eq!(final_status.last_exit_code, Some(0));
+        assert!(
+            events.try_iter().any(|event| matches!(event,
+                CodexWatchEvent::Json(event) if event.payload["task_id"] == 99
+            )),
+            "process exit must not discard unread final stdout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_tasks_unexpected_exits_and_malformed_final_events_are_reported() {
+        let directory = tempfile::tempdir().unwrap();
+        for (kind, payload, expected) in [
+            (
+                CodexRunKind::Once,
+                &br#"{"type":"task_failed","message":"task rejected"}"#[..],
+                "reported a failed task",
+            ),
+            (
+                CodexRunKind::Watch,
+                &b""[..],
+                "exited unexpectedly with code 0",
+            ),
+            (
+                CodexRunKind::Once,
+                &b"invalid JSON"[..],
+                "malformed codex-watch event",
+            ),
+        ] {
+            let (mut worker, events) = worker(echo_config(directory.path()));
+            worker.enabled = true;
+            worker.run_mode = Some(CodexRunMode::DryRun);
+            worker.start_kind(kind);
+            let runtime = worker.runtime.as_mut().unwrap();
+            runtime.child.write_all(payload).unwrap();
+            runtime.child.close_stdin();
+            wait_until(|| {
+                worker.pump();
+                worker.runtime.is_none()
+            });
+            assert_eq!(
+                lock_unpoison(&worker.publisher.status).state,
+                CodexWatchState::Failed
+            );
+            assert!(
+                lock_unpoison(&worker.publisher.status)
+                    .last_error
+                    .as_ref()
+                    .unwrap()
+                    .contains(expected)
+            );
+            assert!(events.try_iter().any(|event| matches!(event, CodexWatchEvent::Error(message) if message.contains(expected))));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonzero_exit_preserves_captured_stderr() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = echo_config(directory.path());
+        config
+            .args
+            .push(directory.path().join("missing-input").into_os_string());
+        let (mut worker, events) = worker(config);
+        worker.enabled = true;
+        worker.run_mode = Some(CodexRunMode::DryRun);
+        worker.start_kind(CodexRunKind::Once);
+        // Wait for stderr before closing stdin to isolate output capture from
+        // platform-dependent EOF ordering between the two pipe reader threads.
+        wait_until(|| {
+            worker.pump();
+            lock_unpoison(&worker.captured_output)
+                .to_string_lossy()
+                .contains("missing-input")
+        });
+        worker.runtime.as_mut().unwrap().child.close_stdin();
+        wait_until(|| {
+            worker.pump();
+            worker.runtime.is_none()
+        });
+        let status = lock_unpoison(&worker.publisher.status).clone();
+        assert_eq!(status.state, CodexWatchState::Failed);
+        assert_eq!(status.last_exit_code, Some(1));
+        assert!(status.last_error.unwrap().contains("with code 1"));
+        assert!(events.try_iter().any(|event| matches!(event,
+            CodexWatchEvent::Stderr(message) if message.contains("missing-input")
+        )));
+    }
+
+    #[test]
+    fn controller_reports_full_and_disconnected_command_queues() {
+        let directory = tempfile::tempdir().unwrap();
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let (_event_sender, events) = mpsc::channel();
+        let watch = CodexWatch {
+            config: Arc::new(CodexWatchConfig::new(directory.path())),
+            commands,
+            events,
+            status: Arc::new(Mutex::new(CodexWatchStatus::default())),
+            captured_output: Arc::new(Mutex::new(BoundedLog::new(16))),
+            dropped_events: Arc::new(AtomicUsize::new(0)),
+            closing: Arc::new(AtomicBool::new(false)),
+            worker: None,
+        };
+        watch.start().unwrap();
+        assert_eq!(watch.stop(), Err(CodexWatchError::QueueFull));
+        assert!(
+            CodexWatchError::QueueFull
+                .to_string()
+                .contains("queue is full")
+        );
+        drop(receiver);
+        assert_eq!(watch.stop(), Err(CodexWatchError::WorkerStopped));
+        assert!(
+            CodexWatchError::WorkerStopped
+                .to_string()
+                .contains("worker has stopped")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exited_process_drains_stderr_after_stdout_has_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = echo_config(directory.path());
+        config.process_limits.output_chunk_bytes = 1;
+        config.process_limits.event_queue_capacity = 16_384;
+        for index in 0..8 {
+            config.args.push(
+                directory
+                    .path()
+                    .join(format!("missing-input-{index}"))
+                    .into_os_string(),
+            );
+        }
+        let (mut worker, events) = worker(config);
+        worker.enabled = true;
+        worker.run_mode = Some(CodexRunMode::DryRun);
+        worker.start_kind(CodexRunKind::Once);
+        let runtime = worker.runtime.as_mut().unwrap();
+        runtime.child.close_stdin();
+        wait_until(|| runtime.child.try_wait().unwrap().is_some());
+        // Force the valid interleaving where an earlier pump saw stdout EOF
+        // before the independent stderr reader finished queuing its chunks.
+        runtime.stdout_closed = true;
+        worker.pump();
+        assert!(
+            worker.runtime.is_some(),
+            "stderr still has more than one batch to drain"
+        );
+        let mut stderr = String::new();
+        wait_until(|| {
+            worker.pump();
+            for event in events.try_iter() {
+                if let CodexWatchEvent::Stderr(chunk) = event {
+                    stderr.push_str(&chunk);
+                }
+            }
+            worker.runtime.is_none()
+        });
+        let captured = lock_unpoison(&worker.captured_output).to_string_lossy();
+        for index in 0..8 {
+            let filename = format!("missing-input-{index}");
+            assert!(
+                captured.contains(&filename),
+                "captured output lost {filename}"
+            );
+            assert!(stderr.contains(&filename), "UI output lost {filename}");
+        }
+        assert_eq!(
+            lock_unpoison(&worker.publisher.status).last_exit_code,
+            Some(1)
+        );
+    }
 
     #[test]
     fn parses_type_event_and_preserves_payload() {
         let event = parse_event_line(br#"{"type":"task_started","task_id":9}"#, 128).unwrap();
         assert_eq!(event.kind, "task_started");
         assert_eq!(event.payload, json!({"type":"task_started","task_id":9}));
+    }
+
+    #[test]
+    fn truncated_status_errors_fit_small_and_unicode_byte_limits() {
+        for text in ["plain ASCII error", "éééé", "🙂🙂🙂"] {
+            for limit in 0..=text.len() {
+                let truncated = truncate_utf8(text, limit);
+                assert!(
+                    truncated.len() <= limit,
+                    "{text:?}, limit {limit}, got {truncated:?}"
+                );
+                if text.len() <= limit {
+                    assert_eq!(truncated, text);
+                } else if limit >= "…".len() {
+                    assert!(truncated.ends_with('…'));
+                }
+            }
+        }
     }
 
     #[test]

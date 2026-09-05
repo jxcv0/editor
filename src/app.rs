@@ -920,6 +920,11 @@ impl Runtime {
             return;
         };
         let edits = parse_text_edits(array);
+        if edits.len() != array.len() {
+            self.editor
+                .message("Could not apply formatting: malformed text edit");
+            return;
+        }
         match self.editor.apply_lsp_edits(edits) {
             Ok(()) => self.editor.message("Formatting applied"),
             Err(error) => self
@@ -943,6 +948,11 @@ impl Runtime {
             return;
         };
         let edits = parse_text_edits(changes);
+        if edits.len() != changes.len() {
+            self.editor
+                .message("Could not apply rename: malformed text edit");
+            return;
+        }
         match self.editor.apply_lsp_edits(edits) {
             Ok(()) => self.editor.message("Rename applied to active buffer"),
             Err(error) => self
@@ -1645,6 +1655,630 @@ mod tests {
         runtime
     }
 
+    fn open_test_file(runtime: &mut Runtime, name: &str, contents: &str) -> PathBuf {
+        let path = runtime.editor.explorer.root.join(name);
+        fs::write(&path, contents).unwrap();
+        runtime.editor.open_path(&path).unwrap();
+        path.canonicalize().unwrap()
+    }
+
+    fn text_edit(line: usize, start: usize, end: usize, text: &str) -> Value {
+        json!({"range": {"start": {"line": line, "character": start},
+            "end": {"line": line, "character": end}}, "newText": text})
+    }
+
+    #[test]
+    fn formatting_applies_utf16_edits_as_one_undo_step() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        let original = "😀 ab cd\n";
+        open_test_file(&mut runtime, "format.rs", original);
+        runtime.editor.split(Orientation::Vertical);
+        runtime.handle_lsp_response(
+            CommandId::Format,
+            json!([text_edit(0, 3, 5, "alpha"), text_edit(0, 6, 8, "beta")]),
+        );
+        assert_eq!(runtime.editor.active_buffer().text(), "😀 alpha beta\n");
+        assert_eq!(runtime.editor.current_message(), Some("Formatting applied"));
+        assert!(!runtime.editor.active_buffer().in_transaction());
+        assert!(runtime.editor.active_buffer_mut().undo().unwrap());
+        assert_eq!(runtime.editor.active_buffer().text(), original);
+        assert!(!runtime.editor.active_buffer().can_undo());
+    }
+
+    #[test]
+    fn formatting_rejects_invalid_positions_and_malformed_batches_atomically() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        open_test_file(&mut runtime, "format.rs", "😀 value\n");
+        for invalid in [
+            text_edit(0, 1, 2, "invalid surrogate"),
+            json!({"newText": "missing range"}),
+        ] {
+            runtime.apply_text_edits(&json!([text_edit(0, 3, 8, "changed"), invalid]));
+            assert_eq!(runtime.editor.active_buffer().text(), "😀 value\n");
+            assert!(!runtime.editor.active_buffer().can_undo());
+            assert!(!runtime.editor.active_buffer().in_transaction());
+            assert!(
+                runtime
+                    .editor
+                    .current_message()
+                    .unwrap()
+                    .starts_with("Could not apply formatting:")
+            );
+        }
+        runtime.apply_text_edits(&Value::Null);
+        assert_eq!(
+            runtime.editor.current_message(),
+            Some("Formatter returned no edits")
+        );
+    }
+
+    #[test]
+    fn rename_applies_active_document_edits_and_rejects_malformed_batches() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        let first = open_test_file(&mut runtime, "first.rs", "old old\n");
+        let first_index = runtime.editor.active_pane().buffer;
+        let second = open_test_file(&mut runtime, "second.rs", "old\n");
+        let second_index = runtime.editor.active_pane().buffer;
+        runtime.editor.active_pane_mut().buffer = first_index;
+        runtime.handle_lsp_response(
+            CommandId::Rename,
+            json!({"changes": {
+                path_to_file_uri(&first): [text_edit(0, 0, 3, "new"), text_edit(0, 4, 7, "new")],
+                path_to_file_uri(&second): [text_edit(0, 0, 3, "other")]
+            }}),
+        );
+        assert_eq!(runtime.editor.active_buffer().text(), "new new\n");
+        assert_eq!(runtime.editor.buffers[second_index].buffer.text(), "old\n");
+        assert_eq!(
+            runtime.editor.current_message(),
+            Some("Rename applied to active buffer")
+        );
+        assert!(runtime.editor.active_buffer_mut().undo().unwrap());
+        assert_eq!(runtime.editor.active_buffer().text(), "old old\n");
+        runtime.apply_workspace_edit(&json!({"changes": {path_to_file_uri(&first): [
+            text_edit(0, 0, 3, "partial"), {"range": {}}
+        ]}}));
+        assert_eq!(runtime.editor.active_buffer().text(), "old old\n");
+        assert_eq!(
+            runtime.editor.current_message(),
+            Some("Could not apply rename: malformed text edit")
+        );
+        runtime.apply_workspace_edit(&json!({"changes": {}}));
+        assert_eq!(
+            runtime.editor.current_message(),
+            Some("Rename returned no edits for the active buffer")
+        );
+    }
+
+    #[test]
+    fn completion_responses_are_bounded_and_do_not_change_text_before_acceptance() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        runtime.editor.handle_key(crate::input::Key::char('i'));
+        let items: Vec<_> = (0..205)
+            .map(|index| {
+                json!({"label": format!("item{index}"),
+            "insertText": format!("insert{index}"), "detail": "function"})
+            })
+            .collect();
+        runtime.handle_lsp_response(CommandId::Completion, json!({"items": items}));
+        let picker = runtime.editor.picker.as_ref().unwrap();
+        assert_eq!(picker.items.len(), 200);
+        assert_eq!(picker.items[0].label, "item0");
+        assert_eq!(picker.items[0].detail, "function");
+        assert_eq!(picker.items[0].insert_text.as_deref(), Some("insert0"));
+        assert_eq!(runtime.editor.active_buffer().text(), "");
+        runtime.handle_lsp_response(CommandId::Completion, json!([{"label": "fallback"}]));
+        assert_eq!(
+            runtime.editor.picker.as_ref().unwrap().items[0]
+                .insert_text
+                .as_deref(),
+            Some("fallback")
+        );
+        assert_eq!(runtime.editor.active_buffer().text(), "");
+    }
+
+    #[test]
+    fn location_responses_support_links_utf16_and_multiple_targets() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        let path = directory.path().join("target with space.rs");
+        fs::write(&path, "first\n😀 target\n").unwrap();
+        let uri = path_to_file_uri(&path);
+        let range =
+            json!({"start": {"line": 1, "character": 3}, "end": {"line": 1, "character": 9}});
+        runtime.handle_lsp_response(
+            CommandId::Definition,
+            json!({"targetUri": uri, "targetSelectionRange": range}),
+        );
+        assert_eq!(runtime.editor.active_buffer().path(), Some(path.as_path()));
+        assert_eq!(runtime.editor.active_pane().cursor, Pos::new(1, 2));
+        runtime.open_locations(json!([
+            {"uri": uri, "range": range}, {"targetUri": uri, "targetSelectionRange": range},
+            {"uri": "https://invalid.example/ignored", "range": range}
+        ]));
+        let picker = runtime.editor.picker.as_ref().unwrap();
+        assert_eq!(picker.kind, PickerKind::Symbols);
+        assert_eq!(picker.items.len(), 2);
+        assert_eq!(picker.items[0].path.as_deref(), Some(path.as_path()));
+        assert_eq!(picker.items[0].line, Some(1));
+        runtime.open_locations(Value::Null);
+        assert_eq!(runtime.editor.current_message(), Some("No locations found"));
+    }
+
+    #[test]
+    fn symbol_and_hover_responses_present_bounded_details() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        let path = directory.path().join("symbols.rs");
+        runtime.handle_lsp_response(
+            CommandId::WorkspaceSymbols,
+            json!([
+                {"name": "workspace", "location": {"uri": path_to_file_uri(&path),
+                    "range": {"start": {"line": 4, "character": 0}}}},
+                {"name": "local", "range": {"start": {"line": 2, "character": 0}}}
+            ]),
+        );
+        let picker = runtime.editor.picker.as_ref().unwrap();
+        assert_eq!(picker.items[0].label, "workspace");
+        assert_eq!(picker.items[0].path.as_deref(), Some(path.as_path()));
+        assert_eq!(picker.items[0].line, Some(4));
+        assert_eq!(picker.items[1].line, Some(2));
+        runtime.handle_lsp_response(
+            CommandId::Hover,
+            json!({"contents": {"kind": "markdown", "value": "first\nsecond"}}),
+        );
+        assert!(
+            runtime
+                .editor
+                .current_message()
+                .unwrap()
+                .contains("first second")
+        );
+        assert_eq!(
+            summarize_lsp_text(&json!({"contents": "界".repeat(800)}))
+                .chars()
+                .count(),
+            500
+        );
+        runtime.handle_lsp_response(
+            CommandId::SignatureHelp,
+            json!({"signatures": [
+                {"label": "fn example(value: u32)", "documentation": {"value": "argument help"}}
+            ]}),
+        );
+        let message = runtime.editor.current_message().unwrap();
+        assert!(message.contains("fn example(value: u32)"));
+        assert!(message.contains("argument help"));
+    }
+
+    #[test]
+    fn diagnostics_follow_live_revisions_and_suppress_dirty_disk_results() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        let path = open_test_file(&mut runtime, "diagnostics.rs", "😀 value\n");
+        let uri = path_to_file_uri(&path);
+        let diagnostic = |source: &str, severity: u8, message: &str| {
+            json!({
+                "range": {"start": {"line": 0, "character": 3}},
+                "source": source, "severity": severity, "message": message
+            })
+        };
+        runtime.publish_diagnostics(json!({"uri": uri, "version": 0, "diagnostics": [
+            diagnostic("rustc", 1, "on disk")
+        ]}));
+        assert_eq!(runtime.editor.diagnostics.len(), 1);
+        assert_eq!(runtime.editor.diagnostics[0].column, 2);
+        assert_eq!(
+            runtime.editor.diagnostics[0].severity,
+            DiagnosticSeverity::Error
+        );
+        runtime
+            .editor
+            .active_buffer_mut()
+            .begin_transaction()
+            .unwrap();
+        runtime
+            .editor
+            .active_buffer_mut()
+            .insert(Pos::new(0, 7), "x")
+            .unwrap();
+        let revision = runtime.editor.active_buffer().revision();
+        runtime.redraw = false;
+        runtime.discard_stale_diagnostics();
+        assert!(runtime.redraw);
+        assert!(runtime.editor.diagnostics.is_empty());
+        runtime.publish_diagnostics(json!({"uri": uri, "version": 0, "diagnostics": [
+            diagnostic("rust-analyzer", 1, "stale")
+        ]}));
+        assert!(runtime.editor.diagnostics.is_empty());
+        runtime.publish_diagnostics(json!({"uri": uri, "version": revision, "diagnostics": [
+            diagnostic("rustc", 1, "old disk"), diagnostic("clippy", 2, "old lint"),
+            diagnostic("rust-analyzer", 2, "live warning"), diagnostic("rust-analyzer", 4, "live hint")
+        ]}));
+        assert_eq!(runtime.editor.diagnostics.len(), 2);
+        assert_eq!(runtime.editor.diagnostics[0].message, "live warning");
+        assert_eq!(
+            runtime.editor.diagnostics[0].severity,
+            DiagnosticSeverity::Warning
+        );
+        assert_eq!(
+            runtime.editor.diagnostics[1].severity,
+            DiagnosticSeverity::Hint
+        );
+        runtime.publish_diagnostics(json!({"uri": uri, "diagnostics": []}));
+        assert!(runtime.editor.diagnostics.is_empty());
+        assert_eq!(runtime.diagnostic_versions.get(&path), Some(&revision));
+    }
+
+    #[test]
+    fn unopened_diagnostics_reject_out_of_order_updates_and_invalid_uris() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        let path = directory.path().join("closed.rs");
+        let uri = path_to_file_uri(&path);
+        runtime.publish_diagnostics(
+            json!({"uri": uri, "version": 4, "diagnostics": [{"message": "new"}]}),
+        );
+        runtime.publish_diagnostics(json!({"uri": uri, "version": 3, "diagnostics": []}));
+        runtime
+            .publish_diagnostics(json!({"uri": "https://example.invalid/file", "diagnostics": []}));
+        runtime.publish_diagnostics(json!({"diagnostics": []}));
+        runtime.discard_stale_diagnostics();
+        assert_eq!(runtime.editor.diagnostics.len(), 1);
+        assert_eq!(runtime.editor.diagnostics[0].message, "new");
+        assert_eq!(
+            runtime.editor.diagnostics[0].severity,
+            DiagnosticSeverity::Information
+        );
+        assert_eq!(runtime.editor.diagnostics[0].column, 0);
+        runtime.publish_diagnostics(json!({"uri": uri, "version": 5, "diagnostics": []}));
+        assert!(runtime.editor.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn document_sync_tracks_only_eligible_buffers_and_live_edits() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        let path = open_test_file(&mut runtime, "active.rs", "let value = 1;\n");
+        let active = runtime.editor.active_pane().buffer;
+        open_test_file(&mut runtime, "notes.txt", "notes");
+        open_test_file(&mut runtime, "large.rs", "large");
+        let large = runtime.editor.active_pane().buffer;
+        runtime.editor.buffers[large].large_file = true;
+        let mut config = RustAnalyzerConfig::new(directory.path());
+        config.executable = directory.path().join("unused-analyzer");
+        runtime.rust_analyzer = Some(RustAnalyzerClient::new(config).unwrap());
+        runtime.sync_lsp_documents();
+        assert_eq!(runtime.lsp_versions, HashMap::from([(path.clone(), 0)]));
+        runtime.editor.buffers[active]
+            .buffer
+            .begin_transaction()
+            .unwrap();
+        runtime.editor.buffers[active]
+            .buffer
+            .insert(Pos::ZERO, "x")
+            .unwrap();
+        let revision = runtime.editor.buffers[active].buffer.revision();
+        runtime.sync_lsp_documents();
+        assert_eq!(runtime.lsp_versions.get(&path), Some(&revision));
+        runtime.sync_lsp_documents();
+        assert_eq!(runtime.lsp_versions.len(), 1);
+        runtime.editor.buffers[active].large_file = true;
+        runtime.sync_lsp_documents();
+        assert!(runtime.lsp_versions.is_empty());
+        assert_eq!(
+            runtime.rust_analyzer.as_ref().unwrap().status().state,
+            RustAnalyzerState::Stopped
+        );
+    }
+
+    #[test]
+    fn queued_lsp_requests_capture_mutation_origins_and_failed_requests_are_removed() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        runtime.request_lsp(CommandId::Hover, None);
+        assert_eq!(
+            runtime.editor.current_message(),
+            Some("rust-analyzer integration failed to initialize")
+        );
+        let mut config = RustAnalyzerConfig::new(directory.path());
+        config.executable = directory.path().join("unused-analyzer");
+        runtime.rust_analyzer = Some(RustAnalyzerClient::new(config).unwrap());
+        runtime.request_lsp(CommandId::Hover, None);
+        assert_eq!(
+            runtime.editor.current_message(),
+            Some("This action requires a saved file")
+        );
+        runtime.request_lsp(CommandId::WorkspaceSymbols, Some("query".into()));
+        let path = open_test_file(&mut runtime, "requests.rs", "😀 value\n");
+        runtime.editor.active_pane_mut().cursor = Pos::new(0, 2);
+        for command in [
+            CommandId::Hover,
+            CommandId::Definition,
+            CommandId::Declaration,
+            CommandId::TypeDefinition,
+            CommandId::Implementation,
+            CommandId::References,
+            CommandId::Completion,
+            CommandId::SignatureHelp,
+            CommandId::Format,
+            CommandId::Rename,
+            CommandId::CodeAction,
+            CommandId::DocumentSymbols,
+        ] {
+            runtime.request_lsp(command, Some("renamed".into()));
+        }
+        assert_eq!(runtime.pending_lsp.len(), 13);
+        for pending in runtime.pending_lsp.values() {
+            if matches!(pending.command, CommandId::Format | CommandId::Rename) {
+                assert_eq!(
+                    pending.mutation_origin,
+                    Some(LspMutationOrigin {
+                        path: path.clone(),
+                        revision: 0
+                    })
+                );
+            } else {
+                assert!(pending.mutation_origin.is_none());
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !runtime.pending_lsp.is_empty() && Instant::now() < deadline {
+            runtime.drain_lsp();
+            thread::yield_now();
+        }
+        assert!(runtime.pending_lsp.is_empty());
+        assert_eq!(
+            runtime.editor.current_message(),
+            Some("rust-analyzer is stopped")
+        );
+        assert_eq!(runtime.editor.active_buffer().text(), "😀 value\n");
+    }
+
+    #[test]
+    fn project_search_replaces_queries_and_clears_cancelled_results() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("search.rs"), "alpha\nbeta\n").unwrap();
+        let mut runtime = local_runtime(directory.path());
+        runtime.editor.explorer.show_ignored = true;
+        runtime
+            .editor
+            .show_picker_items(PickerKind::Grep, Vec::new());
+        runtime.editor.picker.as_mut().unwrap().query = "alpha".into();
+        runtime.update_project_search();
+        let cancelled = runtime
+            .project_search
+            .as_ref()
+            .unwrap()
+            .cancellation_token();
+        runtime.editor.picker.as_mut().unwrap().query = "beta".into();
+        runtime.update_project_search();
+        assert!(cancelled.is_cancelled());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            runtime.drain_project_search();
+            let task = runtime.project_search.as_ref().unwrap();
+            if task.is_finished() && task.ready_len() == 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "project search should finish");
+            thread::yield_now();
+        }
+        assert_eq!(runtime.project_search_results.len(), 1);
+        assert_eq!(runtime.project_search_results[0].line, Some(1));
+        assert_eq!(runtime.project_search_results[0].detail, "beta");
+        assert_eq!(runtime.editor.picker.as_ref().unwrap().items.len(), 1);
+        runtime.editor.picker = None;
+        runtime.update_project_search();
+        assert!(runtime.project_search.is_none());
+        assert!(runtime.project_search_results.is_empty());
+        assert!(runtime.last_search_query.is_empty());
+        runtime
+            .editor
+            .show_picker_items(PickerKind::Grep, Vec::new());
+        runtime.editor.picker.as_mut().unwrap().query = "[".into();
+        runtime.update_project_search();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !runtime
+            .editor
+            .current_message()
+            .is_some_and(|message| message.contains("Invalid project search:"))
+        {
+            runtime.drain_project_search();
+            assert!(
+                Instant::now() < deadline,
+                "invalid regex should report a background error"
+            );
+            thread::yield_now();
+        }
+        assert!(runtime.project_search_results.is_empty());
+    }
+
+    #[test]
+    fn terminal_failures_restore_editor_focus_and_keep_buffer_text() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        runtime
+            .editor
+            .active_buffer_mut()
+            .insert(Pos::ZERO, "keep")
+            .unwrap();
+        runtime.editor.focus = crate::editor::Focus::Terminal;
+        runtime.write_terminal(b"input");
+        assert_eq!(runtime.editor.focus, crate::editor::Focus::Editor);
+        assert!(
+            runtime
+                .editor
+                .current_message()
+                .unwrap()
+                .starts_with("Terminal is not running")
+        );
+        runtime.editor.focus = crate::editor::Focus::Terminal;
+        runtime.redraw = false;
+        runtime.fail_terminal("synthetic terminal failure".into());
+        assert!(runtime.redraw);
+        assert_eq!(runtime.editor.focus, crate::editor::Focus::Editor);
+        assert_eq!(
+            runtime.editor.terminal.status,
+            TerminalStatus::Failed("synthetic terminal failure".into())
+        );
+        assert_eq!(runtime.editor.active_buffer().text(), "keep");
+        runtime.toggle_terminal(false);
+        runtime.sync_terminal_size();
+        runtime.drain_terminal();
+        assert!(runtime.terminal.is_none());
+    }
+
+    #[test]
+    fn journal_records_are_removed_after_saving_or_undoing_to_clean() {
+        for save in [false, true] {
+            let directory = tempdir().unwrap();
+            let recovery = directory.path().join("recovery");
+            let mut runtime = local_runtime(directory.path());
+            open_test_file(&mut runtime, "journal.rs", "before");
+            runtime.journal = Some(Journal::start(recovery.clone()).unwrap());
+            runtime
+                .editor
+                .active_buffer_mut()
+                .insert(Pos::ZERO, "after ")
+                .unwrap();
+            runtime.journal_buffers();
+            assert_eq!(runtime.journal_versions.len(), 1);
+            let versions = runtime.journal_versions.clone();
+            runtime.journal_buffers();
+            assert_eq!(runtime.journal_versions, versions);
+            if save {
+                runtime.editor.active_buffer_mut().save().unwrap();
+            } else {
+                runtime.editor.active_buffer_mut().undo().unwrap();
+            }
+            runtime.journal_buffers();
+            assert!(runtime.journal_versions.is_empty());
+            drop(runtime.journal.take());
+            assert!(state::list_recoverable(&recovery).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn session_delivery_waits_for_data_and_does_not_overwrite_started_editing() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("session.rs");
+        fs::write(&path, "saved").unwrap();
+        for started_editing in [false, true] {
+            let mut runtime = local_runtime(directory.path());
+            let (sender, receiver) = mpsc::channel();
+            runtime.session_rx = Some(receiver);
+            runtime.redraw = false;
+            runtime.restore_session_if_ready();
+            assert!(runtime.session_rx.is_some());
+            assert!(!runtime.redraw);
+            if started_editing {
+                runtime
+                    .editor
+                    .active_buffer_mut()
+                    .insert(Pos::ZERO, "local")
+                    .unwrap();
+            }
+            sender
+                .send(Some(SessionState {
+                    version: STATE_VERSION,
+                    files: vec![path.clone()],
+                    project_root: directory.path().to_owned(),
+                    ..SessionState::default()
+                }))
+                .unwrap();
+            runtime.restore_session_if_ready();
+            assert!(runtime.session_rx.is_none());
+            assert!(runtime.redraw);
+            if started_editing {
+                assert_eq!(runtime.editor.active_buffer().text(), "local");
+                assert!(
+                    runtime
+                        .editor
+                        .current_message()
+                        .unwrap()
+                        .contains("editing has already started")
+                );
+            } else {
+                assert_eq!(runtime.editor.active_buffer().text(), "saved");
+                assert_eq!(runtime.editor.current_message(), Some("Session restored"));
+            }
+        }
+        let mut runtime = local_runtime(directory.path());
+        let (sender, receiver) = mpsc::channel();
+        runtime.session_rx = Some(receiver);
+        drop(sender);
+        runtime.restore_session_if_ready();
+        assert!(runtime.session_rx.is_none());
+    }
+
+    #[test]
+    fn runtime_saves_session_state_to_the_supplied_location() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        let path = open_test_file(&mut runtime, "session.rs", "first\nsecond\n");
+        runtime.editor.active_pane_mut().cursor = Pos::new(1, 3);
+        runtime.editor.explorer.open = true;
+        let session_path = directory.path().join("state/session.json");
+        runtime.session_path = Some(session_path.clone());
+        runtime.save_session();
+        let saved = state::load_session(&session_path).unwrap().unwrap();
+        assert_eq!(saved.files, vec![path]);
+        assert_eq!(saved.panes[0].cursor_line, 1);
+        assert_eq!(saved.panes[0].cursor_grapheme, 3);
+        assert!(saved.explorer_open);
+    }
+
+    #[test]
+    fn external_reload_preserves_dirty_buffers_and_rejects_oversized_replacements() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        let clean_path = open_test_file(&mut runtime, "clean.rs", "first line\nsecond\n");
+        let clean = runtime.editor.active_pane().buffer;
+        let dirty_path = open_test_file(&mut runtime, "dirty.rs", "original");
+        let dirty = runtime.editor.active_pane().buffer;
+        runtime
+            .editor
+            .active_buffer_mut()
+            .insert(Pos::ZERO, "local ")
+            .unwrap();
+        let large_path = open_test_file(&mut runtime, "large.rs", "small");
+        let large = runtime.editor.active_pane().buffer;
+        let transaction_path = open_test_file(&mut runtime, "transaction.rs", "old");
+        let transaction = runtime.editor.active_pane().buffer;
+        runtime
+            .editor
+            .active_buffer_mut()
+            .begin_transaction()
+            .unwrap();
+        runtime.editor.config.limits.max_file_bytes = 8;
+        fs::write(&clean_path, "x\n").unwrap();
+        fs::write(&dirty_path, "disk").unwrap();
+        fs::write(&large_path, "replacement exceeds limit").unwrap();
+        fs::write(&transaction_path, "changed").unwrap();
+        runtime.redraw = false;
+        runtime.reload_clean_external_changes();
+        assert_eq!(runtime.editor.buffers[clean].buffer.text(), "x\n");
+        assert_eq!(
+            runtime.editor.buffers[dirty].buffer.text(),
+            "local original"
+        );
+        assert_eq!(runtime.editor.buffers[large].buffer.text(), "small");
+        assert_eq!(runtime.editor.buffers[transaction].buffer.text(), "old");
+        assert!(runtime.redraw);
+        assert!(
+            runtime
+                .editor
+                .current_message()
+                .unwrap()
+                .contains("Skipped reloading")
+        );
+    }
+
     #[test]
     fn recovery_tracks_typing_without_closing_the_undo_transaction() {
         let directory = tempdir().unwrap();
@@ -1686,7 +2320,13 @@ mod tests {
         runtime.handle_input(InputEvent::Resize);
         assert!(runtime.redraw);
         runtime.redraw = false;
-        runtime.project_scan = Some(project::scan_project(directory.path(), Default::default()));
+        runtime.project_scan = Some(project::scan_project(
+            directory.path(),
+            project::ScanOptions {
+                include_ignored: true,
+                ..Default::default()
+            },
+        ));
         let deadline = Instant::now() + Duration::from_secs(2);
         while !runtime.redraw && Instant::now() < deadline {
             runtime.handle_input(InputEvent::Tick);
