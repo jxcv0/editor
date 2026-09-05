@@ -43,6 +43,7 @@ pub struct Runtime {
     last_codex_animation: Instant,
     project_scan: Option<BackgroundTask<ProjectEntry>>,
     explorer_scan: Option<(PathBuf, BackgroundTask<ProjectEntry>)>,
+    reference_previews: Option<BackgroundTask<project::ReferencePreview>>,
     project_search: Option<BackgroundTask<TextSearchMatch>>,
     project_search_results: Vec<PickerItem>,
     last_search_query: String,
@@ -150,6 +151,7 @@ impl Runtime {
             last_codex_animation: Instant::now(),
             project_scan: None,
             explorer_scan: None,
+            reference_previews: None,
             project_search: None,
             project_search_results: Vec::new(),
             last_search_query: String::new(),
@@ -254,6 +256,7 @@ impl Runtime {
         self.drain_project_search();
         self.redraw |= self.editor.poll_file_finder();
         self.drain_lsp();
+        self.drain_reference_previews();
         self.drain_codex();
         self.animate_codex(Instant::now());
         self.restore_session_if_ready();
@@ -411,6 +414,7 @@ impl Runtime {
                         detail: found.preview,
                         path: Some(found.path),
                         line: Some(found.line.saturating_sub(1)),
+                        column: None,
                         insert_text: None,
                     });
                     changed = true;
@@ -830,8 +834,8 @@ impl Runtime {
             CommandId::Definition
             | CommandId::Declaration
             | CommandId::TypeDefinition
-            | CommandId::Implementation
-            | CommandId::References => self.open_locations(result),
+            | CommandId::Implementation => self.open_locations(result, false),
+            CommandId::References => self.open_locations(result, true),
             CommandId::Completion => {
                 let array = result
                     .get("items")
@@ -863,6 +867,7 @@ impl Runtime {
                             detail,
                             path: None,
                             line: None,
+                            column: None,
                             insert_text: Some(insert),
                         }
                     })
@@ -897,6 +902,7 @@ impl Runtime {
                             detail: command.to_string(),
                             path,
                             line,
+                            column: None,
                             insert_text: None,
                         }
                     })
@@ -907,7 +913,8 @@ impl Runtime {
         }
     }
 
-    fn open_locations(&mut self, result: Value) {
+    fn open_locations(&mut self, result: Value, references: bool) {
+        self.reference_previews = None;
         let values = if let Some(array) = result.as_array() {
             array.clone()
         } else if result.is_null() {
@@ -916,7 +923,12 @@ impl Runtime {
             vec![result]
         };
         let mut locations = Vec::new();
-        for value in values {
+        let limit = if references {
+            self.editor.config.limits.search_results
+        } else {
+            usize::MAX
+        };
+        for value in values.into_iter().take(limit) {
             let uri = value
                 .get("uri")
                 .or_else(|| value.get("targetUri"))
@@ -937,7 +949,57 @@ impl Runtime {
                 .unwrap_or(0) as usize;
             locations.push((path, Utf16Pos::new(line, column)));
         }
-        if locations.len() == 1 {
+        if locations.is_empty() && references {
+            self.editor.picker = None;
+            self.editor.message("No references found");
+        } else if references {
+            let mut pending = Vec::new();
+            let items = locations
+                .into_iter()
+                .map(|(path, position)| {
+                    let detail = if let Some(slot) = self
+                        .editor
+                        .buffers
+                        .iter()
+                        .find(|slot| slot.buffer.path() == Some(path.as_path()))
+                    {
+                        project::reference_preview_text(
+                            slot.buffer.line(position.line),
+                            position.code_unit,
+                        )
+                    } else {
+                        pending.push((path.clone(), position.line, position.code_unit));
+                        "Loading code…".into()
+                    };
+                    PickerItem {
+                        label: format!(
+                            "{}:{}:{}",
+                            path.strip_prefix(&self.editor.explorer.root)
+                                .unwrap_or(&path)
+                                .display(),
+                            position.line.saturating_add(1),
+                            position.code_unit.saturating_add(1)
+                        ),
+                        detail,
+                        path: Some(path),
+                        line: Some(position.line),
+                        column: Some(position.code_unit),
+                        insert_text: None,
+                    }
+                })
+                .collect();
+            self.editor.show_picker_items(PickerKind::References, items);
+            if !pending.is_empty() {
+                self.reference_previews = Some(project::preview_references(
+                    pending,
+                    self.editor
+                        .config
+                        .limits
+                        .max_file_bytes
+                        .min(usize::MAX as u64) as usize,
+                ));
+            }
+        } else if locations.len() == 1 {
             let (path, position) = locations.remove(0);
             if let Err(error) = self.editor.jump_to(path, position) {
                 self.editor.message(error.to_string());
@@ -957,10 +1019,40 @@ impl Runtime {
                     detail: "location".into(),
                     path: Some(path),
                     line: Some(position.line),
+                    column: None,
                     insert_text: None,
                 })
                 .collect();
             self.editor.show_picker_items(PickerKind::Symbols, items);
+        }
+    }
+
+    fn drain_reference_previews(&mut self) {
+        if !self
+            .editor
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.kind == PickerKind::References)
+        {
+            self.reference_previews = None;
+            return;
+        }
+        let events = self
+            .reference_previews
+            .as_ref()
+            .map(|task| task.drain(64))
+            .unwrap_or_default();
+        let mut previews = Vec::new();
+        for event in events {
+            match event {
+                StreamEvent::Item(preview) => previews.push(preview),
+                StreamEvent::Finished(_) => self.reference_previews = None,
+                StreamEvent::Error(_) => {}
+            }
+        }
+        if !previews.is_empty() {
+            self.editor.update_reference_previews(previews);
+            self.redraw = true;
         }
     }
 
@@ -1170,6 +1262,7 @@ impl Runtime {
                         detail: "codex-watch".into(),
                         path: None,
                         line: None,
+                        column: None,
                         insert_text: None,
                     })
                     .collect();
@@ -1179,6 +1272,7 @@ impl Runtime {
                         detail: String::new(),
                         path: None,
                         line: None,
+                        column: None,
                         insert_text: None,
                     });
                 }
@@ -1418,6 +1512,7 @@ impl Runtime {
                 detail: "UTF-8, true color, bracketed paste, diff rendering".into(),
                 path: None,
                 line: None,
+                column: None,
                 insert_text: None,
             },
             PickerItem {
@@ -1425,6 +1520,7 @@ impl Runtime {
                 detail: self.editor.explorer.root.display().to_string(),
                 path: None,
                 line: None,
+                column: None,
                 insert_text: None,
             },
             PickerItem {
@@ -1440,6 +1536,7 @@ impl Runtime {
                 }),
                 path: None,
                 line: None,
+                column: None,
                 insert_text: None,
             },
             PickerItem {
@@ -1452,6 +1549,7 @@ impl Runtime {
                 }),
                 path: None,
                 line: None,
+                column: None,
                 insert_text: None,
             },
             PickerItem {
@@ -1460,6 +1558,7 @@ impl Runtime {
                     .map_or("unavailable".into(), |path| path.display().to_string()),
                 path: None,
                 line: None,
+                column: None,
                 insert_text: None,
             },
         ];
@@ -2170,6 +2269,75 @@ mod tests {
     }
 
     #[test]
+    fn references_preview_live_buffers_and_jump_to_utf16_columns() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        let path = open_test_file(&mut runtime, "source.rs", "first\n😀 target\n");
+        runtime
+            .editor
+            .active_buffer_mut()
+            .insert(Pos::new(1, 8), "_unsaved")
+            .unwrap();
+        let original_cursor = runtime.editor.active_pane().cursor;
+        runtime.handle_lsp_response(
+            CommandId::References,
+            json!([
+                {"uri": path_to_file_uri(&path), "range": {"start": {"line": 1, "character": 3}}}
+            ]),
+        );
+        let picker = runtime.editor.picker.as_ref().unwrap();
+        assert_eq!(picker.kind, PickerKind::References);
+        assert_eq!(picker.items[0].label, "source.rs:2:4");
+        assert_eq!(picker.items[0].detail, "😀 target_unsaved");
+        assert_eq!(runtime.editor.active_pane().cursor, original_cursor);
+        assert!(runtime.reference_previews.is_none());
+        runtime.editor.handle_key(crate::input::Key::ctrl('v'));
+        assert_eq!(runtime.editor.panes.len(), 2);
+        assert_eq!(runtime.editor.active_pane().cursor, Pos::new(1, 2));
+        assert!(runtime.editor.active_buffer().is_dirty());
+    }
+
+    #[test]
+    fn reference_previews_filter_by_code_without_opening_buffers_and_cancel_on_close() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        let path = directory.path().join("unopened.rs");
+        fs::write(&path, "call_one();\ncall_two();\n").unwrap();
+        let result = json!([
+            {"uri": path_to_file_uri(&path), "range": {"start": {"line": 0, "character": 0}}},
+            {"uri": path_to_file_uri(&path), "range": {"start": {"line": 1, "character": 0}}}
+        ]);
+        runtime.handle_lsp_response(CommandId::References, result.clone());
+        let buffers = runtime.editor.buffers.len();
+        for ch in "two".chars() {
+            runtime.editor.handle_key(crate::input::Key::char(ch));
+        }
+        assert!(runtime.editor.picker.as_ref().unwrap().items.is_empty());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while runtime.reference_previews.is_some() {
+            runtime.drain_reference_previews();
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        let picker = runtime.editor.picker.as_ref().unwrap();
+        assert_eq!(picker.items.len(), 1);
+        assert_eq!(picker.items[0].detail, "call_two();");
+        assert_eq!(runtime.editor.buffers.len(), buffers);
+        runtime.handle_lsp_response(CommandId::References, result);
+        let cancellation = runtime
+            .reference_previews
+            .as_ref()
+            .unwrap()
+            .cancellation_token();
+        runtime
+            .editor
+            .handle_key(crate::input::Key::plain(crate::input::KeyCode::Esc));
+        runtime.drain_reference_previews();
+        assert!(cancellation.is_cancelled());
+        assert!(runtime.editor.picker.is_none());
+    }
+
+    #[test]
     fn location_responses_support_links_utf16_and_multiple_targets() {
         let directory = tempdir().unwrap();
         let mut runtime = local_runtime(directory.path());
@@ -2184,16 +2352,19 @@ mod tests {
         );
         assert_eq!(runtime.editor.active_buffer().path(), Some(path.as_path()));
         assert_eq!(runtime.editor.active_pane().cursor, Pos::new(1, 2));
-        runtime.open_locations(json!([
-            {"uri": uri, "range": range}, {"targetUri": uri, "targetSelectionRange": range},
-            {"uri": "https://invalid.example/ignored", "range": range}
-        ]));
+        runtime.open_locations(
+            json!([
+                {"uri": uri, "range": range}, {"targetUri": uri, "targetSelectionRange": range},
+                {"uri": "https://invalid.example/ignored", "range": range}
+            ]),
+            false,
+        );
         let picker = runtime.editor.picker.as_ref().unwrap();
         assert_eq!(picker.kind, PickerKind::Symbols);
         assert_eq!(picker.items.len(), 2);
         assert_eq!(picker.items[0].path.as_deref(), Some(path.as_path()));
         assert_eq!(picker.items[0].line, Some(1));
-        runtime.open_locations(Value::Null);
+        runtime.open_locations(Value::Null, false);
         assert_eq!(runtime.editor.current_message(), Some("No locations found"));
     }
 

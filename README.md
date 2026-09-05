@@ -239,7 +239,8 @@ The transport advertises completion, signature, hover, navigation, references,
 rename, actions, formatting, and inlay-hint capabilities. The current runtime
 handles diagnostics, including severity-colored gutter markers and Error
 Lens-style messages beside affected source lines; manual completion; hover text;
-definition/declaration/type/implementation/reference locations; active-buffer
+definition/declaration/type/implementation/reference locations, with source-code
+previews and exact-column navigation in the `gr` reference picker; active-buffer
 formatting; active-buffer rename edits; and basic symbol/action result lists. It
 uses live text revisions to send full document changes while an Insert-mode undo
 transaction is still open. Disk-backed `rustc`/Clippy results are hidden while

@@ -5,6 +5,7 @@
 //! the terminal event loop cannot accidentally wait on a slow filesystem.
 
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::ops::Range;
@@ -429,6 +430,120 @@ pub struct ProjectEntry {
     pub relative_path: PathBuf,
     pub kind: ProjectEntryKind,
     pub depth: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReferencePreview {
+    pub path: PathBuf,
+    pub line: usize,
+    pub column: usize,
+    pub text: String,
+}
+
+/// A bounded excerpt around an LSP UTF-16 column, also safe for open buffers.
+pub fn reference_preview_text(line: Option<&str>, column: usize) -> String {
+    let Some(line) = line else {
+        return "[Line unavailable]".into();
+    };
+    let mut end = line.len().min(16 * 1024);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let characters = line[..end].chars().collect::<Vec<_>>();
+    let mut units = 0;
+    let mut at = 0;
+    while at < characters.len() && units < column {
+        units += characters[at].len_utf16();
+        at += 1;
+    }
+    if units < column && end < line.len() {
+        return "[Reference exceeds line preview limit]".into();
+    }
+    let start = at.saturating_sub(40);
+    let stop = (start + 160).min(characters.len());
+    let text: String = characters[start..stop].iter().collect();
+    format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        text.trim().replace('\t', "    "),
+        if stop < characters.len() || end < line.len() {
+            "…"
+        } else {
+            ""
+        },
+    )
+}
+
+/// Read each referenced file once, keeping disk I/O off the foreground thread.
+pub fn preview_references(
+    locations: Vec<(PathBuf, usize, usize)>,
+    max_file_bytes: usize,
+) -> BackgroundTask<ReferencePreview> {
+    let (sender, task) = task_channel(DEFAULT_CHANNEL_CAPACITY);
+    let cancellation = task.cancellation_token();
+    let status = Arc::clone(&task.status);
+    thread::Builder::new()
+        .name("reference-previews".into())
+        .spawn(move || {
+            let mut files = BTreeMap::<PathBuf, BTreeSet<(usize, usize)>>::new();
+            for (path, line, column) in locations {
+                files.entry(path).or_default().insert((line, column));
+            }
+            let mut summary = TaskSummary::default();
+            'files: for (path, positions) in files {
+                if cancellation.is_cancelled() {
+                    break;
+                }
+                let (contents, error) =
+                    match read_searchable_file(&path, max_file_bytes.min(8 * 1024 * 1024)) {
+                        Ok(Some(text)) => (text, None),
+                        Ok(None) => (
+                            String::new(),
+                            Some(
+                                "[Preview unavailable: file too large or not UTF-8 text]"
+                                    .to_owned(),
+                            ),
+                        ),
+                        Err(error) => (
+                            String::new(),
+                            Some(format!("[Preview unavailable: {error}]")),
+                        ),
+                    };
+                summary.files_scanned += 1;
+                summary.errors += usize::from(error.is_some());
+                let mut lines = contents.lines().enumerate().peekable();
+                for (line, column) in positions {
+                    if cancellation.is_cancelled() {
+                        break 'files;
+                    }
+                    while lines.peek().is_some_and(|(number, _)| *number < line) {
+                        lines.next();
+                    }
+                    let text = error.clone().unwrap_or_else(|| {
+                        reference_preview_text(
+                            lines
+                                .peek()
+                                .filter(|(number, _)| *number == line)
+                                .map(|(_, text)| *text),
+                            column,
+                        )
+                    });
+                    let preview = ReferencePreview {
+                        path: path.clone(),
+                        line,
+                        column,
+                        text,
+                    };
+                    if !send_cancellable(&sender, &cancellation, StreamEvent::Item(preview)) {
+                        break 'files;
+                    }
+                    summary.results_emitted += 1;
+                }
+            }
+            finish_task(&sender, &cancellation, &status, summary);
+        })
+        .expect("failed to spawn reference preview worker");
+    task
 }
 
 impl ProjectEntry {
@@ -1640,6 +1755,69 @@ mod tests {
             !ignored
                 .iter()
                 .any(|entry| entry.relative_path == Path::new(".hidden.txt"))
+        );
+    }
+
+    #[test]
+    fn reference_previews_read_target_lines_and_report_unavailable_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("code.rs");
+        fs::write(
+            &path,
+            "fn first() {}\r\n\tuse_symbol();\r\n😀 second_symbol();\n",
+        )
+        .unwrap();
+        let missing = directory.path().join("missing.rs");
+        let (previews, summary) = collect(&preview_references(
+            vec![
+                (path.clone(), 2, 3),
+                (path.clone(), 1, 1),
+                (path.clone(), 1, 1),
+                (path.clone(), 99, 0),
+                (missing.clone(), 0, 0),
+            ],
+            1024,
+        ));
+        assert_eq!(previews.len(), 4);
+        assert_eq!(
+            previews.iter().find(|item| item.line == 1).unwrap().text,
+            "use_symbol();"
+        );
+        assert_eq!(
+            previews.iter().find(|item| item.line == 2).unwrap().text,
+            "😀 second_symbol();"
+        );
+        assert_eq!(
+            previews.iter().find(|item| item.line == 99).unwrap().text,
+            "[Line unavailable]"
+        );
+        assert!(
+            previews
+                .iter()
+                .find(|item| item.path == missing)
+                .unwrap()
+                .text
+                .contains("Preview unavailable")
+        );
+        assert_eq!(summary.unwrap().files_scanned, 2);
+        let (oversized, _) = collect(&preview_references(vec![(path.clone(), 1, 1)], 1));
+        assert!(oversized[0].text.contains("too large"));
+        fs::write(&path, b"invalid\xff").unwrap();
+        let (binary, _) = collect(&preview_references(vec![(path, 0, 0)], 1024));
+        assert!(binary[0].text.contains("not UTF-8"));
+    }
+
+    #[test]
+    fn reference_excerpt_centers_on_utf16_columns_and_bounds_long_lines() {
+        let text = format!("{}call_target(){}", "😀".repeat(100), "tail".repeat(100));
+        let excerpt = reference_preview_text(Some(&text), 200);
+        assert!(excerpt.starts_with('…'));
+        assert!(excerpt.ends_with('…'));
+        assert!(excerpt.contains("call_target()"));
+        assert!(excerpt.chars().count() <= 162);
+        assert!(
+            reference_preview_text(Some(&"x".repeat(1024 * 1024)), 1024 * 1024 - 1)
+                .contains("limit")
         );
     }
 

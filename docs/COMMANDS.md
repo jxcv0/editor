@@ -89,9 +89,13 @@ ordered by severity and clipped to the pane width. `gl` shows the collected
 diagnostic messages for the cursor line. `K`, `gd`, `gD`, `gy`, `gI`, and `gr`
 issue distinct typed requests for hover, definition, declaration, type
 definition, implementation, and references. They require a ready
-`rust-analyzer`. Hover is summarized on the message line; one location is
-opened directly and multiple locations use a picker. Link/range presentation
-and request cancellation are still minimal.
+`rust-analyzer`. Hover is summarized on the message line. `gr` opens a references
+picker, including for a single result, with each file/line/column followed by a
+source-code excerpt. Open buffers supply their current unsaved text; other files
+load previews asynchronously. Type to filter by path or code, then use `Enter`
+or a split-open key to jump to the exact symbol column. Other navigation requests
+open one location directly or show a picker for multiple locations. Request
+cancellation remains minimal.
 
 Native rust-analyzer diagnostics follow unsaved text revisions. Diagnostics
 from disk-backed `rustc` or Clippy checks are hidden after an unsaved edit and
@@ -254,10 +258,12 @@ are not yet implemented.
 Type to refine a picker, use Up/Down or `<C-p>`/`<C-n>` to move, `Enter` to
 open, `<C-v>` to open in a vertical split, `<C-s>` to open in a horizontal
 split, and `Esc` to close. File results are fuzzy-ranked; buffer, recent,
-message, diagnostic, and symbol lists use fuzzy filtering in their existing
-order. Project grep is a separate cancellable asynchronous regex operation
-rather than a shell call to `ripgrep`. Picker result details/previews are not
-currently drawn.
+message, diagnostic, symbol, and reference lists use fuzzy filtering in their
+existing order. Project grep is a separate cancellable asynchronous regex operation
+rather than a shell call to `ripgrep`. Reference results show source-code
+excerpts beneath their locations. Disk previews are limited to 8 MiB per file
+and excerpts to the first 16 KiB of a line; unavailable previews retain the
+selectable location. Other picker details/previews are not currently drawn.
 
 ### Explorer
 

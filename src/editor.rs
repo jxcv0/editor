@@ -253,6 +253,7 @@ pub enum PickerKind {
     Messages,
     Diagnostics,
     Symbols,
+    References,
     Recent,
 }
 
@@ -262,6 +263,8 @@ pub struct PickerItem {
     pub detail: String,
     pub path: Option<PathBuf>,
     pub line: Option<usize>,
+    /// Zero-based UTF-16 column for LSP locations.
+    pub column: Option<usize>,
     pub insert_text: Option<String>,
 }
 
@@ -543,6 +546,7 @@ impl Editor {
                 detail: format!("score {}", matched.score),
                 path: Some(matched.path),
                 line: None,
+                column: None,
                 insert_text: None,
             })
             .collect();
@@ -585,6 +589,45 @@ impl Editor {
             return_mode,
             current_buffer_diagnostics: false,
         });
+    }
+
+    pub fn update_reference_previews(&mut self, previews: Vec<crate::project::ReferencePreview>) {
+        let Some(picker) = self
+            .picker
+            .as_mut()
+            .filter(|picker| picker.kind == PickerKind::References)
+        else {
+            return;
+        };
+        let selected = picker
+            .items
+            .get(picker.selected)
+            .map(|item| (item.path.clone(), item.line, item.column));
+        let previews = previews
+            .into_iter()
+            .map(|preview| ((preview.path, preview.line, preview.column), preview.text))
+            .collect::<HashMap<_, _>>();
+        for item in &mut picker.all_items {
+            if let Some(path) = &item.path
+                && let Some(text) = previews.get(&(
+                    path.clone(),
+                    item.line.unwrap_or(0),
+                    item.column.unwrap_or(0),
+                ))
+            {
+                item.detail = text.clone();
+            }
+        }
+        self.refresh_picker();
+        let picker = self.picker.as_mut().unwrap();
+        if let Some(index) = selected.and_then(|selected| {
+            picker
+                .items
+                .iter()
+                .position(|item| (item.path.clone(), item.line, item.column) == selected)
+        }) {
+            picker.selected = index;
+        }
     }
 
     pub fn jump_to(
@@ -3557,6 +3600,7 @@ impl Editor {
                     detail: format!("buffer:{index}"),
                     path: slot.buffer.path().map(Path::to_owned),
                     line: None,
+                    column: None,
                     insert_text: None,
                 })
                 .collect(),
@@ -3569,6 +3613,7 @@ impl Editor {
                     detail: "recent".into(),
                     path: Some(path.clone()),
                     line: None,
+                    column: None,
                     insert_text: None,
                 })
                 .collect(),
@@ -3582,6 +3627,7 @@ impl Editor {
                     detail: "message".into(),
                     path: None,
                     line: None,
+                    column: None,
                     insert_text: None,
                 })
                 .collect(),
@@ -3608,6 +3654,7 @@ impl Editor {
                         ),
                         path: diagnostic.path.clone(),
                         line: Some(diagnostic.line),
+                        column: None,
                         insert_text: None,
                     })
                     .collect()
@@ -3618,7 +3665,7 @@ impl Editor {
                 .filter(|item| fuzzy_contains(&query, &format!("{} {}", item.label, item.detail)))
                 .cloned()
                 .collect(),
-            PickerKind::Symbols => picker
+            PickerKind::Symbols | PickerKind::References => picker
                 .all_items
                 .iter()
                 .filter(|item| fuzzy_contains(&query, &format!("{} {}", item.label, item.detail)))
@@ -3656,6 +3703,19 @@ impl Editor {
             return;
         };
         match picker.kind {
+            PickerKind::References => {
+                if let Some(path) = item.path
+                    && let Err(error) = self.jump_to(
+                        path,
+                        crate::buffer::Utf16Pos::new(
+                            item.line.unwrap_or(0),
+                            item.column.unwrap_or(0),
+                        ),
+                    )
+                {
+                    self.message(error.to_string());
+                }
+            }
             PickerKind::Buffers => {
                 if let Some(index) = item
                     .detail
@@ -4487,6 +4547,42 @@ mod tests {
     }
 
     #[test]
+    fn arriving_reference_previews_preserve_the_selected_location() {
+        let mut editor = editor("");
+        editor.show_picker_items(
+            PickerKind::References,
+            (0..2)
+                .map(|line| PickerItem {
+                    label: format!("source.rs:{}:1", line + 1),
+                    detail: "Loading code…".into(),
+                    path: Some(PathBuf::from("/tmp/source.rs")),
+                    line: Some(line),
+                    column: Some(0),
+                    insert_text: None,
+                })
+                .collect(),
+        );
+        editor.handle_key(Key::plain(KeyCode::Down));
+        editor.update_reference_previews(vec![crate::project::ReferencePreview {
+            path: PathBuf::from("/tmp/source.rs"),
+            line: 1,
+            column: 0,
+            text: "symbol_two();".into(),
+        }]);
+        assert_eq!(editor.picker.as_ref().unwrap().selected, 1);
+        keys(&mut editor, "symbol");
+        assert_eq!(editor.picker.as_ref().unwrap().items[0].line, Some(1));
+        editor.update_reference_previews(vec![crate::project::ReferencePreview {
+            path: PathBuf::from("/tmp/source.rs"),
+            line: 0,
+            column: 0,
+            text: "symbol_one();".into(),
+        }]);
+        let picker = editor.picker.as_ref().unwrap();
+        assert_eq!(picker.items[picker.selected].line, Some(1));
+    }
+
+    #[test]
     fn file_picker_publishes_only_current_query_results() {
         let mut editor = editor("");
         editor.set_project_files(vec![PathBuf::from("old.rs"), PathBuf::from("new.rs")]);
@@ -4525,6 +4621,7 @@ mod tests {
                 detail: String::new(),
                 path: None,
                 line: None,
+                column: None,
                 insert_text: None,
             }],
         );

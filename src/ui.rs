@@ -871,11 +871,11 @@ fn build_frame(
     }
 
     let cursor = if let Some(picker) = &editor.picker {
-        let rect = overlay_rect(width, height, 72, 18);
+        let rect = picker_rect(width, height, picker.kind);
         let prompt_width = UnicodeWidthStr::width(picker.query.as_str()) as u16;
         Some((
             rect.x
-                .saturating_add(3)
+                .saturating_add(4)
                 .saturating_add(prompt_width)
                 .min(rect.x.saturating_add(rect.width.saturating_sub(1)))
                 .min(width.saturating_sub(1)),
@@ -1701,9 +1701,17 @@ fn render_leader(canvas: &mut Canvas, editor: &Editor, palette: Palette) {
     }
 }
 
+fn picker_rect(width: u16, height: u16, kind: PickerKind) -> Rect {
+    if kind == PickerKind::References {
+        overlay_rect(width, height, 96, 22)
+    } else {
+        overlay_rect(width, height, 72, 18)
+    }
+}
+
 fn render_picker(canvas: &mut Canvas, editor: &Editor, palette: Palette) {
     let Some(picker) = &editor.picker else { return };
-    let rect = overlay_rect(canvas.width, canvas.height, 72, 18);
+    let rect = picker_rect(canvas.width, canvas.height, picker.kind);
     if rect.width == 0 || rect.height == 0 {
         return;
     }
@@ -1716,6 +1724,7 @@ fn render_picker(canvas: &mut Canvas, editor: &Editor, palette: Palette) {
         PickerKind::Messages => " Messages ",
         PickerKind::Diagnostics => " Diagnostics ",
         PickerKind::Symbols => " Symbols ",
+        PickerKind::References => " References ",
         PickerKind::Recent => " Recent files ",
     };
     canvas.text(
@@ -1748,13 +1757,18 @@ fn render_picker(canvas: &mut Canvas, editor: &Editor, palette: Palette) {
             Style::new(palette.muted, palette.status),
         );
     }
-    let rows = usize::from(rect.height.saturating_sub(5));
+    let item_height = if picker.kind == PickerKind::References {
+        2
+    } else {
+        1
+    };
+    let rows = usize::from(rect.height.saturating_sub(5) / item_height);
     let start = picker.selected.saturating_sub(rows.saturating_sub(1));
     for (index, item) in picker.items.iter().enumerate().skip(start).take(rows) {
         let y = rect
             .y
             .saturating_add(4)
-            .saturating_add((index - start) as u16);
+            .saturating_add((index - start) as u16 * item_height);
         let selected = index == picker.selected;
         let style = Style::new(
             if selected {
@@ -1773,7 +1787,7 @@ fn render_picker(canvas: &mut Canvas, editor: &Editor, palette: Palette) {
                 x: rect.x.saturating_add(1),
                 y,
                 width: rect.width.saturating_sub(2),
-                height: 1,
+                height: item_height,
             },
             " ",
             style,
@@ -1783,8 +1797,21 @@ fn render_picker(canvas: &mut Canvas, editor: &Editor, palette: Palette) {
             y,
             &item.label,
             rect.width.saturating_sub(4),
-            style,
+            if picker.kind == PickerKind::References && !selected {
+                Style::new(palette.muted, palette.status)
+            } else {
+                style
+            },
         );
+        if picker.kind == PickerKind::References {
+            canvas.text(
+                rect.x.saturating_add(4),
+                y.saturating_add(1),
+                &item.detail,
+                rect.width.saturating_sub(6),
+                style,
+            );
+        }
     }
     if picker.items.is_empty() {
         canvas.text(
@@ -2219,6 +2246,7 @@ mod tests {
                     detail: String::new(),
                     path: None,
                     line: None,
+                    column: None,
                     insert_text: None,
                 }],
             );
@@ -2270,6 +2298,44 @@ mod tests {
         let (other, _) = draw_editor(&mut editor, 60, 12);
         assert!(!row(&other, 1).contains('⠙'));
         assert!(!row(&other, 6).contains('⠙'));
+    }
+
+    #[test]
+    fn reference_picker_shows_code_beneath_locations_and_scrolls_whole_results() {
+        let mut editor = Editor::new(Config::default(), PathBuf::from("/work"));
+        editor.show_picker_items(
+            PickerKind::References,
+            (0..20)
+                .map(|index| crate::editor::PickerItem {
+                    label: format!("src/file{index}.rs:42:5"),
+                    detail: format!("let value{index} = symbol(\"😀\");"),
+                    path: Some(PathBuf::from(format!("/work/src/file{index}.rs"))),
+                    line: Some(41),
+                    column: Some(4),
+                    insert_text: None,
+                })
+                .collect(),
+        );
+        let rect = overlay_rect(100, 24, 96, 22);
+        let (canvas, cursor) = draw_editor(&mut editor, 100, 24);
+        assert_eq!(cursor, Some((rect.x + 4, rect.y + 2)));
+        assert!(row(&canvas, rect.y).contains("References"));
+        assert!(row(&canvas, rect.y + 4).contains("src/file0.rs:42:5"));
+        assert!(row(&canvas, rect.y + 5).contains("let value0 = symbol(\"😀\");"));
+        for ch in "value".chars() {
+            editor.handle_key(Key::char(ch));
+        }
+        let (_, cursor) = draw_editor(&mut editor, 100, 24);
+        assert_eq!(cursor, Some((rect.x + 9, rect.y + 2)));
+        editor.handle_key(Key::ctrl('p'));
+        let (scrolled, _) = draw_editor(&mut editor, 100, 24);
+        assert!(row(&scrolled, rect.y + 18).contains("src/file19.rs:42:5"));
+        assert!(row(&scrolled, rect.y + 19).contains("let value19 = symbol(\"😀\");"));
+        assert!(!row(&scrolled, rect.y + 21).contains("symbol"));
+        for (width, height) in [(0, 0), (1, 1), (10, 4), (20, 8)] {
+            let (small, _) = draw_editor(&mut editor, width, height);
+            assert_eq!((small.width, small.height), (width, height));
+        }
     }
 
     #[test]
