@@ -265,7 +265,13 @@ exposed as events. Bounded raw output is retained separately for the logs view.
 The watcher's `{"type":"status","state":"waiting",...}` events drive the status
 bar: preparing, waiting, and retrying show processing; applied/previewed show
 completion when no other file is active. Task summaries and failures appear in
-messages. Completed files trigger a reload of clean buffers even while another
+messages. Active tasks with a reported line show an animated spinner beside that
+line's number, alongside any diagnostic marker. Spinners update every 120 ms and
+clear when the task finishes, fails, becomes idle, or the watcher stops. The
+reported line identifies the task's `@codex` marker; events without a valid line
+do not add a spinner. Line activity survives dropped UI events and is bounded
+to 4,096 task locations and 4 MiB of retained path text.
+Completed files trigger a reload of clean buffers even while another
 task is processing. Active task tracking is capped at 4,096 paths and 4 MiB of
 path text; exceeding either limit fails the integration with an explicit error.
 Safe automatic reload/review of files changed by the tool is not complete, so

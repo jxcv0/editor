@@ -232,6 +232,75 @@ impl Drop for EditorTerminal {
 }
 
 #[test]
+fn codex_line_spinner_animates_in_the_terminal_without_input_and_clears_on_stop() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let workspace = Workspace::new();
+    fs::write(
+        workspace.project.join("source.rs"),
+        "first\n// @codex fix this\n",
+    )
+    .unwrap();
+    let peer = workspace.project.join("watcher-peer");
+    fs::write(&peer, concat!(
+        "#!/bin/sh\n",
+        "printf '%s\\n' '{\"type\":\"status\",\"state\":\"waiting\",\"path\":\"source.rs\",\"line\":2,\"task\":1}'\n",
+        "exec sleep 60\n",
+    )).unwrap();
+    fs::set_permissions(&peer, fs::Permissions::from_mode(0o755)).unwrap();
+    let config_path = workspace.config.join("editor/config.toml");
+    let mut config: editor::config::Config =
+        toml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+    config.tools.codex_watch.path = peer.to_str().unwrap().into();
+    fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+
+    let mut terminal = workspace.terminal(&["--no-session", "source.rs"]);
+    terminal.wait_for("// @codex fix this");
+    terminal.send(b" ad");
+    terminal.wait_for("Confirm codex-watch dry-run");
+    terminal.send(b" ad");
+    terminal.wait_for("stopped:dry-run");
+    terminal.send(b" at");
+    terminal.wait_for("⠋");
+    let first = terminal
+        .parser
+        .screen()
+        .cell(1, 1)
+        .unwrap()
+        .contents()
+        .to_owned();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while terminal.parser.screen().cell(1, 1).unwrap().contents() == first {
+        assert!(
+            Instant::now() < deadline,
+            "spinner did not animate without input"
+        );
+        terminal.read_output();
+    }
+    terminal.send(b" at");
+    terminal.wait_for("stopped:dry-run");
+    assert!(
+        terminal
+            .parser
+            .screen()
+            .cell(1, 1)
+            .unwrap()
+            .contents()
+            .trim()
+            .is_empty()
+    );
+    assert!(
+        terminal
+            .parser
+            .screen()
+            .contents()
+            .contains("// @codex fix this")
+    );
+    terminal.ex("qa");
+    terminal.finish();
+}
+
+#[test]
 fn project_tree_expands_collapses_opens_files_and_restores_expansion() {
     let workspace = Workspace::new();
     fs::create_dir_all(workspace.project.join("src/nested")).unwrap();

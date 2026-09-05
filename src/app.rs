@@ -39,6 +39,8 @@ pub struct Runtime {
     redraw: bool,
     rust_analyzer: Option<RustAnalyzerClient>,
     codex_watch: Option<CodexWatch>,
+    codex_activity_revision: u64,
+    last_codex_animation: Instant,
     project_scan: Option<BackgroundTask<ProjectEntry>>,
     explorer_scan: Option<(PathBuf, BackgroundTask<ProjectEntry>)>,
     project_search: Option<BackgroundTask<TextSearchMatch>>,
@@ -144,6 +146,8 @@ impl Runtime {
             redraw: true,
             rust_analyzer,
             codex_watch,
+            codex_activity_revision: 0,
+            last_codex_animation: Instant::now(),
             project_scan: None,
             explorer_scan: None,
             project_search: None,
@@ -251,6 +255,7 @@ impl Runtime {
         self.redraw |= self.editor.poll_file_finder();
         self.drain_lsp();
         self.drain_codex();
+        self.animate_codex(Instant::now());
         self.restore_session_if_ready();
         if idle || self.last_maintenance.elapsed() >= Duration::from_millis(50) {
             self.last_maintenance = Instant::now();
@@ -1260,6 +1265,29 @@ impl Runtime {
                     .message(format!("codex-watch dropped {count} UI events")),
             }
         }
+        if let Some((revision, lines)) = self
+            .codex_watch
+            .as_ref()
+            .and_then(|watch| watch.working_lines_since(self.codex_activity_revision))
+        {
+            if self.editor.codex_working_lines.is_empty() {
+                self.editor.codex_spinner_frame = 0;
+                self.last_codex_animation = Instant::now();
+            }
+            self.codex_activity_revision = revision;
+            self.editor.codex_working_lines = lines;
+            self.redraw = true;
+        }
+    }
+
+    fn animate_codex(&mut self, now: Instant) {
+        if !self.editor.codex_working_lines.is_empty()
+            && now.duration_since(self.last_codex_animation) >= Duration::from_millis(120)
+        {
+            self.last_codex_animation = now;
+            self.editor.codex_spinner_frame = self.editor.codex_spinner_frame.wrapping_add(1);
+            self.redraw = true;
+        }
     }
 
     fn journal_buffers(&mut self) {
@@ -1876,6 +1904,43 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn codex_line_spinners_animate_without_input_and_stop_with_the_watcher() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        let path = open_test_file(&mut runtime, "active.rs", "first\n// @codex change this\n");
+        start_codex_event_peer(
+            &mut runtime,
+            &[
+                json!({"type":"status","state":"preparing","path":"active.rs","line":2,"task":1}),
+                json!({"type":"status","state":"waiting","path":"active.rs","line":2,"task":1}),
+            ],
+        );
+        wait_codex_message(&mut runtime, "codex-watch: waiting");
+        assert_eq!(
+            runtime.editor.codex_working_lines[&path],
+            std::collections::BTreeSet::from([1])
+        );
+        runtime.redraw = false;
+        let now = runtime.last_codex_animation;
+        runtime.animate_codex(now + Duration::from_millis(119));
+        assert!(!runtime.redraw);
+        runtime.animate_codex(now + Duration::from_millis(120));
+        assert!(runtime.redraw);
+        assert_eq!(runtime.editor.codex_spinner_frame, 1);
+        runtime.codex_watch.as_ref().unwrap().stop().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !runtime.editor.codex_working_lines.is_empty() {
+            runtime.drain_codex();
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        runtime.redraw = false;
+        runtime.animate_codex(now + Duration::from_secs(1));
+        assert!(!runtime.redraw);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn codex_task_completion_reloads_clean_files_while_another_task_is_processing() {
         for completed_state in ["applied", "previewed"] {
             let directory = tempdir().unwrap();
@@ -1909,6 +1974,8 @@ mod tests {
                 CodexWatchState::Processing
             );
             assert_eq!(runtime.editor.codex_watch_status, "processing:dry-run");
+            assert!(!runtime.editor.codex_working_lines.contains_key(&clean_path));
+            assert!(runtime.editor.codex_working_lines.contains_key(&dirty_path));
             assert_eq!(
                 runtime.editor.buffers[clean].buffer.text(),
                 "new contents\n"

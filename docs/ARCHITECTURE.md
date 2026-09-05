@@ -33,7 +33,10 @@ mutate editor text directly.
 
 The foreground `app::Runtime` thread owns `Editor`, terminal input, and
 rendering. It performs small, nonblocking polls of worker handles between input
-events. Idle ticks continue polling services but render only after input or a
+events. Active Codex marker lines animate in the gutter every 120 ms. Their
+bounded activity snapshot is polled separately from the lossy UI event queue,
+so missed notifications cannot leave stale spinners. Idle ticks otherwise
+continue polling services but render only after input or a
 worker result changes visible state. `ui::FrameBuilder` retains line syntax
 and display checkpoints using buffer-provided line identities. Lexical work
 is capped at 16 KiB per line; the remainder remains readable as plain text.

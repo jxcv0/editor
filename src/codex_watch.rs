@@ -9,10 +9,10 @@ use crate::process::{
     SupervisedChild,
 };
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -22,6 +22,78 @@ use std::time::{Duration, Instant};
 const MAX_STATUS_ERROR_BYTES: usize = 4 * 1024;
 const MAX_ACTIVE_PATHS: usize = 4096;
 const MAX_ACTIVE_PATH_BYTES: usize = 4 * 1024 * 1024;
+
+/// Active marker lines, using canonical file paths and zero-based line numbers.
+pub type CodexWorkingLines = HashMap<PathBuf, BTreeSet<usize>>;
+
+#[derive(Default)]
+struct CodexActivity {
+    tasks: BTreeMap<(PathBuf, u64), usize>,
+    path_bytes: usize,
+    revision: u64,
+}
+
+impl CodexActivity {
+    fn update(&mut self, event: &CodexJsonEvent, path: PathBuf) -> Result<(), String> {
+        let state = event.state_name();
+        let task = event.payload["task"].as_u64();
+        if matches!(state, "queued" | "preparing" | "waiting" | "retrying") {
+            let Some(line) = event.payload["line"]
+                .as_u64()
+                .and_then(|line| usize::try_from(line).ok())
+                .and_then(|line| line.checked_sub(1))
+            else {
+                return Ok(());
+            };
+            let bytes = path.as_os_str().len();
+            let key = (path, task.unwrap_or(0));
+            if !self.tasks.contains_key(&key) {
+                if self.tasks.len() >= MAX_ACTIVE_PATHS
+                    || bytes > MAX_ACTIVE_PATH_BYTES - self.path_bytes
+                {
+                    return Err("codex-watch active line tracking limit exceeded".into());
+                }
+                self.path_bytes += bytes;
+            }
+            if self.tasks.insert(key, line) != Some(line) {
+                self.revision = self.revision.wrapping_add(1);
+            }
+        } else if matches!(state, "applied" | "previewed" | "failed" | "idle") {
+            let previous_len = self.tasks.len();
+            self.tasks.retain(|(candidate, id), _| {
+                let remove =
+                    *candidate == path && (state == "idle" || task.is_none_or(|task| task == *id));
+                if remove {
+                    self.path_bytes -= candidate.as_os_str().len();
+                }
+                !remove
+            });
+            if self.tasks.len() != previous_len {
+                self.revision = self.revision.wrapping_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        if !self.tasks.is_empty() {
+            self.tasks.clear();
+            self.path_bytes = 0;
+            self.revision = self.revision.wrapping_add(1);
+        }
+    }
+
+    fn lines_since(&self, revision: u64) -> Option<(u64, CodexWorkingLines)> {
+        if self.revision == revision {
+            return None;
+        }
+        let mut lines = CodexWorkingLines::new();
+        for ((path, _), line) in &self.tasks {
+            lines.entry(path.clone()).or_default().insert(*line);
+        }
+        Some((self.revision, lines))
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CodexRunMode {
@@ -248,6 +320,7 @@ pub struct CodexWatch {
     commands: SyncSender<CodexCommand>,
     events: Receiver<CodexWatchEvent>,
     status: Arc<Mutex<CodexWatchStatus>>,
+    activity: Arc<Mutex<CodexActivity>>,
     captured_output: Arc<Mutex<BoundedLog>>,
     dropped_events: Arc<AtomicUsize>,
     closing: Arc<AtomicBool>,
@@ -260,6 +333,7 @@ impl CodexWatch {
         let (command_tx, command_rx) = mpsc::sync_channel(config.command_queue_capacity.max(1));
         let (event_tx, events) = mpsc::sync_channel(config.event_queue_capacity.max(1));
         let status = Arc::new(Mutex::new(CodexWatchStatus::default()));
+        let activity = Arc::new(Mutex::new(CodexActivity::default()));
         let captured_output = Arc::new(Mutex::new(BoundedLog::new(config.captured_output_bytes)));
         let dropped_events = Arc::new(AtomicUsize::new(0));
         let closing = Arc::new(AtomicBool::new(false));
@@ -271,6 +345,7 @@ impl CodexWatch {
                 sender: event_tx,
                 dropped: Arc::clone(&dropped_events),
                 status: Arc::clone(&status),
+                activity: Arc::clone(&activity),
             },
             captured_output: Arc::clone(&captured_output),
             closing: Arc::clone(&closing),
@@ -291,6 +366,7 @@ impl CodexWatch {
             commands: command_tx,
             events,
             status,
+            activity,
             captured_output,
             dropped_events,
             closing,
@@ -335,6 +411,12 @@ impl CodexWatch {
 
     pub fn status(&self) -> CodexWatchStatus {
         lock_unpoison(&self.status).clone()
+    }
+
+    /// Latest line activity survives dropped UI events. Unchanged polls do not
+    /// clone paths, and lifecycle resets publish an empty snapshot.
+    pub fn working_lines_since(&self, revision: u64) -> Option<(u64, CodexWorkingLines)> {
+        lock_unpoison(&self.activity).lines_since(revision)
     }
 
     pub fn captured_output(&self) -> (String, u64) {
@@ -408,6 +490,7 @@ struct CodexPublisher {
     sender: SyncSender<CodexWatchEvent>,
     dropped: Arc<AtomicUsize>,
     status: Arc<Mutex<CodexWatchStatus>>,
+    activity: Arc<Mutex<CodexActivity>>,
 }
 
 impl CodexPublisher {
@@ -892,11 +975,22 @@ impl CodexWorker {
         let event = parse_event_line(line, self.config.max_event_line_bytes)
             .map_err(|error| format!("malformed codex-watch event: {error}"))?;
         self.apply_event_state(&event)?;
+        if event.kind == "status"
+            && let Some(path) = event.payload["path"]
+                .as_str()
+                .filter(|path| !path.is_empty())
+        {
+            let path = self.config.project_root.join(Path::new(path));
+            // Resolve aliases on the worker, never on the input/render thread.
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            lock_unpoison(&self.publisher.activity).update(&event, path)?;
+        }
         self.publisher.emit(CodexWatchEvent::Json(event));
         Ok(())
     }
 
     fn reset_task_progress(&mut self) {
+        lock_unpoison(&self.publisher.activity).clear();
         self.active_paths.clear();
         self.active_path_bytes = 0;
         self.had_task_failure = false;
@@ -1057,6 +1151,7 @@ mod tests {
                 sender: events,
                 dropped: Arc::new(AtomicUsize::new(0)),
                 status: Arc::new(Mutex::new(CodexWatchStatus::default())),
+                activity: Arc::new(Mutex::new(CodexActivity::default())),
             },
             closing: Arc::new(AtomicBool::new(false)),
             runtime: None,
@@ -1098,6 +1193,107 @@ mod tests {
             )
             .unwrap();
         lock_unpoison(&worker.publisher.status).clone()
+    }
+
+    #[test]
+    fn working_lines_track_tasks_and_survive_dropped_ui_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = CodexWatchConfig::new(directory.path());
+        config.event_queue_capacity = 1;
+        let (mut worker, _events) = worker(config);
+        let send = |worker: &mut CodexWorker, state, task, line| {
+            worker.consume_line(serde_json::to_string(&serde_json::json!({
+                "type": "status", "state": state, "path": "src.rs", "task": task, "line": line,
+            })).unwrap().as_bytes()).unwrap();
+        };
+        send(&mut worker, "preparing", Some(1), Some(2));
+        send(&mut worker, "waiting", Some(2), Some(5));
+        send(&mut worker, "retrying", Some(1), None);
+        assert_eq!(
+            lock_unpoison(&worker.publisher.activity)
+                .lines_since(0)
+                .unwrap()
+                .1[&directory.path().join("src.rs")],
+            BTreeSet::from([1, 4])
+        );
+        assert!(worker.publisher.dropped.load(Ordering::Relaxed) > 0);
+        send(&mut worker, "applied", Some(1), Some(2));
+        assert_eq!(
+            lock_unpoison(&worker.publisher.activity)
+                .lines_since(0)
+                .unwrap()
+                .1[&directory.path().join("src.rs")],
+            BTreeSet::from([4])
+        );
+        send(&mut worker, "failed", Some(2), None);
+        assert!(lock_unpoison(&worker.publisher.activity).tasks.is_empty());
+        send(&mut worker, "queued", Some(3), Some(0));
+        send(&mut worker, "waiting", Some(3), None);
+        assert!(lock_unpoison(&worker.publisher.activity).tasks.is_empty());
+        send(&mut worker, "waiting", Some(3), Some(7));
+        send(&mut worker, "idle", None, None);
+        assert!(lock_unpoison(&worker.publisher.activity).tasks.is_empty());
+        send(&mut worker, "waiting", Some(4), Some(9));
+        worker.stop_current();
+        let activity = lock_unpoison(&worker.publisher.activity);
+        assert!(activity.lines_since(0).unwrap().1.is_empty());
+        assert!(activity.lines_since(activity.revision).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn working_lines_resolve_relative_paths_and_symlinks_on_the_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("source.rs");
+        std::fs::write(&file, "// @codex fix this\n").unwrap();
+        std::os::unix::fs::symlink(&file, directory.path().join("alias.rs")).unwrap();
+        let (mut worker, _events) = worker(CodexWatchConfig::new(directory.path()));
+        task_status(&mut worker, "preparing", "alias.rs");
+        assert!(
+            lock_unpoison(&worker.publisher.activity)
+                .lines_since(0)
+                .unwrap()
+                .1
+                .contains_key(&file.canonicalize().unwrap())
+        );
+        task_status(&mut worker, "previewed", "./source.rs");
+        assert!(lock_unpoison(&worker.publisher.activity).tasks.is_empty());
+    }
+
+    #[test]
+    fn working_line_tracking_bounds_multiple_tasks_in_one_file() {
+        let mut activity = CodexActivity::default();
+        for task in 0..MAX_ACTIVE_PATHS {
+            let event = CodexJsonEvent {
+                kind: "status".into(),
+                payload: serde_json::json!({
+                    "state": "waiting", "task": task, "line": task + 1,
+                }),
+            };
+            activity
+                .update(&event, PathBuf::from("/project/a.rs"))
+                .unwrap();
+        }
+        let event = CodexJsonEvent {
+            kind: "status".into(),
+            payload: serde_json::json!({
+                "state": "waiting", "task": MAX_ACTIVE_PATHS, "line": 1,
+            }),
+        };
+        assert!(
+            activity
+                .update(&event, PathBuf::from("/project/a.rs"))
+                .unwrap_err()
+                .contains("limit")
+        );
+        activity.clear();
+        assert_eq!(activity.path_bytes, 0);
+        assert!(
+            activity
+                .update(&event, PathBuf::from("a".repeat(MAX_ACTIVE_PATH_BYTES + 1)))
+                .unwrap_err()
+                .contains("limit")
+        );
     }
 
     #[test]
@@ -1191,7 +1387,7 @@ mod tests {
         assert!(worker.active_paths.is_empty());
         assert_eq!(worker.active_path_bytes, 0);
 
-        let path = "a".repeat(MAX_ACTIVE_PATH_BYTES);
+        let path = format!("/{}", "a".repeat(MAX_ACTIVE_PATH_BYTES - 1));
         task_status(&mut worker, "preparing", &path);
         task_status(&mut worker, "waiting", &path);
         assert_eq!(worker.active_paths.len(), 1);
@@ -1587,6 +1783,7 @@ mod tests {
             commands,
             events,
             status: Arc::new(Mutex::new(CodexWatchStatus::default())),
+            activity: Arc::new(Mutex::new(CodexActivity::default())),
             captured_output: Arc::new(Mutex::new(BoundedLog::new(16))),
             dropped_events: Arc::new(AtomicUsize::new(0)),
             closing: Arc::new(AtomicBool::new(false)),

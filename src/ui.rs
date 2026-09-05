@@ -1207,6 +1207,9 @@ fn render_pane(
     let gutter = (digits + 3).min(rect.width.saturating_sub(1));
     let content_x = rect.x.saturating_add(gutter);
     let content_width = rect.width.saturating_sub(gutter);
+    let working_lines = buffer
+        .path()
+        .and_then(|path| editor.codex_working_lines.get(path));
     let diagnostics = editor
         .diagnostics
         .iter()
@@ -1244,6 +1247,16 @@ fn render_pane(
             palette.background,
         );
         canvas.text(rect.x, rect.y + row, &number_text, digits, number_style);
+        if gutter > digits && working_lines.is_some_and(|lines| lines.contains(&line_number)) {
+            const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            canvas.text(
+                rect.x + digits,
+                rect.y + row,
+                FRAMES[editor.codex_spinner_frame % FRAMES.len()],
+                1,
+                Style::new(palette.info, palette.background),
+            );
+        }
         let severity = diagnostics
             .iter()
             .filter(|diagnostic| diagnostic.line == line_number)
@@ -2212,6 +2225,51 @@ mod tests {
             let (canvas, _) = draw_editor(&mut picker, width, height);
             assert_eq!((canvas.width, canvas.height), (width, height));
         }
+    }
+
+    #[test]
+    fn codex_spinners_render_beside_working_lines_without_displacing_diagnostics_or_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.rs");
+        std::fs::write(&path, "first\n// @codex fix this\nlast\n").unwrap();
+        let mut editor = Editor::new(Config::default(), directory.path().to_owned());
+        editor.open_path(&path).unwrap();
+        editor.codex_working_lines.insert(
+            path.canonicalize().unwrap(),
+            std::collections::BTreeSet::from([1]),
+        );
+        editor.diagnostics.push(crate::editor::Diagnostic {
+            path: editor.active_buffer().path().map(std::path::Path::to_owned),
+            line: 1,
+            column: 0,
+            severity: DiagnosticSeverity::Error,
+            message: "problem".into(),
+            version: editor.active_buffer().revision(),
+        });
+        let (frame, cursor) = draw_editor(&mut editor, 60, 10);
+        assert!(row(&frame, 1).starts_with("1⠋● // @codex fix this"));
+        assert!(!row(&frame, 0).contains('⠋'));
+        assert!(!row(&frame, 2).contains('⠋'));
+        editor.codex_spinner_frame = 1;
+        let (next, next_cursor) = draw_editor(&mut editor, 60, 10);
+        assert!(row(&next, 1).starts_with("1⠙● // @codex fix this"));
+        assert_eq!(cursor, next_cursor);
+        editor.split(Orientation::Horizontal);
+        let (split, _) = draw_editor(&mut editor, 60, 12);
+        assert!(row(&split, 1).contains('⠙'));
+        assert!(row(&split, 6).contains('⠙'));
+        for width in 0..4 {
+            let (narrow, _) = draw_editor(&mut editor, width, 12);
+            assert_eq!(narrow.width, width);
+        }
+        editor.codex_working_lines.clear();
+        editor.codex_working_lines.insert(
+            directory.path().join("other.rs"),
+            std::collections::BTreeSet::from([1]),
+        );
+        let (other, _) = draw_editor(&mut editor, 60, 12);
+        assert!(!row(&other, 1).contains('⠙'));
+        assert!(!row(&other, 6).contains('⠙'));
     }
 
     #[test]
