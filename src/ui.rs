@@ -1453,20 +1453,21 @@ fn render_explorer(canvas: &mut Canvas, editor: &Editor, rect: Rect, palette: Pa
         .explorer
         .selected
         .saturating_sub(visible.saturating_sub(1));
-    for (row, path) in editor
+    for (row, entry) in editor
         .explorer
-        .files
+        .rows()
         .iter()
         .enumerate()
         .skip(start)
         .take(visible)
     {
         let y = rect.y + 1 + (row - start) as u16;
-        let relative = path.strip_prefix(&editor.explorer.root).unwrap_or(path);
         let selected = row == editor.explorer.selected && editor.focus == Focus::Explorer;
         let style = Style::new(
             if selected {
                 palette.background
+            } else if entry.is_directory() {
+                palette.accent
             } else {
                 palette.foreground
             },
@@ -1476,7 +1477,32 @@ fn render_explorer(canvas: &mut Canvas, editor: &Editor, rect: Rect, palette: Pa
                 palette.status
             },
         );
-        let label = format!("  {}", relative.display());
+        let marker = if entry.is_directory() {
+            if editor.explorer.expanded.contains(&entry.path) {
+                "▾"
+            } else {
+                "▸"
+            }
+        } else {
+            " "
+        };
+        let name = entry.path.file_name().unwrap_or_default().to_string_lossy();
+        let indent = entry.depth.saturating_sub(1).saturating_mul(2);
+        let label = format!(
+            " {}{marker} {name}{}",
+            " ".repeat(indent.min(usize::from(rect.width))),
+            if entry.is_directory() { "/" } else { "" },
+        );
+        canvas.fill(
+            Rect {
+                x: rect.x,
+                y,
+                width: rect.width,
+                height: 1,
+            },
+            " ",
+            style,
+        );
         canvas.text(rect.x, y, &label, rect.width, style);
     }
     let flags = format!(
@@ -2065,6 +2091,49 @@ mod tests {
             canvas.cells[usize::from(divider.saturating_add(1))].symbol,
             "│"
         );
+    }
+
+    #[test]
+    fn explorer_renders_tree_markers_indentation_and_scrolls_to_selection() {
+        use crate::project::{ProjectEntry, ProjectEntryKind};
+        use std::path::Path;
+        let mut editor = Editor::new(Config::default(), PathBuf::from("/work"));
+        editor.explorer.open = true;
+        editor.focus = Focus::Explorer;
+        editor.explorer.append_directory(
+            Path::new("/work"),
+            vec![ProjectEntry {
+                path: PathBuf::from("/work/src"),
+                relative_path: "src".into(),
+                kind: ProjectEntryKind::Directory,
+                depth: 1,
+            }],
+        );
+        let (canvas, _) = draw_editor(&mut editor, 60, 10);
+        assert!(row(&canvas, 1).starts_with(" ▸ src/"));
+        editor.handle_key(Key::plain(KeyCode::Right));
+        editor.explorer.append_directory(
+            Path::new("/work/src"),
+            (0..20)
+                .map(|index| ProjectEntry {
+                    path: PathBuf::from(format!("/work/src/file{index:02}.rs")),
+                    relative_path: PathBuf::new(),
+                    kind: ProjectEntryKind::File,
+                    depth: 1,
+                })
+                .collect(),
+        );
+        let (canvas, _) = draw_editor(&mut editor, 60, 10);
+        assert!(row(&canvas, 1).starts_with(" ▾ src/"));
+        assert!(row(&canvas, 2).starts_with("     file00.rs"));
+        editor.explorer.move_selection(20);
+        let (canvas, _) = draw_editor(&mut editor, 60, 10);
+        assert!(row(&canvas, 6).starts_with("     file19.rs"));
+        editor.handle_key(Key::plain(KeyCode::Left));
+        editor.handle_key(Key::plain(KeyCode::Enter));
+        let (canvas, _) = draw_editor(&mut editor, 60, 10);
+        assert!(row(&canvas, 1).starts_with(" ▸ src/"));
+        assert!(!row(&canvas, 2).contains("file"));
     }
 
     #[test]

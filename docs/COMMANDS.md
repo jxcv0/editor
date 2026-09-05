@@ -261,15 +261,27 @@ currently drawn.
 
 ### Explorer
 
-When the explorer has focus, `j`/`k` or Down/Up select a path, `l` or `Enter`
-opens it, `h` or `Esc` returns focus to the editor, `e` toggles hidden paths,
-and `i` toggles ignored paths. `<Space>e` is handled specially while focused
-and closes the explorer. `<C-l>` and `<C-w>l` return focus to the editor without
-opening the selected path. The current explorer is a flat scanned file list, not
-the fully lazy hierarchical tree described by the design. Creation, renaming,
-and deletion are not performed from the explorer; deletion reports that
-explicit filesystem confirmation is unavailable. External filesystem changes
-do not automatically refresh this list.
+The explorer displays an indented tree with directories sorted before files.
+`▸` marks a collapsed directory and `▾` marks an expanded one. Directory contents
+load in the background when expanded, including empty directories.
+
+When the explorer has focus:
+
+- `j`/`k` or Down/Up select a visible entry.
+- `Enter` toggles a directory or opens a file.
+- `l` or Right expands a directory, enters its first child if already expanded,
+  or opens a file.
+- `h` or Left collapses an expanded directory or selects the parent. At the
+  top level it leaves the selection in place.
+- `Esc`, `<C-l>`, and `<C-w>l` return focus to the editor.
+- `e` toggles hidden paths and `i` toggles ignored paths, refreshing the tree.
+- `<Space>e` closes the explorer while it has focus.
+
+Opening or focusing the explorer reveals the active file by expanding its
+ancestors. Expanded directories are remembered in project sessions. Creation,
+renaming, and deletion are not performed from the explorer; deletion reports
+that explicit filesystem confirmation is unavailable. External filesystem
+changes do not automatically refresh the tree.
 
 ## Ex commands
 

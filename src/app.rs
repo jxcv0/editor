@@ -40,6 +40,7 @@ pub struct Runtime {
     rust_analyzer: Option<RustAnalyzerClient>,
     codex_watch: Option<CodexWatch>,
     project_scan: Option<BackgroundTask<ProjectEntry>>,
+    explorer_scan: Option<(PathBuf, BackgroundTask<ProjectEntry>)>,
     project_search: Option<BackgroundTask<TextSearchMatch>>,
     project_search_results: Vec<PickerItem>,
     last_search_query: String,
@@ -144,6 +145,7 @@ impl Runtime {
             rust_analyzer,
             codex_watch,
             project_scan: None,
+            explorer_scan: None,
             project_search: None,
             project_search_results: Vec::new(),
             last_search_query: String::new(),
@@ -244,6 +246,7 @@ impl Runtime {
         self.discard_stale_diagnostics();
         self.update_project_search();
         self.drain_project_scan();
+        self.drain_explorer_scan();
         self.drain_project_search();
         self.redraw |= self.editor.poll_file_finder();
         self.drain_lsp();
@@ -265,6 +268,8 @@ impl Runtime {
         if let Some(task) = self.project_scan.take() {
             task.cancel();
         }
+        self.explorer_scan = None;
+        self.editor.explorer.reset();
         self.editor.set_project_files(Vec::new());
         let options = project::ScanOptions {
             include_hidden: self.editor.explorer.show_hidden,
@@ -273,6 +278,46 @@ impl Runtime {
             ..project::ScanOptions::default()
         };
         self.project_scan = Some(project::scan_project(&self.editor.explorer.root, options));
+    }
+
+    fn drain_explorer_scan(&mut self) {
+        if let Some((directory, task)) = &self.explorer_scan {
+            let events = task.drain(256);
+            self.redraw |= !events.is_empty();
+            let mut entries = Vec::new();
+            let mut finished = false;
+            for event in events {
+                match event {
+                    StreamEvent::Item(entry) => entries.push(entry),
+                    StreamEvent::Error(error) => {
+                        self.editor.message(format!("Explorer: {}", error.message))
+                    }
+                    StreamEvent::Finished(_) => finished = true,
+                }
+            }
+            if !entries.is_empty() {
+                self.editor.explorer.append_directory(directory, entries);
+            }
+            if finished {
+                self.explorer_scan = None;
+            }
+        }
+        // One directory worker at a time bounds both threads and foreground
+        // draining, including when many expanded paths are restored at once.
+        if self.explorer_scan.is_none()
+            && let Some(directory) = self.editor.explorer.next_directory_to_load()
+        {
+            let options = project::ScanOptions {
+                include_hidden: self.editor.explorer.show_hidden,
+                include_ignored: self.editor.explorer.show_ignored,
+                ..project::ScanOptions::default()
+            };
+            let task = project::scan_directory(&directory, options);
+            self.editor
+                .explorer
+                .append_directory(&directory, Vec::new());
+            self.explorer_scan = Some((directory, task));
+        }
     }
 
     fn drain_project_scan(&mut self) {
@@ -1516,6 +1561,7 @@ fn restore_session_state(editor: &mut Editor, session: SessionState) -> bool {
     editor.explorer.open = explorer_open;
     editor.explorer.width = explorer_width;
     editor.explorer.expanded = expanded_directories.into_iter().collect();
+    editor.explorer.rebuild_rows();
     true
 }
 
@@ -1679,6 +1725,104 @@ mod tests {
         runtime.rust_analyzer = None;
         runtime.codex_watch = None;
         runtime
+    }
+
+    #[test]
+    fn explorer_loads_only_open_directories_and_refreshes_hidden_and_ignored_filters() {
+        fn load(runtime: &mut Runtime) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                runtime.drain_explorer_scan();
+                if runtime.explorer_scan.is_none()
+                    && runtime.editor.explorer.next_directory_to_load().is_none()
+                {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "explorer scan did not finish");
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let directory = tempdir().unwrap();
+        for name in ["src", "empty", ".hidden", "ignored"] {
+            fs::create_dir(directory.path().join(name)).unwrap();
+        }
+        fs::write(
+            directory.path().join(".gitignore"),
+            "ignored/\nsrc/skipped.rs\n",
+        )
+        .unwrap();
+        fs::write(directory.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(directory.path().join("src/skipped.rs"), "").unwrap();
+        let mut runtime = local_runtime(directory.path());
+        load(&mut runtime);
+        assert!(runtime.editor.explorer.rows().is_empty());
+        runtime.editor.explorer.open = true;
+        runtime.editor.focus = crate::editor::Focus::Explorer;
+        load(&mut runtime);
+        assert_eq!(runtime.editor.explorer.rows().len(), 2);
+        assert!(
+            runtime
+                .editor
+                .explorer
+                .rows()
+                .iter()
+                .all(ProjectEntry::is_directory)
+        );
+        runtime.editor.handle_key(crate::input::Key::char('j'));
+        runtime.editor.handle_key(crate::input::Key::char('l'));
+        load(&mut runtime);
+        assert_eq!(runtime.editor.explorer.rows().len(), 3);
+        assert_eq!(
+            runtime.editor.explorer.rows()[2].relative_path,
+            Path::new("src/main.rs")
+        );
+        runtime.editor.handle_key(crate::input::Key::char('e'));
+        runtime.handle_request();
+        load(&mut runtime);
+        assert!(
+            runtime
+                .editor
+                .explorer
+                .rows()
+                .iter()
+                .any(|entry| entry.relative_path == Path::new(".hidden"))
+        );
+        assert!(
+            runtime
+                .editor
+                .explorer
+                .rows()
+                .iter()
+                .all(|entry| entry.relative_path != Path::new("ignored"))
+        );
+        runtime.editor.handle_key(crate::input::Key::char('i'));
+        runtime.handle_request();
+        load(&mut runtime);
+        assert!(
+            runtime
+                .editor
+                .explorer
+                .rows()
+                .iter()
+                .any(|entry| entry.relative_path == Path::new("ignored"))
+        );
+        assert!(
+            runtime
+                .editor
+                .explorer
+                .rows()
+                .iter()
+                .any(|entry| entry.relative_path == Path::new("src/skipped.rs"))
+        );
+        assert_eq!(
+            runtime
+                .editor
+                .explorer
+                .selected_entry()
+                .unwrap()
+                .relative_path,
+            Path::new("src")
+        );
     }
 
     fn open_test_file(runtime: &mut Runtime, name: &str, contents: &str) -> PathBuf {

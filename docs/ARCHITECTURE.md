@@ -15,6 +15,7 @@ mutate editor text directly.
 | `app` | Foreground event loop, rendering cadence, terminal-process polling, background scan/search polling, LSP and `codex-watch` dispatch, diagnostics, clean-file reloads, journaling, session I/O, and health output | Owns process/integration handles and is the only layer that converts `EditorRequest` values or worker events into UI/core actions. Worker drains are bounded. Periodic clean-file checks use synchronous metadata only when unchanged, but changed files are still reread on the foreground thread; config reload is synchronous too. |
 | `buffer` | UTF-8 text storage, grapheme positions, byte and UTF-16 conversion, edit transactions, branching undo/redo, loading, conflict detection, and atomic saving | Owns text and disk identity. It has no terminal, project-search, or tool-process knowledge. The current representation is line-based strings, not a rope/piece table, so the largest size/performance goals still need measurement and likely further work. |
 | `editor` | Modal state machine, panes/layout, per-pane cursor/viewport, buffers, registers/macros, selection, prompts, picker/explorer state, diagnostics, and typed integration requests | Consumes terminal-neutral `Key` values and mutates `Buffer`s. It emits `EditorRequest` values rather than launching tools. Vim compatibility is intentionally bounded; see [COMMANDS.md](COMMANDS.md). |
+| `explorer` | Cached directory listings, visible tree rows, expansion, selection, and active-file reveal | Performs no filesystem I/O. `app` supplies bounded batches from one lazy directory scan at a time; the file finder retains its independent recursive index. |
 | `input` | Small terminal-neutral key vocabulary | Keeps Crossterm types out of the editor state machine and leaves room for another frontend. |
 | `ui` | Crossterm terminal lifecycle, input translation, cell canvas, Unicode display width, and changed-cell rendering | The only terminal-specific module. Its RAII guard restores raw mode, cursor, bracketed paste, and alternate screen on ordinary drop; a panic hook performs emergency restoration. Suspend/resume behavior and deterministic full-frame snapshots are not yet complete. |
 | `command` | Declarative typed command IDs and built-in leader hierarchy | Shared vocabulary for editor, `rust-analyzer`, and `codex-watch` actions. The registry describes commands; context availability and actual execution remain the orchestrator/editor's responsibility. |
@@ -152,7 +153,7 @@ method. The following areas require continued integration and verification:
 - safe UI flows for external file changes and dirty-buffer conflicts;
 - complete completion/signature/snippet, navigation, rename, code-action,
   formatting, diagnostics, and inlay-hint UX above the generic LSP transport;
-- lazy hierarchical explorer mutation/confirmation flows and automatic
+- explorer mutation/confirmation flows and automatic
   external-filesystem refresh;
 - system clipboard providers and persistent undo;
 - large-file degradation policy up to the stated limits;

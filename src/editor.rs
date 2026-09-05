@@ -1,12 +1,14 @@
 //! Terminal-independent modal editor state machine.
 
 use std::{
-    collections::{BTreeSet, HashMap, VecDeque},
+    collections::{HashMap, VecDeque},
     fs,
     path::{Path, PathBuf},
 };
 
 use unicode_segmentation::UnicodeSegmentation;
+
+pub use crate::explorer::Explorer;
 
 use crate::{
     buffer::{Buffer, BufferError, Pos, TextRange},
@@ -275,18 +277,6 @@ pub struct Picker {
 }
 
 #[derive(Debug, Clone)]
-pub struct Explorer {
-    pub open: bool,
-    pub root: PathBuf,
-    pub files: Vec<PathBuf>,
-    pub selected: usize,
-    pub expanded: BTreeSet<PathBuf>,
-    pub show_hidden: bool,
-    pub show_ignored: bool,
-    pub width: u16,
-}
-
-#[derive(Debug, Clone)]
 pub struct Diagnostic {
     pub path: Option<PathBuf>,
     pub line: usize,
@@ -428,16 +418,7 @@ impl Editor {
             active_pane: 1,
             mode: Mode::Normal,
             focus: Focus::Editor,
-            explorer: Explorer {
-                open: false,
-                root: project_root,
-                files: Vec::new(),
-                selected: 0,
-                expanded: BTreeSet::new(),
-                show_hidden,
-                show_ignored,
-                width,
-            },
+            explorer: Explorer::new(project_root, width, show_hidden, show_ignored),
             terminal: TerminalPanel::with_background(terminal_background),
             picker: None,
             prompt: String::new(),
@@ -497,15 +478,10 @@ impl Editor {
     pub fn set_project_files(&mut self, mut files: Vec<PathBuf>) {
         files.sort();
         files.dedup();
-        self.explorer.files.clear();
         if let Some(finder) = &self.file_finder {
             finder.reset(self.explorer.root.clone());
         }
         self.append_project_files(files);
-        self.explorer.selected = self
-            .explorer
-            .selected
-            .min(self.explorer.files.len().saturating_sub(1));
         if self
             .picker
             .as_ref()
@@ -515,14 +491,11 @@ impl Editor {
         }
     }
 
-    /// Incorporate only the new scan batch. The ranking worker owns its index;
-    /// the explorer keeps the traversal order without repeatedly sorting or
-    /// cloning paths discovered by earlier batches.
+    /// Incorporate only the new scan batch into the ranking worker's index.
     pub fn append_project_files(&mut self, files: Vec<PathBuf>) {
         if files.is_empty() {
             return;
         }
-        self.explorer.files.extend(files.iter().cloned());
         self.file_finder
             .get_or_insert_with(|| crate::project::FileFinder::new(self.explorer.root.clone()))
             .append(files);
@@ -1609,17 +1582,21 @@ impl Editor {
         }
         let KeyCode::Char(ch) = key.code else {
             match key.code {
-                KeyCode::Up => self.explorer_move(-1),
-                KeyCode::Down => self.explorer_move(1),
-                KeyCode::Enter => self.explorer_open_selected(),
+                KeyCode::Up => self.explorer.move_selection(-1),
+                KeyCode::Down => self.explorer.move_selection(1),
+                KeyCode::Left => self.explorer.collapse_selected(),
+                KeyCode::Right => self.explorer_open_selected(false),
+                KeyCode::Enter => self.explorer_open_selected(true),
                 _ => {}
             }
             return;
         };
         match ch {
             ' ' => self.leader_prefix.push(' '),
-            'j' => self.explorer_move(1), 'k' => self.explorer_move(-1),
-            'h' => self.focus = Focus::Editor, 'l' | '\n' => self.explorer_open_selected(),
+            'j' => self.explorer.move_selection(1), 'k' => self.explorer.move_selection(-1),
+            'h' => self.explorer.collapse_selected(),
+            'l' => self.explorer_open_selected(false),
+            '\n' => self.explorer_open_selected(true),
             'e' => { self.explorer.show_hidden = !self.explorer.show_hidden; self.request = EditorRequest::RefreshProject; },
             'i' => { self.explorer.show_ignored = !self.explorer.show_ignored; self.request = EditorRequest::RefreshProject; },
             'a' => self.message("Use :e PATH to create a new file"),
@@ -1700,9 +1677,6 @@ impl Editor {
                     self.explorer.open = true;
                     self.focus = Focus::Explorer;
                     self.reveal_active_file();
-                    if self.explorer.files.is_empty() {
-                        self.request = EditorRequest::RefreshProject;
-                    }
                 }
             }
             CommandId::TerminalToggle => {
@@ -3775,17 +3749,15 @@ impl Editor {
         }
     }
 
-    fn explorer_move(&mut self, delta: isize) {
-        if self.explorer.files.is_empty() {
+    fn explorer_open_selected(&mut self, toggle: bool) {
+        if self.explorer.expand_selected(toggle) {
             return;
         }
-        self.explorer.selected = (self.explorer.selected as isize + delta)
-            .rem_euclid(self.explorer.files.len() as isize)
-            as usize;
-    }
-
-    fn explorer_open_selected(&mut self) {
-        let Some(path) = self.explorer.files.get(self.explorer.selected).cloned() else {
+        let Some(path) = self
+            .explorer
+            .selected_entry()
+            .map(|entry| entry.path.clone())
+        else {
             return;
         };
         if let Err(error) = self.open_path(path) {
@@ -3796,17 +3768,10 @@ impl Editor {
     }
 
     fn reveal_active_file(&mut self) {
-        let Some(path) = self.active_buffer().path() else {
+        let Some(path) = self.active_buffer().path().map(Path::to_owned) else {
             return;
         };
-        if let Some(index) = self
-            .explorer
-            .files
-            .iter()
-            .position(|candidate| candidate == path)
-        {
-            self.explorer.selected = index;
-        }
+        self.explorer.reveal(&path);
     }
 }
 
@@ -3897,6 +3862,22 @@ mod tests {
         for ch in input.chars() {
             editor.handle_key(Key::char(ch));
         }
+    }
+
+    fn explorer_files(editor: &mut Editor, files: Vec<PathBuf>) {
+        let root = editor.explorer.root.clone();
+        editor.explorer.append_directory(
+            &root,
+            files
+                .into_iter()
+                .map(|path| crate::project::ProjectEntry {
+                    relative_path: path.strip_prefix(&root).unwrap().to_owned(),
+                    path,
+                    kind: crate::project::ProjectEntryKind::File,
+                    depth: 1,
+                })
+                .collect(),
+        );
     }
 
     #[test]
@@ -4565,7 +4546,10 @@ mod tests {
         let mut navigation = editor("");
         navigation.explorer.open = true;
         navigation.focus = Focus::Explorer;
-        navigation.set_project_files(vec![PathBuf::from("a"), PathBuf::from("b")]);
+        explorer_files(
+            &mut navigation,
+            vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")],
+        );
         keys(&mut navigation, " j");
         assert_eq!(navigation.explorer.selected, 1);
         assert_eq!(navigation.focus, Focus::Explorer);
@@ -4582,9 +4566,10 @@ mod tests {
         fs::write(&path, "fn selected() {}\n").unwrap();
 
         let mut editor = editor("keep this buffer active");
+        editor.explorer.root = directory.path().to_owned();
         editor.explorer.open = true;
         editor.focus = Focus::Explorer;
-        editor.set_project_files(vec![path.clone()]);
+        explorer_files(&mut editor, vec![path.clone()]);
 
         editor.handle_key(Key::ctrl('w'));
         editor.handle_key(Key::char('l'));

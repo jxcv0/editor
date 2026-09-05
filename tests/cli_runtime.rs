@@ -232,6 +232,55 @@ impl Drop for EditorTerminal {
 }
 
 #[test]
+fn project_tree_expands_collapses_opens_files_and_restores_expansion() {
+    let workspace = Workspace::new();
+    fs::create_dir_all(workspace.project.join("src/nested")).unwrap();
+    fs::write(
+        workspace.project.join("src/nested/leaf.rs"),
+        "tree file opened\n",
+    )
+    .unwrap();
+    let mut terminal = workspace.terminal(&["--no-session", "."]);
+    terminal.wait_for("▸ src/");
+    assert!(!terminal.parser.screen().contents().contains("▸ nested/"));
+    terminal.send(b"l");
+    terminal.wait_for("▸ nested/");
+    terminal.send(b"j\r");
+    terminal.wait_for("leaf.rs");
+    terminal.send(b"j\r");
+    terminal.wait_for("tree file opened");
+    terminal.send(b" e");
+    terminal.send(b"hh");
+    terminal.wait_for("▸ nested/");
+    terminal.send(b"h\r");
+    terminal.wait_for("▸ src/");
+    assert!(!terminal.parser.screen().contents().contains("▸ nested/"));
+    terminal.send(b"\r");
+    terminal.wait_for("▸ nested/");
+    terminal.send(b"\x17l");
+    terminal.ex("qa");
+    terminal.finish();
+    let session = workspace.session();
+    assert!(
+        session
+            .expanded_directories
+            .contains(&workspace.project.join("src"))
+    );
+    assert!(
+        !session
+            .expanded_directories
+            .contains(&workspace.project.join("src/nested"))
+    );
+
+    let mut restored = workspace.terminal(&["."]);
+    restored.wait_for("tree file opened");
+    restored.wait_for("▸ nested/");
+    restored.send(b"\x17l");
+    restored.ex("qa");
+    restored.finish();
+}
+
+#[test]
 fn help_and_version_work_without_loading_invalid_configuration() {
     let workspace = Workspace::new();
     fs::write(workspace.project.join(".editor.toml"), "invalid toml").unwrap();
