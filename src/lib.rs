@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod buffer;
+pub mod check;
 pub mod cli;
 pub mod command;
 pub mod config;

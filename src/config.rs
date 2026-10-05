@@ -62,6 +62,8 @@ pub struct ThemeConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ToolsConfig {
     pub rust_analyzer: ToolConfig,
+    /// `args` are appended to `cargo check --message-format=json`.
+    pub cargo: ToolConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -143,6 +145,10 @@ impl Default for ToolsConfig {
         Self {
             rust_analyzer: ToolConfig {
                 path: "rust-analyzer".into(),
+                args: Vec::new(),
+            },
+            cargo: ToolConfig {
+                path: "cargo".into(),
                 args: Vec::new(),
             },
         }

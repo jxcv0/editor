@@ -88,6 +88,8 @@ The editor starts in Normal mode. A minimal first session is:
 - `<Space>` for the keyboard-driven command menu; `<Space><Space>` finds files
   and `<Space>e` toggles the explorer.
 - `` Ctrl-` `` or `<Space>t` to open or hide the integrated terminal.
+- `<Space>cc` to run `cargo check` and `<Space>cw` to watch it in a right-side
+  panel that re-runs whenever a Rust file is saved.
 
 The exact supported grammar, leader bindings, Ex commands, picker controls,
 and intentional Vim deviations are documented in
@@ -180,6 +182,10 @@ selection = "#2b4548"
 path = "rust-analyzer"
 args = []
 
+[tools.cargo]
+path = "cargo"
+args = []
+
 [limits]
 max_file_bytes = 104857600
 large_file_bytes = 10485760
@@ -229,6 +235,23 @@ runner. Closing the editor closes the PTY and terminates its shell.
 No external tool is required for editing, and the editor does not download,
 update, or invoke one through a shell.
 
+### `cargo check`
+
+`<Space>cc` (or `:check`) runs `cargo check --message-format=json` in the
+project root and shows the result in a panel docked on the right. `<Space>cw`
+toggles that panel; while it is visible, saving a `.rs`, `Cargo.toml`, or
+`Cargo.lock` file re-runs the check, cancelling any run still in progress.
+Hiding the panel stops watching. Errors are listed before warnings, each with
+its location, primary label, and rustc notes; the previous results stay on
+screen until a new run finishes. `Ctrl-w l` (or `Ctrl-l`) from the rightmost
+pane focuses the panel, where `j`/`k` select an entry, `Enter` jumps to its
+source location, and `r` re-runs the check.
+
+`tools.cargo.path` selects the cargo executable and `tools.cargo.args` are
+appended to the command, for example `["--all-targets"]`; both are read when
+each run starts. Like any cargo build, a check runs the project's build scripts
+and procedural macros, so it only starts after one of these explicit commands.
+
 ### `rust-analyzer`
 
 Install `rust-analyzer` separately and ensure it is on `PATH`, or set
@@ -267,6 +290,7 @@ all of `DESIGN.md`'s end-to-end or performance release criteria have passed.
 | Project discovery, finder, and text/regex search | Root selection is a synchronous ancestor walk before the first frame. Full-tree scanning and text search then run in background threads, stream through bounded cancellable queues, and honor hidden/ignored controls. The interactive grep picker uses regex mode and cancels the previous task when its query changes; previews are not yet rendered. |
 | Explorer | Expandable directory tree with lazy background loading, keyboard navigation, active-file reveal, hidden/ignored filters, and session-persisted expansion. Automatic external-filesystem refresh and confirmed create/rename/delete operations remain. |
 | `rust-analyzer` | Supervised asynchronous transport, initialization, manual restart, versioned full-text sync, typed requests, diagnostics, basic response UI/edit application, size bounds, and failure status are wired. Snippets, code-action execution, multi-file rename, inlay rendering, request cancellation, and capability-specific disabled states remain. |
+| `cargo check` panel | Explicit and save-triggered runs, JSON diagnostic parsing, a right-side panel with errors first, and jumps to rustc locations are implemented with process-level tests. Runs share cargo's build-directory lock with rust-analyzer's own check-on-save, so one can briefly wait for the other. |
 | Recovery and sessions | Dirty named and scratch/stdin buffers are journaled asynchronously, queued journal work is joined at shutdown, and content-free named-file sessions restore active selection, pane cursor/viewports, and explorer metadata. Recovery choice/application, unnamed session buffers, exact split topology/orientation, explicit-discard cleanup, and persistent undo are not release-complete. |
 | Performance/release evidence | `editor-bench` reports warm 1 MiB buffer-open and component p95 checks for insertion, long-word movement, whole-file indentation, long-line rendering, and finder input. It does not measure process launch through terminal flush or runtime maintenance, has no target-laptop/CI baseline yet, and therefore does not prove the complete 50 ms/8 ms release budgets. Broader fuzz/property coverage remains release work. |
 

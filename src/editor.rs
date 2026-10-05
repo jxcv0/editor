@@ -12,6 +12,7 @@ pub use crate::explorer::Explorer;
 
 use crate::{
     buffer::{Buffer, BufferError, Pos, TextRange},
+    check::{CheckLocation, CheckPanel},
     command::{self, CommandId},
     config::{Config, parse_hex_color},
     input::{Key, KeyCode, Modifiers},
@@ -243,6 +244,7 @@ pub enum Focus {
     Editor,
     Explorer,
     Terminal,
+    Check,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,6 +306,7 @@ pub enum EditorRequest {
     DocumentSaved(PathBuf),
     TerminalToggle(bool),
     TerminalInput(Vec<u8>),
+    CargoCheck,
     RustAnalyzer(CommandId),
     RustAnalyzerWithArgument(CommandId, String),
     CheckHealth,
@@ -355,6 +358,7 @@ pub struct Editor {
     pub focus: Focus,
     pub explorer: Explorer,
     pub terminal: TerminalPanel,
+    pub check: CheckPanel,
     pub picker: Option<Picker>,
     pub prompt: String,
     pub leader_prefix: String,
@@ -421,6 +425,7 @@ impl Editor {
             focus: Focus::Editor,
             explorer: Explorer::new(project_root, width, show_hidden, show_ignored),
             terminal: TerminalPanel::with_background(terminal_background),
+            check: CheckPanel::default(),
             picker: None,
             prompt: String::new(),
             leader_prefix: String::new(),
@@ -880,7 +885,7 @@ impl Editor {
         }
         if key == Key::ctrl('w')
             && self.picker.is_none()
-            && (self.focus == Focus::Explorer
+            && (matches!(self.focus, Focus::Explorer | Focus::Check)
                 || matches!(
                     self.mode,
                     Mode::Normal
@@ -901,6 +906,10 @@ impl Editor {
         }
         if self.focus == Focus::Explorer {
             self.handle_explorer_key(key);
+            return;
+        }
+        if self.focus == Focus::Check {
+            self.handle_check_key(key);
             return;
         }
         match self.mode.clone() {
@@ -1684,6 +1693,74 @@ impl Editor {
         }
     }
 
+    fn handle_check_key(&mut self, key: Key) {
+        if key.modifiers.contains(Modifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('n') => self.check.move_selection(1),
+                KeyCode::Char('p') => self.check.move_selection(-1),
+                KeyCode::Char('d') => self.check.move_selection(10),
+                KeyCode::Char('u') => self.check.move_selection(-10),
+                KeyCode::Char('h') => self.focus = Focus::Editor,
+                _ => self.message("Unsupported control key in the check panel"),
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.focus = Focus::Editor,
+            KeyCode::Down | KeyCode::Char('j') => self.check.move_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => self.check.move_selection(-1),
+            KeyCode::PageDown => self.check.move_selection(10),
+            KeyCode::PageUp => self.check.move_selection(-10),
+            KeyCode::Home | KeyCode::Char('g') => self.check.selected = 0,
+            KeyCode::End | KeyCode::Char('G') => self.check.select_last(),
+            KeyCode::Enter | KeyCode::Char('o' | 'l') => self.open_selected_check_entry(),
+            KeyCode::Char('r') => self.execute_command(CommandId::CargoCheck),
+            KeyCode::Char(' ') => {
+                self.focus = Focus::Editor;
+                self.mode = Mode::Leader;
+                self.leader_prefix.clear();
+            }
+            KeyCode::Char(':') => {
+                self.focus = Focus::Editor;
+                self.mode = Mode::Command;
+                self.prompt.clear();
+            }
+            _ => {}
+        }
+    }
+
+    fn open_selected_check_entry(&mut self) {
+        let Some(entry) = self.check.selected_entry() else {
+            return;
+        };
+        let Some(location) = entry.location.clone() else {
+            self.message("This cargo check entry has no source location");
+            return;
+        };
+        self.open_check_location(&location);
+    }
+
+    /// Open a rustc location, whose column counts Unicode scalar values.
+    fn open_check_location(&mut self, location: &CheckLocation) {
+        if let Err(error) = self.open_path(&location.path) {
+            self.message(error.to_string());
+            return;
+        }
+        self.focus = Focus::Editor;
+        let buffer = self.active_buffer();
+        let line = location.line.min(buffer.line_count().saturating_sub(1));
+        let grapheme = buffer.line(line).map_or(0, |text| {
+            let mut chars = 0;
+            text.graphemes(true)
+                .take_while(|grapheme| {
+                    chars += grapheme.chars().count();
+                    chars <= location.column
+                })
+                .count()
+        });
+        self.set_cursor(Pos::new(line, grapheme), false);
+    }
+
     fn handle_window_prefix_key(&mut self, key: Key) -> bool {
         if !matches!(self.awaiting, Awaiting::WindowPrefix) {
             return false;
@@ -1725,6 +1802,14 @@ impl Editor {
             }
             return;
         }
+        if self.focus == Focus::Check {
+            match direction {
+                'h' => self.focus = Focus::Editor,
+                'j' if self.terminal.visible => self.focus = Focus::Terminal,
+                _ => self.message("No window in that direction"),
+            }
+            return;
+        }
 
         if direction == 'h' && self.explorer.open {
             self.focus = Focus::Explorer;
@@ -1733,6 +1818,15 @@ impl Editor {
 
         if direction == 'j' && self.terminal.visible {
             self.focus = Focus::Terminal;
+            return;
+        }
+
+        // The check panel sits right of every pane, so moving right from the
+        // last pane focuses it instead of wrapping around.
+        let mut leaves = Vec::new();
+        self.layout.leaves(&mut leaves);
+        if direction == 'l' && self.check.visible && leaves.last() == Some(&self.active_pane) {
+            self.focus = Focus::Check;
             return;
         }
 
@@ -1784,6 +1878,23 @@ impl Editor {
             CommandId::SplitRight => self.split(Orientation::Vertical),
             CommandId::ClosePane => self.close_pane(),
             CommandId::OnlyPane => self.only_pane(),
+            CommandId::CargoCheck => {
+                self.check.visible = true;
+                self.request = EditorRequest::CargoCheck;
+                self.message("Running cargo check");
+            }
+            CommandId::CargoCheckWatch => {
+                self.check.visible = !self.check.visible;
+                if self.check.visible {
+                    self.request = EditorRequest::CargoCheck;
+                    self.message("Watching cargo check; saving Rust files re-runs it");
+                } else {
+                    if self.focus == Focus::Check {
+                        self.focus = Focus::Editor;
+                    }
+                    self.message("Stopped watching cargo check");
+                }
+            }
             CommandId::ToggleInlayHints => {
                 self.inlay_hints = !self.inlay_hints;
                 self.message(format!(
@@ -3442,6 +3553,7 @@ impl Editor {
             }
             "messages" => self.open_picker(PickerKind::Messages),
             "terminal" | "term" => self.execute_command(CommandId::TerminalToggle),
+            "check" | "cargocheck" => self.execute_command(CommandId::CargoCheck),
             "rename" => {
                 if argument.is_empty() {
                     self.message("Usage: :rename NEW_NAME");
@@ -4157,6 +4269,126 @@ mod tests {
         editor.focus = Focus::Editor;
         keys(&mut editor, "u");
         assert_eq!(editor.active_buffer().text(), "");
+    }
+
+    fn finish_check(editor: &mut Editor, entries: Vec<crate::check::CheckEntry>) {
+        use crate::check::CheckEvent;
+        editor.check.begin();
+        for entry in entries {
+            editor.check.apply(CheckEvent::Entry(entry));
+        }
+        editor.check.apply(CheckEvent::Finished {
+            success: false,
+            code: Some(101),
+        });
+    }
+
+    #[test]
+    fn cargo_check_commands_run_and_toggle_the_watch_panel() {
+        let mut editor = editor("safe");
+        keys(&mut editor, " cc");
+        assert!(editor.check.visible);
+        assert!(matches!(editor.take_request(), EditorRequest::CargoCheck));
+
+        keys(&mut editor, " cw");
+        assert!(!editor.check.visible);
+        assert!(matches!(editor.take_request(), EditorRequest::None));
+        keys(&mut editor, " cw");
+        assert!(editor.check.visible);
+        assert!(matches!(editor.take_request(), EditorRequest::CargoCheck));
+
+        for command in [":check", ":cargocheck"] {
+            keys(&mut editor, command);
+            editor.handle_key(Key::plain(KeyCode::Enter));
+            assert!(matches!(editor.take_request(), EditorRequest::CargoCheck));
+        }
+        assert_eq!(editor.active_buffer().text(), "safe");
+    }
+
+    #[test]
+    fn check_panel_focus_selection_and_jumps_use_rustc_columns() {
+        use crate::check::{CheckEntry, CheckLevel, CheckLocation};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("main.rs");
+        let line = "let s = \"e\u{301}\"; bad();";
+        std::fs::write(&path, format!("fn main() {{\n{line}\n}}\n")).unwrap();
+        let byte = line.find("bad").unwrap();
+        let entry = |title: &str, location: Option<CheckLocation>| CheckEntry {
+            level: Some(CheckLevel::Error),
+            title: title.into(),
+            location,
+            origin: None,
+            label: None,
+            notes: Vec::new(),
+        };
+        let mut editor = editor("scratch");
+        editor.check.visible = true;
+        finish_check(
+            &mut editor,
+            vec![
+                entry("error: no location", None),
+                entry(
+                    "error: bad call",
+                    Some(CheckLocation {
+                        path: path.clone(),
+                        line: 1,
+                        column: line[..byte].chars().count(),
+                    }),
+                ),
+            ],
+        );
+
+        editor.handle_key(Key::ctrl('w'));
+        editor.handle_key(Key::char('l'));
+        assert_eq!(editor.focus, Focus::Check);
+        editor.handle_key(Key::plain(KeyCode::Enter));
+        assert_eq!(editor.focus, Focus::Check);
+        assert!(
+            editor
+                .current_message()
+                .unwrap()
+                .contains("no source location")
+        );
+
+        keys(&mut editor, "jjk");
+        assert_eq!(editor.check.selected, 0);
+        keys(&mut editor, "G");
+        assert_eq!(editor.check.selected, 1);
+        keys(&mut editor, "q");
+        assert_eq!(editor.focus, Focus::Editor);
+        editor.handle_key(Key::ctrl('l'));
+        assert_eq!(editor.focus, Focus::Check);
+
+        editor.handle_key(Key::plain(KeyCode::Enter));
+        assert_eq!(editor.focus, Focus::Editor);
+        assert_eq!(
+            editor.active_buffer().path(),
+            Some(path.canonicalize().unwrap().as_path())
+        );
+        assert_eq!(
+            editor.active_pane().cursor,
+            Pos::new(1, line[..byte].graphemes(true).count())
+        );
+        assert_eq!(editor.mode, Mode::Normal);
+
+        // The panel is right of every pane, so only the last pane reaches it.
+        editor.split(Orientation::Vertical);
+        editor.cycle_pane(-1);
+        editor.handle_key(Key::ctrl('l'));
+        assert_eq!(editor.focus, Focus::Editor);
+        editor.handle_key(Key::ctrl('l'));
+        assert_eq!(editor.focus, Focus::Check);
+        editor.handle_key(Key::ctrl('w'));
+        editor.handle_key(Key::char('h'));
+        assert_eq!(editor.focus, Focus::Editor);
+
+        // Hiding the panel returns focus to the editor.
+        editor.focus = Focus::Check;
+        keys(&mut editor, " cw");
+        assert!(!editor.check.visible);
+        assert_eq!(editor.focus, Focus::Editor);
+        editor.handle_key(Key::ctrl('l'));
+        assert_eq!(editor.focus, Focus::Editor);
     }
 
     #[test]

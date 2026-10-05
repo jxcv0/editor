@@ -222,6 +222,8 @@ registry is:
 | `<Space>cf` | Format | Applies returned active-buffer text edits as one transaction. |
 | `<Space>cr` | Rename | Opens `:rename ` input. Returned edits for the active buffer are applied; multi-file edits are not. |
 | `<Space>cR` | Restart rust-analyzer | Restarts the client; remains available while the server is failed or not ready. |
+| `<Space>cc` | Cargo check | Runs `cargo check` now and shows the right-side check panel. |
+| `<Space>cw` | Watch cargo check | Toggles the check panel. While it is visible, saving a Rust source or Cargo manifest/lockfile re-runs the check; hiding it stops watching and cancels a running check. |
 | `<Space>fr` | Recent files | Opens files visited during this process; this list is not persistent yet. |
 | `<Space>ss`, `<Space>sS` | Document/workspace symbols | Requests and lists symbols. Workspace locations can open; document-symbol selection remains incomplete. |
 | `<Space>sm` | Messages | Opens bounded message history. |
@@ -256,6 +258,29 @@ same byte as `Ctrl-Space` and `Ctrl-@`, so those keys toggle the panel too and
 are not forwarded to the shell. In Insert mode that byte keeps its
 `<C-Space>` completion meaning; a distinctly reported `` Ctrl-` `` still leaves
 Insert mode and toggles the terminal.
+
+### Cargo check panel
+
+`<Space>cc` runs `cargo check --message-format=json` (plus `tools.cargo.args`)
+in the project root and opens the panel docked right of the panes. It needs at
+least 59 columns beside the explorer and otherwise stays hidden. The header
+shows the latest status line while a run is in progress, then the error and
+warning counts. Each entry lists its rustc header, location, primary label, and
+notes, errors before warnings, followed by cargo's own output such as manifest
+errors. Duplicate diagnostics are shown once and at most 1,000 entries are
+kept. A new run replaces the displayed results only when it finishes.
+
+`<C-w>l` or `<C-l>` from the last (rightmost) pane focuses the panel. When it
+has focus:
+
+- `j`/`k`, Down/Up, or `<C-n>`/`<C-p>` select an entry; `<C-d>`/`<C-u>` and
+  PageDown/PageUp move by ten; `g`/`G` or Home/End select the first or last.
+- `Enter`, `o`, or `l` open the selected entry's file at rustc's line and
+  column and return focus to the editor.
+- `r` re-runs the check.
+- `<Space>` opens the leader menu and `:` the command line from editor focus.
+- `Esc`, `q`, `<C-h>`, or `<C-w>h` return focus to the editor; `<C-w>j` focuses
+  a visible terminal.
 
 ### Pickers
 
@@ -317,6 +342,7 @@ aliases are accepted.
 | `:earlier [N]`, `:later [N]` | Undo/redo `N` nodes on the current branch. |
 | `:messages` | Open message history. |
 | `:terminal`, `:term` | Toggle the integrated terminal panel. |
+| `:check`, `:cargocheck` | Run `cargo check` and show the check panel. |
 | `:rename NEW_NAME` | Request an LSP rename and apply returned changes for the active buffer only. |
 | `:rarestart`, `:lsprestart` | Restart the `rust-analyzer` client. |
 | `:checkhealth` | Request the current health report; the report is incomplete in this MVP. |
@@ -346,7 +372,8 @@ changed tool paths/arguments therefore require a restart.
 In Normal and Visual modes, `<C-h>`/`<C-k>` select the previous layout leaf and
 `<C-j>`/`<C-l>` select the next one. The same directions work after a `<C-w>`
 prefix. When the explorer is open, moving left from an editor pane focuses it;
-moving right from the explorer focuses the editor. This is deterministic but
+moving right from the explorer focuses the editor. When the cargo check panel
+is visible, moving right from the last pane focuses it instead of wrapping. This is deterministic but
 not yet geometric left/down/up/right pane selection. Closing a pane retains its
 buffer, except when `:q!` explicitly discards a modified buffer's last view.
 `<Space>wd` keeps buffers open and still refuses to close the last pane.

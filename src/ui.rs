@@ -24,6 +24,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::{
     buffer::Buffer,
+    check::{CheckEntry, CheckLevel, CheckStatus},
     command::{self, CommandSource},
     config::parse_hex_color,
     editor::{
@@ -831,6 +832,13 @@ fn build_frame(
             .width
             .saturating_sub(explorer_width.saturating_add(1));
     }
+    let check_rect = if editor.check.visible {
+        let (panes, panel) = check_panel_layout(content);
+        content = panes;
+        panel
+    } else {
+        None
+    };
 
     let mut pane_rects = Vec::new();
     layout_rects(&editor.layout, content, &mut pane_rects);
@@ -845,6 +853,16 @@ fn build_frame(
         }
     }
     render_split_lines(&mut canvas, &editor.layout, content, palette);
+    if let Some(rect) = check_rect {
+        canvas.vline(
+            rect.x.saturating_sub(1),
+            rect.y,
+            rect.height,
+            "│",
+            Style::new(palette.border, palette.surface),
+        );
+        render_check_panel(&mut canvas, editor, rect, palette);
+    }
     let terminal_cursor =
         terminal_rect.and_then(|rect| render_terminal(&mut canvas, editor, rect, palette));
 
@@ -941,6 +959,277 @@ fn terminal_layout(content: Rect, visible: bool) -> (Rect, Option<Rect>) {
         height: terminal_height,
     };
     (editor, Some(terminal))
+}
+
+/// Dock the cargo check panel right of the panes, only when both keep a
+/// usable width.
+fn check_panel_layout(content: Rect) -> (Rect, Option<Rect>) {
+    const MIN_PANEL: u16 = 28;
+    const MIN_PANES: u16 = 30;
+    if content.width < MIN_PANEL + MIN_PANES + 1 || content.height == 0 {
+        return (content, None);
+    }
+    let preferred = u16::try_from(u32::from(content.width) * 2 / 5).unwrap_or(u16::MAX);
+    let width = preferred
+        .clamp(MIN_PANEL, 80)
+        .min(content.width - MIN_PANES - 1);
+    let panel = Rect {
+        x: content.x + content.width - width,
+        width,
+        ..content
+    };
+    let panes = Rect {
+        width: content.width - width - 1,
+        ..content
+    };
+    (panes, Some(panel))
+}
+
+fn render_check_panel(canvas: &mut Canvas, editor: &mut Editor, rect: Rect, palette: Palette) {
+    let focused = editor.focus == Focus::Check;
+    canvas.fill(rect, " ", Style::new(palette.foreground, palette.surface));
+    let header = Rect { height: 1, ..rect };
+    canvas.fill(header, " ", Style::new(palette.foreground, palette.status));
+    let title_width = canvas.text(
+        header.x.saturating_add(1),
+        header.y,
+        "CARGO CHECK",
+        header.width.saturating_sub(2),
+        Style::new(
+            if focused {
+                palette.accent
+            } else {
+                palette.muted
+            },
+            palette.status,
+        )
+        .bold(),
+    );
+    let (errors, warnings) = editor.check.counts();
+    let status_color = match &editor.check.status {
+        CheckStatus::Running => palette.info,
+        CheckStatus::Failed(_) => palette.error,
+        CheckStatus::Finished { success, .. } if errors > 0 || !success => palette.error,
+        CheckStatus::Finished { .. } if warnings > 0 => palette.warning,
+        CheckStatus::Finished { .. } => palette.accent,
+        CheckStatus::Idle | CheckStatus::Cancelled => palette.muted,
+    };
+    let status_width = header.width.saturating_sub(title_width).saturating_sub(4);
+    let mut status = editor.check.summary();
+    if let CheckStatus::Finished { elapsed, .. } = editor.check.status {
+        let timed = format!("{status} · {:.1}s", elapsed.as_secs_f64());
+        if UnicodeWidthStr::width(timed.as_str()) <= usize::from(status_width) {
+            status = timed;
+        }
+    }
+    canvas.text(
+        header.x.saturating_add(title_width).saturating_add(3),
+        header.y,
+        &status,
+        status_width,
+        Style::new(status_color, palette.status),
+    );
+
+    let footer_height = u16::from(rect.height >= 3);
+    let body = Rect {
+        y: rect.y.saturating_add(1),
+        height: rect.height.saturating_sub(1).saturating_sub(footer_height),
+        ..rect
+    };
+    if footer_height > 0 {
+        let omitted = editor.check.omitted();
+        let mut hints = if omitted > 0 {
+            format!("{omitted} more not shown · ")
+        } else {
+            String::new()
+        };
+        hints.push_str(if focused {
+            "Enter open · r rerun · q back"
+        } else {
+            "Ctrl-W l focus · <Space>cw hide"
+        });
+        canvas.text(
+            rect.x.saturating_add(1),
+            rect.y + rect.height - 1,
+            &hints,
+            rect.width.saturating_sub(2),
+            Style::new(palette.muted, palette.surface),
+        );
+    }
+    if body.height == 0 || body.width < 4 {
+        return;
+    }
+
+    let text_width = usize::from(body.width.saturating_sub(2));
+    let entries = editor.check.entries();
+    if entries.is_empty() {
+        let (text, color) = match &editor.check.status {
+            CheckStatus::Idle => ("Not run yet".into(), palette.muted),
+            CheckStatus::Running => ("Running cargo check…".into(), palette.muted),
+            CheckStatus::Cancelled => ("Cancelled".into(), palette.muted),
+            CheckStatus::Failed(error) => (error.clone(), palette.error),
+            CheckStatus::Finished { success: false, .. } => (
+                "cargo check failed without diagnostics".into(),
+                palette.error,
+            ),
+            CheckStatus::Finished { .. } => ("✓ No errors or warnings".into(), palette.accent),
+        };
+        for (row, line) in wrap_text(&text, text_width, 0)
+            .iter()
+            .take(usize::from(body.height))
+            .enumerate()
+        {
+            canvas.text(
+                body.x.saturating_add(1),
+                body.y.saturating_add(row as u16),
+                line,
+                body.width.saturating_sub(2),
+                Style::new(color, palette.surface),
+            );
+        }
+        return;
+    }
+
+    // Keep the whole selected entry visible, measuring only the entries
+    // between the selection and the earliest row that can stay on screen.
+    let selected = editor.check.selected.min(entries.len() - 1);
+    let mut scroll = editor.check.scroll.min(selected);
+    let room = usize::from(body.height).saturating_add(1);
+    let mut used = 0;
+    for index in (scroll..=selected).rev() {
+        used += check_entry_rows(&entries[index], text_width).len() + 1;
+        if used > room {
+            scroll = (index + 1).min(selected);
+            break;
+        }
+    }
+
+    let mut y = body.y;
+    let bottom = body.y.saturating_add(body.height);
+    'entries: for (index, entry) in entries.iter().enumerate().skip(scroll) {
+        let highlighted = focused && index == selected;
+        let background = if highlighted {
+            palette.selection
+        } else {
+            palette.surface
+        };
+        for (text, kind) in check_entry_rows(entry, text_width) {
+            if y >= bottom {
+                break 'entries;
+            }
+            let foreground = match kind {
+                CheckRow::Title => match entry.level {
+                    Some(CheckLevel::Error) => palette.error,
+                    Some(CheckLevel::Warning) => palette.warning,
+                    None if entry.title.starts_with("error") => palette.error,
+                    None if entry.title.starts_with("warning") => palette.warning,
+                    None => palette.foreground,
+                },
+                CheckRow::Origin => palette.info,
+                CheckRow::Label => palette.foreground,
+                CheckRow::Note => palette.muted,
+            };
+            let mut style = Style::new(foreground, background);
+            if kind == CheckRow::Title && entry.level.is_some() {
+                style = style.bold();
+            }
+            canvas.fill(
+                Rect {
+                    y,
+                    height: 1,
+                    ..body
+                },
+                " ",
+                Style::new(palette.foreground, background),
+            );
+            canvas.text(
+                body.x.saturating_add(1),
+                y,
+                &text,
+                body.width.saturating_sub(2),
+                style,
+            );
+            y += 1;
+        }
+        y = y.saturating_add(1);
+    }
+    editor.check.selected = selected;
+    editor.check.scroll = scroll;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckRow {
+    Title,
+    Origin,
+    Label,
+    Note,
+}
+
+/// Display rows for one check entry, wrapped to `width` cells.
+fn check_entry_rows(entry: &CheckEntry, width: usize) -> Vec<(String, CheckRow)> {
+    let marker = match entry.level {
+        Some(CheckLevel::Error) => "● ",
+        Some(CheckLevel::Warning) => "▲ ",
+        None => "",
+    };
+    let mut rows = Vec::new();
+    let mut push = |text: &str, kind: CheckRow, indent: usize| {
+        for line in text.lines() {
+            rows.extend(
+                wrap_text(line, width, indent)
+                    .into_iter()
+                    .map(|row| (row, kind)),
+            );
+        }
+    };
+    push(&format!("{marker}{}", entry.title), CheckRow::Title, 2);
+    if let Some(origin) = &entry.origin {
+        push(&format!("  {origin}"), CheckRow::Origin, 4);
+    }
+    if let Some(label) = &entry.label {
+        push(&format!("  {label}"), CheckRow::Label, 4);
+    }
+    for note in &entry.notes {
+        push(&format!("  {note}"), CheckRow::Note, 4);
+    }
+    rows
+}
+
+/// Word-wrap `text` to `width` cells, indenting continuation rows. Words
+/// longer than a row are split between graphemes.
+fn wrap_text(text: &str, width: usize, indent: usize) -> Vec<String> {
+    let width = width.max(1);
+    let indent = indent.min(width / 2);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut content_start = 0;
+    let mut break_at = None;
+    for grapheme in text.graphemes(true) {
+        let cells = UnicodeWidthStr::width(grapheme);
+        if UnicodeWidthStr::width(row.as_str()) + cells > width && row.len() > content_start {
+            if grapheme == " " {
+                rows.push(row.trim_end().to_owned());
+                row = " ".repeat(indent);
+                content_start = indent;
+                break_at = None;
+                continue;
+            }
+            let carried = break_at
+                .filter(|&at| at < row.len())
+                .map(|at| row.split_off(at))
+                .unwrap_or_default();
+            rows.push(row.trim_end().to_owned());
+            row = format!("{}{carried}", " ".repeat(indent));
+            content_start = indent;
+            break_at = None;
+        }
+        row.push_str(grapheme);
+        if grapheme == " " && !row[content_start..].trim().is_empty() {
+            break_at = Some(row.len());
+        }
+    }
+    rows.push(row);
+    rows
 }
 
 fn render_terminal(
@@ -2423,6 +2712,153 @@ mod tests {
         let (canvas, _) = draw_editor(&mut editor, 60, 10);
         assert!(row(&canvas, 1).starts_with(" ▸ src/"));
         assert!(!row(&canvas, 2).contains("file"));
+    }
+
+    fn check_entry(level: CheckLevel, title: &str, line: usize) -> CheckEntry {
+        CheckEntry {
+            level: Some(level),
+            title: title.into(),
+            location: Some(crate::check::CheckLocation {
+                path: PathBuf::from("/work/src/main.rs"),
+                line,
+                column: 4,
+            }),
+            origin: Some(format!("src/main.rs:{}:5", line + 1)),
+            label: Some("expected `u32`, found `&str`".into()),
+            notes: vec!["help: consider removing this call to keep the types aligned".into()],
+        }
+    }
+
+    fn finished_check(editor: &mut Editor, entries: Vec<CheckEntry>) {
+        use crate::check::CheckEvent;
+        editor.check.visible = true;
+        editor.check.begin();
+        for entry in entries {
+            editor.check.apply(CheckEvent::Entry(entry));
+        }
+        editor.check.apply(CheckEvent::Finished {
+            success: false,
+            code: Some(101),
+        });
+    }
+
+    #[test]
+    fn check_panel_docks_right_wraps_entries_and_follows_the_selection() {
+        let mut editor = Editor::new(Config::default(), PathBuf::from("/work"));
+        finished_check(
+            &mut editor,
+            (0..6)
+                .map(|line| check_entry(CheckLevel::Error, "error[E0308]: mismatched types", line))
+                .chain([check_entry(
+                    CheckLevel::Warning,
+                    "warning: unused variable",
+                    9,
+                )])
+                .collect(),
+        );
+        let (canvas, _) = draw_editor(&mut editor, 100, 24);
+        // 2/5 of 100 columns, after a one-column divider.
+        let panel_x = 60;
+        for y in 0_u16..22 {
+            let index = usize::from(y) * usize::from(canvas.width) + panel_x - 1;
+            assert_eq!(canvas.cells[index].symbol, "│", "row {y}");
+        }
+        let panel_rows = (0..24)
+            .map(|y| row(&canvas, y).chars().skip(panel_x).collect::<String>())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            panel_rows[0].trim_end(),
+            " CARGO CHECK  6 errors, 1 warning"
+        );
+        assert_eq!(
+            panel_rows[1].trim_end(),
+            " ● error[E0308]: mismatched types"
+        );
+        assert_eq!(panel_rows[2].trim_end(), "   src/main.rs:1:5");
+        assert_eq!(panel_rows[3].trim_end(), "   expected `u32`, found `&str`");
+        assert_eq!(
+            panel_rows[4].trim_end(),
+            "   help: consider removing this call to"
+        );
+        assert_eq!(panel_rows[5].trim_end(), "     keep the types aligned");
+        assert_eq!(panel_rows[6].trim_end(), "");
+        assert!(panel_rows[21].contains("Ctrl-W l focus · <Space>cw hide"));
+        assert!(
+            row(&canvas, 0).starts_with("1 "),
+            "panes stay left of the panel"
+        );
+
+        editor.focus = Focus::Check;
+        editor.check.select_last();
+        let (canvas, _) = draw_editor(&mut editor, 100, 24);
+        let frame = (0..24)
+            .map(|y| row(&canvas, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(frame.contains("▲ warning: unused variable"));
+        assert!(frame.contains("Enter open · r rerun · q back"));
+        assert!(editor.check.scroll > 0);
+        let selected_row = (0..24)
+            .find(|&y| row(&canvas, y).contains("▲ warning"))
+            .unwrap();
+        let index = usize::from(selected_row) * usize::from(canvas.width) + panel_x + 1;
+        assert_eq!(
+            canvas.cells[index].style.bg,
+            Palette::from_editor(&editor).selection
+        );
+    }
+
+    #[test]
+    fn check_panel_reports_empty_states_and_yields_narrow_terminals() {
+        let mut editor = Editor::new(Config::default(), PathBuf::from("/work"));
+        editor.check.visible = true;
+        editor.check.begin();
+        let (canvas, _) = draw_editor(&mut editor, 90, 12);
+        let frame = (0..12)
+            .map(|y| row(&canvas, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(frame.contains("CARGO CHECK  running…"));
+        assert!(frame.contains("Running cargo check…"));
+
+        finished_check(&mut editor, Vec::new());
+        editor.check.begin();
+        editor.check.apply(crate::check::CheckEvent::Finished {
+            success: true,
+            code: Some(0),
+        });
+        let (canvas, _) = draw_editor(&mut editor, 90, 12);
+        let frame = (0..12)
+            .map(|y| row(&canvas, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(frame.contains("✓ No errors or warnings"));
+        assert!(frame.contains("CARGO CHECK  no errors or warnings"));
+        let (canvas, _) = draw_editor(&mut editor, 160, 12);
+        assert!(row(&canvas, 0).contains("CARGO CHECK  no errors or warnings · 0.0s"));
+
+        let (canvas, _) = draw_editor(&mut editor, 50, 12);
+        let frame = (0..12)
+            .map(|y| row(&canvas, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!frame.contains("CARGO CHECK"));
+    }
+
+    #[test]
+    fn wrapping_prefers_spaces_and_indents_continuations() {
+        assert_eq!(wrap_text("short", 10, 2), ["short"]);
+        assert_eq!(
+            wrap_text("one two three four", 10, 2),
+            ["one two", "  three", "  four"]
+        );
+        assert_eq!(wrap_text("abcdefghij", 4, 1), ["abcd", " efg", " hij"]);
+        assert_eq!(
+            wrap_text("fits exactly here", 12, 2),
+            ["fits exactly", "  here"]
+        );
+        assert_eq!(wrap_text("界界界", 4, 0), ["界界", "界"]);
+        assert_eq!(wrap_text("", 4, 0), [""]);
     }
 
     #[test]

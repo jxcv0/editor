@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 use crate::{
     buffer::{Pos, Utf16Pos},
+    check::{self, CargoCheckTask, CheckEvent},
     command::CommandId,
     editor::{
         Diagnostic, DiagnosticSeverity, Editor, EditorRequest, Orientation, PickerItem, PickerKind,
@@ -55,6 +56,7 @@ pub struct Runtime {
     restore_session: bool,
     background_started: bool,
     terminal: Option<TerminalProcess>,
+    cargo_check: Option<CargoCheckTask>,
 }
 
 #[derive(Debug, Clone)]
@@ -146,6 +148,7 @@ impl Runtime {
             restore_session,
             background_started: false,
             terminal: None,
+            cargo_check: None,
         })
     }
 
@@ -234,6 +237,7 @@ impl Runtime {
         self.drain_project_search();
         self.redraw |= self.editor.poll_file_finder();
         self.drain_lsp();
+        self.drain_cargo_check();
         self.drain_reference_previews();
         self.restore_session_if_ready();
         if idle || self.last_maintenance.elapsed() >= Duration::from_millis(50) {
@@ -412,13 +416,65 @@ impl Runtime {
         match self.editor.take_request() {
             EditorRequest::None => {}
             EditorRequest::RefreshProject => self.restart_scan(),
-            EditorRequest::DocumentSaved(path) => self.notify_lsp_document_saved(&path),
+            EditorRequest::DocumentSaved(path) => {
+                self.notify_lsp_document_saved(&path);
+                if self.editor.check.visible && check::is_cargo_input(&path) {
+                    self.start_cargo_check();
+                }
+            }
             EditorRequest::TerminalToggle(visible) => self.toggle_terminal(visible),
             EditorRequest::TerminalInput(bytes) => self.write_terminal(&bytes),
+            EditorRequest::CargoCheck => self.start_cargo_check(),
             EditorRequest::CheckHealth => self.show_health(),
             EditorRequest::RustAnalyzer(command) => self.request_lsp(command, None),
             EditorRequest::RustAnalyzerWithArgument(command, argument) => {
                 self.request_lsp(command, Some(argument));
+            }
+        }
+    }
+
+    /// Start a check, replacing (and killing) any run still in progress.
+    fn start_cargo_check(&mut self) {
+        self.cargo_check = None;
+        self.redraw = true;
+        let root = self.editor.explorer.root.clone();
+        let spec = check::cargo_check_spec(&self.editor.config.tools.cargo, &root);
+        let program = spec.program.display().to_string();
+        match CargoCheckTask::spawn(spec, root) {
+            Ok(task) => {
+                self.editor.check.begin();
+                self.cargo_check = Some(task);
+            }
+            Err(error) => {
+                let error = format!("could not start {program}: {error}");
+                self.editor.check.fail(error.clone());
+                self.editor.message(format!("cargo check failed: {error}"));
+            }
+        }
+    }
+
+    fn drain_cargo_check(&mut self) {
+        if !self.editor.check.visible {
+            // Hiding the panel stops watching, including a run in progress.
+            if self.cargo_check.take().is_some() {
+                self.editor.check.cancel();
+                self.redraw = true;
+            }
+            return;
+        }
+        let Some(task) = &self.cargo_check else {
+            return;
+        };
+        let events = task.drain(256);
+        self.redraw |= !events.is_empty();
+        for event in events {
+            let finished = matches!(event, CheckEvent::Finished { .. } | CheckEvent::Failed(_));
+            if let Some(message) = self.editor.check.apply(event) {
+                self.editor.message(message);
+            }
+            if finished {
+                self.cargo_check = None;
+                break;
             }
         }
     }
@@ -2263,6 +2319,125 @@ mod tests {
         runtime.sync_terminal_size();
         runtime.drain_terminal();
         assert!(runtime.terminal.is_none());
+    }
+
+    fn wait_for_check(runtime: &mut Runtime) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        runtime.pump(false);
+        while runtime.editor.check.is_running() {
+            assert!(Instant::now() < deadline, "cargo check did not finish");
+            thread::sleep(Duration::from_millis(5));
+            runtime.pump(false);
+        }
+    }
+
+    fn type_keys(runtime: &mut Runtime, keys: &str) {
+        for key in keys.chars() {
+            let key = if key == '\n' {
+                crate::input::Key::plain(crate::input::KeyCode::Enter)
+            } else {
+                crate::input::Key::char(key)
+            };
+            runtime.editor.handle_key(key);
+            runtime.pump(false);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_check_runs_on_request_reruns_on_rust_saves_and_stops_when_hidden() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let tools = tempdir().unwrap();
+        let log = tools.path().join("runs.log");
+        let slow = tools.path().join("slow");
+        let message = json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": "warning",
+                "message": "unused variable: `x`",
+                "spans": [{"file_name": "src/lib.rs", "line_start": 1, "column_start": 5,
+                           "is_primary": true, "label": null}],
+            },
+        });
+        let cargo = tools.path().join("cargo");
+        fs::write(
+            &cargo,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\n[ -f '{}' ] && sleep 30\nprintf '%s\\n' '{message}'\n",
+                log.display(),
+                slow.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut runtime = local_runtime(&root);
+        runtime.editor.config.tools.cargo.path = cargo.display().to_string();
+        runtime.editor.config.tools.cargo.args = vec!["--all-targets".into()];
+
+        type_keys(&mut runtime, " cc");
+        assert!(runtime.editor.check.visible);
+        wait_for_check(&mut runtime);
+        assert_eq!(runtime.editor.check.summary(), "1 warning");
+        assert_eq!(
+            runtime.editor.current_message(),
+            Some("cargo check: 1 warning")
+        );
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            "check --message-format=json --color=never --all-targets\n"
+        );
+        let location = runtime.editor.check.entries()[0].location.clone().unwrap();
+        assert_eq!(location.path, root.join("src/lib.rs"));
+
+        open_test_file(&mut runtime, "notes.md", "notes\n");
+        type_keys(&mut runtime, ":w\n");
+        wait_for_check(&mut runtime);
+        assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
+
+        open_test_file(&mut runtime, "lib.rs", "fn main() {}\n");
+        type_keys(&mut runtime, ":w\n");
+        assert!(runtime.cargo_check.is_some());
+        wait_for_check(&mut runtime);
+        assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 2);
+
+        fs::write(&slow, "").unwrap();
+        type_keys(&mut runtime, " cc");
+        assert!(runtime.editor.check.is_running());
+        type_keys(&mut runtime, " cw");
+        assert!(!runtime.editor.check.visible);
+        assert!(runtime.cargo_check.is_none());
+        assert_eq!(runtime.editor.check.summary(), "cancelled");
+        assert_eq!(runtime.editor.check.entries().len(), 1);
+
+        // A watched save does nothing while the panel is hidden.
+        type_keys(&mut runtime, ":w\n");
+        assert!(runtime.cargo_check.is_none());
+    }
+
+    #[test]
+    fn missing_cargo_reports_a_failed_check() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        runtime.editor.config.tools.cargo.path =
+            directory.path().join("missing-cargo").display().to_string();
+        type_keys(&mut runtime, " cc");
+        assert!(runtime.cargo_check.is_none());
+        assert!(
+            runtime
+                .editor
+                .check
+                .summary()
+                .starts_with("failed: could not start")
+        );
+        assert!(
+            runtime
+                .editor
+                .current_message()
+                .unwrap()
+                .starts_with("cargo check failed: could not start")
+        );
     }
 
     #[test]

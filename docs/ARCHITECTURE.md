@@ -23,6 +23,7 @@ mutate editor text directly.
 | `project` | Project-root discovery, ignored/hidden-aware walking, fuzzy ranking, and literal/regex project search | The short ancestor-based root discovery is synchronous during composition. Full scans/searches run on cancellable background threads and stream through bounded channels. The module has no editor mutation access; preview/open behavior is handled above it. |
 | `syntax` | Lightweight, line-local Rust/TOML/Markdown highlighting | Always-available fallback with no parser process. It is lexical and deliberately tolerant, not a full incremental syntax tree or semantic highlighter. |
 | `terminal` | PTY shell lifecycle, bounded asynchronous output, VT screen/scrollback state, resizing, terminal-key encoding, and bounded capability replies | The editor owns only the renderable emulator state and emits typed input/toggle requests; `app` owns the fallible OS process handle. The interactive shell starts only after an explicit terminal command. |
+| `check` | `cargo check` process runs, JSON diagnostic parsing, path resolution, and the check panel's result state | A worker thread owns parsing and streams compact entries through a bounded queue; the editor owns only the renderable panel state and emits run requests, while `app` owns the cancellable task. Checks start only after an explicit command or a watched save while the panel is visible. |
 | `bin/editor-bench` | Repeatable local smoke measurement for warm 1 MiB open and edit-plus-frame p95 | Measures useful core proxies, not full process-launch-to-terminal-flush latency. Target-laptop baselines and regression enforcement are still needed. |
 | `process` | Direct child spawning, bounded stdin/stdout/stderr, process-group shutdown, and bounded logs | Security/reliability boundary shared by integrations. It never invokes a shell. On Unix it creates a child process group; non-Unix shutdown falls back to the platform process API. |
 | `lsp` | Asynchronous `rust-analyzer` lifecycle and JSON-RPC/LSP transport, document snapshots/version checks, generic request/notification routing, and bounded events/errors | Runs process and protocol work on a dedicated worker. `app` maps typed actions to methods and handles a practical response subset; comprehensive capability-aware UX remains incomplete. |
@@ -134,6 +135,13 @@ intentionally starts the user's `$SHELL` directly in a PTY after `<Space>t` or
 The PTY reader uses a bounded queue, the VT model keeps bounded scrollback,
 terminal capability responses are queued with a fixed limit, and dropping the
 runtime closes the PTY and terminates the owned shell.
+
+`cargo check` runs are another explicit boundary. `<Space>cc`, `:check`, or a
+save of a Rust source or Cargo manifest while the watch panel is visible starts
+`cargo check --message-format=json` directly through `SupervisedChild`. A
+worker thread parses stdout into bounded entries and classifies stderr status
+lines; at most one run exists, and starting another, hiding the panel, or
+dropping the runtime kills the previous run's process group.
 
 There is deliberately no dynamic library loading, embedded language, arbitrary
 plugin callback, or general task runner.

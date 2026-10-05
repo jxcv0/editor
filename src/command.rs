@@ -13,6 +13,8 @@ pub enum CommandId {
     Completion,
     SignatureHelp,
     RustAnalyzerRestart,
+    CargoCheck,
+    CargoCheckWatch,
     FindFiles,
     ProjectGrep,
     ExplorerToggle,
@@ -136,6 +138,20 @@ pub const COMMANDS: &[Command] = &[
         sequence: "cR",
         description: "Restart rust-analyzer",
         source: CommandSource::RustAnalyzer,
+    },
+    Command {
+        id: CommandId::CargoCheck,
+        name: "code.cargo_check",
+        sequence: "cc",
+        description: "Cargo check",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::CargoCheckWatch,
+        name: "code.cargo_check_watch",
+        sequence: "cw",
+        description: "Watch cargo check",
+        source: CommandSource::Editor,
     },
     Command {
         id: CommandId::FindFiles,
@@ -358,6 +374,12 @@ mod tests {
         assert_eq!(
             by_sequence("cR").map(|command| command.id),
             Some(CommandId::RustAnalyzerRestart)
+        );
+        assert_eq!(by_sequence("cc").unwrap().id, CommandId::CargoCheck);
+        assert_eq!(by_sequence("cw").unwrap().id, CommandId::CargoCheckWatch);
+        assert_eq!(
+            CommandId::CargoCheckWatch.to_string(),
+            "code.cargo_check_watch"
         );
     }
 }
