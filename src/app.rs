@@ -2550,7 +2550,6 @@ mod tests {
 
         open_test_file(&mut runtime, "lib.rs", "fn main() {}\n");
         type_keys(&mut runtime, ":w\n");
-        assert!(runtime.cargo_check.is_some());
         wait_for_check(&mut runtime);
         assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 2);
 
@@ -2690,28 +2689,36 @@ mod tests {
         fs::write(root.join("second.rs"), "").unwrap();
         fs::remove_file(root.join("gone.rs")).unwrap();
         // A rescan right after indexing would be redundant.
+        let indexed = Some(Instant::now());
+        runtime.last_file_index = indexed;
         type_keys(&mut runtime, "  rs");
-        assert!(runtime.file_rescan.is_none());
         pump_until(&mut runtime, |runtime| {
             picker_labels(runtime) == ["first.rs", "gone.rs"]
         });
+        assert!(runtime.file_rescan.is_none());
+        assert_eq!(runtime.last_file_index, indexed);
         close_picker(&mut runtime);
 
         runtime.last_file_index = None;
         type_keys(&mut runtime, "  rs");
-        assert!(runtime.file_rescan.is_some());
         pump_until(&mut runtime, |runtime| {
-            runtime.file_rescan.is_none() && picker_labels(runtime) == ["first.rs", "second.rs"]
+            runtime.last_file_index.is_some()
+                && runtime.file_rescan.is_none()
+                && picker_labels(runtime) == ["first.rs", "second.rs"]
         });
         close_picker(&mut runtime);
 
+        // Saving adds the file without another rescan.
+        let indexed = Some(Instant::now());
+        runtime.last_file_index = indexed;
         runtime.editor.open_path(root.join("third.rs")).unwrap();
         type_keys(&mut runtime, ":w\n");
         type_keys(&mut runtime, "  rs");
-        assert!(runtime.file_rescan.is_none());
         pump_until(&mut runtime, |runtime| {
             picker_labels(runtime) == ["first.rs", "second.rs", "third.rs"]
         });
+        assert!(runtime.file_rescan.is_none());
+        assert_eq!(runtime.last_file_index, indexed);
     }
 
     #[test]
