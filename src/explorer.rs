@@ -72,6 +72,22 @@ impl Explorer {
             .map(|entry| entry.path.clone())
     }
 
+    /// Whether a listing of `directory` is cached.
+    pub fn is_loaded(&self, directory: &Path) -> bool {
+        self.children.contains_key(directory)
+    }
+
+    /// Directories whose listings are cached, for external-change checks.
+    pub fn loaded_directories(&self) -> impl Iterator<Item = &Path> {
+        self.children.keys().map(PathBuf::as_path)
+    }
+
+    /// Swap in a complete fresh listing, dropping entries that disappeared.
+    pub fn replace_directory(&mut self, directory: &Path, entries: Vec<ProjectEntry>) {
+        self.children.insert(directory.to_owned(), Vec::new());
+        self.append_directory(directory, entries);
+    }
+
     /// An empty batch also records an empty (or failed) directory as loaded.
     pub fn append_directory(&mut self, directory: &Path, entries: Vec<ProjectEntry>) {
         let children = self.children.entry(directory.to_owned()).or_default();
@@ -312,6 +328,47 @@ mod tests {
             Path::new("src/z.rs")
         );
         assert!(tree.expanded.contains(&tree.root.join("src")));
+    }
+
+    #[test]
+    fn replacing_a_listing_adds_and_removes_entries_but_keeps_the_selection() {
+        let mut tree = tree();
+        append(&mut tree, "", &["src/", "old.rs", "z.rs"]);
+        tree.expand_selected(true);
+        append(&mut tree, "src", &["main.rs"]);
+        tree.move_selection(3);
+        assert_eq!(
+            tree.selected_entry().unwrap().relative_path,
+            Path::new("z.rs")
+        );
+        assert!(tree.is_loaded(&tree.root.join("src")));
+        assert!(!tree.is_loaded(&tree.root.join("missing")));
+
+        let root = tree.root.clone();
+        tree.replace_directory(
+            &root,
+            ["src", "new.rs", "z.rs"]
+                .iter()
+                .map(|name| ProjectEntry {
+                    path: root.join(name),
+                    relative_path: PathBuf::new(),
+                    kind: if *name == "src" {
+                        ProjectEntryKind::Directory
+                    } else {
+                        ProjectEntryKind::File
+                    },
+                    depth: 1,
+                })
+                .collect(),
+        );
+        assert_eq!(paths(&tree), ["src", "src/main.rs", "new.rs", "z.rs"]);
+        assert_eq!(
+            tree.selected_entry().unwrap().relative_path,
+            Path::new("z.rs")
+        );
+        let mut loaded = tree.loaded_directories().collect::<Vec<_>>();
+        loaded.sort();
+        assert_eq!(loaded, [root.as_path(), root.join("src").as_path()]);
     }
 
     #[test]

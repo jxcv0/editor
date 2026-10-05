@@ -1,13 +1,13 @@
 //! Foreground application loop and coordination of bounded background services.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     ffi::OsString,
     fs, io,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use serde_json::{Value, json};
@@ -39,7 +39,13 @@ pub struct Runtime {
     redraw: bool,
     rust_analyzer: Option<RustAnalyzerClient>,
     project_scan: Option<BackgroundTask<ProjectEntry>>,
-    explorer_scan: Option<(PathBuf, BackgroundTask<ProjectEntry>)>,
+    /// A finder rescan that keeps the current index until it completes.
+    file_rescan: Option<BackgroundTask<ProjectEntry>>,
+    last_file_index: Option<Instant>,
+    explorer_scan: Option<DirectoryListing>,
+    /// Modification times observed when each cached directory was listed.
+    listing_times: HashMap<PathBuf, Option<SystemTime>>,
+    stale_directories: BTreeSet<PathBuf>,
     reference_previews: Option<BackgroundTask<project::ReferencePreview>>,
     project_search: Option<BackgroundTask<TextSearchMatch>>,
     project_search_results: Vec<PickerItem>,
@@ -57,6 +63,14 @@ pub struct Runtime {
     background_started: bool,
     terminal: Option<TerminalProcess>,
     cargo_check: Option<CargoCheckTask>,
+}
+
+/// One directory listing in flight. A first load streams into the explorer;
+/// a refresh collects the whole listing so it can replace the cached one.
+struct DirectoryListing {
+    directory: PathBuf,
+    task: BackgroundTask<ProjectEntry>,
+    refresh: Option<Vec<ProjectEntry>>,
 }
 
 #[derive(Debug, Clone)]
@@ -131,7 +145,11 @@ impl Runtime {
             redraw: true,
             rust_analyzer,
             project_scan: None,
+            file_rescan: None,
+            last_file_index: None,
             explorer_scan: None,
+            listing_times: HashMap::new(),
+            stale_directories: BTreeSet::new(),
             reference_previews: None,
             project_search: None,
             project_search_results: Vec::new(),
@@ -233,6 +251,7 @@ impl Runtime {
         self.discard_stale_diagnostics();
         self.update_project_search();
         self.drain_project_scan();
+        self.drain_file_rescan();
         self.drain_explorer_scan();
         self.drain_project_search();
         self.redraw |= self.editor.poll_file_finder();
@@ -249,6 +268,7 @@ impl Runtime {
         if idle && self.last_disk_check.elapsed() >= Duration::from_secs(2) {
             self.last_disk_check = Instant::now();
             self.reload_clean_external_changes();
+            self.find_changed_directories();
         }
     }
 
@@ -256,7 +276,10 @@ impl Runtime {
         if let Some(task) = self.project_scan.take() {
             task.cancel();
         }
+        self.file_rescan = None;
         self.explorer_scan = None;
+        self.listing_times.clear();
+        self.stale_directories.clear();
         self.editor.explorer.reset();
         self.editor.set_project_files(Vec::new());
         let options = project::ScanOptions {
@@ -269,42 +292,162 @@ impl Runtime {
     }
 
     fn drain_explorer_scan(&mut self) {
-        if let Some((directory, task)) = &self.explorer_scan {
-            let events = task.drain(256);
+        if let Some(listing) = &mut self.explorer_scan {
+            let events = listing.task.drain(256);
             self.redraw |= !events.is_empty();
             let mut entries = Vec::new();
             let mut finished = false;
             for event in events {
                 match event {
                     StreamEvent::Item(entry) => entries.push(entry),
-                    StreamEvent::Error(error) => {
+                    // A refreshed directory may have been removed meanwhile;
+                    // its parent's refresh drops the row.
+                    StreamEvent::Error(error) if listing.refresh.is_none() => {
                         self.editor.message(format!("Explorer: {}", error.message))
                     }
+                    StreamEvent::Error(_) => {}
                     StreamEvent::Finished(_) => finished = true,
                 }
             }
-            if !entries.is_empty() {
-                self.editor.explorer.append_directory(directory, entries);
+            match &mut listing.refresh {
+                Some(collected) => collected.extend(entries),
+                None if !entries.is_empty() => self
+                    .editor
+                    .explorer
+                    .append_directory(&listing.directory, entries),
+                None => {}
             }
-            if finished {
-                self.explorer_scan = None;
+            if finished && let Some(listing) = self.explorer_scan.take() {
+                self.finish_directory_refresh(listing);
             }
         }
         // One directory worker at a time bounds both threads and foreground
         // draining, including when many expanded paths are restored at once.
-        if self.explorer_scan.is_none()
-            && let Some(directory) = self.editor.explorer.next_directory_to_load()
-        {
-            let options = project::ScanOptions {
-                include_hidden: self.editor.explorer.show_hidden,
-                include_ignored: self.editor.explorer.show_ignored,
-                ..project::ScanOptions::default()
-            };
-            let task = project::scan_directory(&directory, options);
+        // First loads of expanded directories go before refreshes.
+        if self.explorer_scan.is_some() {
+            return;
+        }
+        let (directory, refresh) = match self.editor.explorer.next_directory_to_load() {
+            Some(directory) => (directory, None),
+            None => match self.stale_directories.pop_first() {
+                Some(directory) => (directory, Some(Vec::new())),
+                None => return,
+            },
+        };
+        // Record the time before listing, so a change during the listing is
+        // seen by the next check.
+        self.listing_times
+            .insert(directory.clone(), directory_modified(&directory));
+        let options = project::ScanOptions {
+            include_hidden: self.editor.explorer.show_hidden,
+            include_ignored: self.editor.explorer.show_ignored,
+            ..project::ScanOptions::default()
+        };
+        let task = project::scan_directory(&directory, options);
+        if refresh.is_none() {
             self.editor
                 .explorer
                 .append_directory(&directory, Vec::new());
-            self.explorer_scan = Some((directory, task));
+        }
+        self.explorer_scan = Some(DirectoryListing {
+            directory,
+            task,
+            refresh,
+        });
+    }
+
+    /// Apply a complete refreshed listing to the explorer, when it still caches
+    /// that directory, and add its files to the finder index.
+    fn finish_directory_refresh(&mut self, listing: DirectoryListing) {
+        let Some(entries) = listing.refresh else {
+            return;
+        };
+        let files = entries
+            .iter()
+            .filter(|entry| entry.is_file())
+            .map(|entry| entry.path.clone())
+            .collect();
+        if self.editor.explorer.is_loaded(&listing.directory) {
+            self.editor
+                .explorer
+                .replace_directory(&listing.directory, entries);
+        } else {
+            self.listing_times.remove(&listing.directory);
+        }
+        self.editor.append_project_files(files);
+        self.redraw = true;
+    }
+
+    /// Queue cached explorer directories whose modification time changed,
+    /// which covers files created, removed, or renamed outside the editor.
+    fn find_changed_directories(&mut self) {
+        self.listing_times
+            .retain(|directory, _| self.editor.explorer.is_loaded(directory));
+        for (directory, listed) in &self.listing_times {
+            if directory_modified(directory) != *listed {
+                self.stale_directories.insert(directory.clone());
+            }
+        }
+    }
+
+    /// List a saved file's directory so a new file reaches the explorer and
+    /// the finder immediately.
+    fn refresh_saved_file_directory(&mut self, path: &Path) {
+        if let Some(directory) = path.parent()
+            && directory.starts_with(&self.editor.explorer.root)
+        {
+            self.stale_directories.insert(directory.to_owned());
+        }
+    }
+
+    /// Rescan the project for the file finder. The current index stays
+    /// usable, and files the rescan does not find are removed when it ends.
+    fn rescan_project_files(&mut self) {
+        let indexing = self
+            .project_scan
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+            || self.file_rescan.is_some();
+        let recent = self
+            .last_file_index
+            .is_some_and(|indexed| indexed.elapsed() < Duration::from_secs(2));
+        if indexing || recent {
+            return;
+        }
+        self.editor.begin_project_file_rescan();
+        let options = project::ScanOptions {
+            include_hidden: self.editor.explorer.show_hidden,
+            include_ignored: self.editor.explorer.show_ignored,
+            max_results: Some(self.editor.config.limits.search_results.saturating_mul(50)),
+            ..project::ScanOptions::default()
+        };
+        self.file_rescan = Some(project::scan_project(&self.editor.explorer.root, options));
+    }
+
+    fn drain_file_rescan(&mut self) {
+        let Some(task) = &self.file_rescan else {
+            return;
+        };
+        let mut files = Vec::new();
+        let mut summary = None;
+        for event in task.drain(256) {
+            match event {
+                StreamEvent::Item(entry) if entry.is_file() => files.push(entry.path),
+                StreamEvent::Finished(finished) => summary = Some(finished),
+                _ => {}
+            }
+        }
+        if !files.is_empty() {
+            self.redraw = true;
+            self.editor.append_project_files(files);
+        }
+        if let Some(summary) = summary {
+            self.file_rescan = None;
+            self.last_file_index = Some(Instant::now());
+            // A truncated walk did not see every indexed file.
+            if !summary.truncated {
+                self.editor.finish_project_file_rescan();
+            }
         }
     }
 
@@ -329,6 +472,7 @@ impl Runtime {
                 StreamEvent::Finished(summary) => {
                     self.editor
                         .message(format!("Indexed {} project files", summary.files_scanned));
+                    self.last_file_index = Some(Instant::now());
                     changed = true;
                 }
                 _ => {}
@@ -416,8 +560,10 @@ impl Runtime {
         match self.editor.take_request() {
             EditorRequest::None => {}
             EditorRequest::RefreshProject => self.restart_scan(),
+            EditorRequest::RescanProjectFiles => self.rescan_project_files(),
             EditorRequest::DocumentSaved(path) => {
                 self.notify_lsp_document_saved(&path);
+                self.refresh_saved_file_directory(&path);
                 if self.editor.check.visible && check::is_cargo_input(&path) {
                     self.start_cargo_check();
                 }
@@ -1559,6 +1705,12 @@ fn clamp_panes_for_buffer(editor: &mut Editor, buffer_index: usize) {
     }
 }
 
+fn directory_modified(directory: &Path) -> Option<SystemTime> {
+    fs::metadata(directory)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
 fn ra_state_label(state: RustAnalyzerState) -> &'static str {
     match state {
         RustAnalyzerState::Stopped => "stopped",
@@ -2438,6 +2590,128 @@ mod tests {
                 .unwrap()
                 .starts_with("cargo check failed: could not start")
         );
+    }
+
+    fn explorer_paths(runtime: &Runtime) -> Vec<String> {
+        runtime
+            .editor
+            .explorer
+            .rows()
+            .iter()
+            .map(|entry| entry.relative_path.display().to_string())
+            .collect()
+    }
+
+    fn pump_until(runtime: &mut Runtime, done: impl Fn(&mut Runtime) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done(runtime) {
+            assert!(Instant::now() < deadline, "condition was not reached");
+            thread::sleep(Duration::from_millis(1));
+            runtime.pump(false);
+        }
+    }
+
+    #[test]
+    fn explorer_shows_saved_and_externally_created_files_and_drops_removed_ones() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(root.join("old.rs"), "").unwrap();
+        let mut runtime = local_runtime(&root);
+        runtime.editor.explorer.open = true;
+        pump_until(&mut runtime, |runtime| {
+            explorer_paths(runtime) == ["src", "old.rs"] && runtime.explorer_scan.is_none()
+        });
+
+        // Saving a new buffer lists its directory without waiting for a check.
+        runtime.editor.open_path(root.join("saved.rs")).unwrap();
+        type_keys(&mut runtime, ":w\n");
+        pump_until(&mut runtime, |runtime| {
+            explorer_paths(runtime) == ["src", "old.rs", "saved.rs"]
+        });
+
+        // Files created or removed elsewhere, such as in the terminal, are
+        // found by comparing directory modification times.
+        thread::sleep(Duration::from_millis(20));
+        fs::write(root.join("external.rs"), "").unwrap();
+        fs::remove_file(root.join("old.rs")).unwrap();
+        runtime.find_changed_directories();
+        pump_until(&mut runtime, |runtime| {
+            explorer_paths(runtime) == ["src", "external.rs", "saved.rs"]
+        });
+
+        // Unchanged directories are not listed again.
+        runtime.find_changed_directories();
+        assert!(runtime.stale_directories.is_empty());
+
+        // A directory removed while cached disappears from its parent.
+        runtime.editor.explorer.selected = 0;
+        runtime.editor.focus = crate::editor::Focus::Explorer;
+        runtime.editor.handle_key(crate::input::Key::char('l'));
+        pump_until(&mut runtime, |runtime| {
+            explorer_paths(runtime).contains(&"src/main.rs".to_string())
+        });
+        thread::sleep(Duration::from_millis(20));
+        fs::remove_dir_all(root.join("src")).unwrap();
+        runtime.find_changed_directories();
+        pump_until(&mut runtime, |runtime| {
+            explorer_paths(runtime) == ["external.rs", "saved.rs"]
+        });
+    }
+
+    #[test]
+    fn file_finder_rescans_when_opened_and_includes_saved_files() {
+        fn picker_labels(runtime: &Runtime) -> Vec<String> {
+            let mut labels = runtime
+                .editor
+                .picker
+                .iter()
+                .flat_map(|picker| picker.items.iter().map(|item| item.label.clone()))
+                .collect::<Vec<_>>();
+            labels.sort();
+            labels
+        }
+        fn close_picker(runtime: &mut Runtime) {
+            runtime
+                .editor
+                .handle_key(crate::input::Key::plain(crate::input::KeyCode::Esc));
+            runtime.pump(false);
+        }
+
+        let directory = tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        fs::write(root.join("first.rs"), "").unwrap();
+        fs::write(root.join("gone.rs"), "").unwrap();
+        let mut runtime = local_runtime(&root);
+        runtime.restart_scan();
+        pump_until(&mut runtime, |runtime| runtime.last_file_index.is_some());
+
+        fs::write(root.join("second.rs"), "").unwrap();
+        fs::remove_file(root.join("gone.rs")).unwrap();
+        // A rescan right after indexing would be redundant.
+        type_keys(&mut runtime, "  rs");
+        assert!(runtime.file_rescan.is_none());
+        pump_until(&mut runtime, |runtime| {
+            picker_labels(runtime) == ["first.rs", "gone.rs"]
+        });
+        close_picker(&mut runtime);
+
+        runtime.last_file_index = None;
+        type_keys(&mut runtime, "  rs");
+        assert!(runtime.file_rescan.is_some());
+        pump_until(&mut runtime, |runtime| {
+            runtime.file_rescan.is_none() && picker_labels(runtime) == ["first.rs", "second.rs"]
+        });
+        close_picker(&mut runtime);
+
+        runtime.editor.open_path(root.join("third.rs")).unwrap();
+        type_keys(&mut runtime, ":w\n");
+        type_keys(&mut runtime, "  rs");
+        assert!(runtime.file_rescan.is_none());
+        pump_until(&mut runtime, |runtime| {
+            picker_labels(runtime) == ["first.rs", "second.rs", "third.rs"]
+        });
     }
 
     #[test]

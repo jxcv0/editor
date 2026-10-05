@@ -15,7 +15,7 @@ mutate editor text directly.
 | `app` | Foreground event loop, rendering cadence, terminal-process polling, background scan/search polling, LSP dispatch, diagnostics, clean-file reloads, journaling, session I/O, and health output | Owns process/integration handles and is the only layer that converts `EditorRequest` values or worker events into UI/core actions. Worker drains are bounded. Periodic clean-file checks use synchronous metadata only when unchanged, but changed files are still reread on the foreground thread; config reload is synchronous too. |
 | `buffer` | UTF-8 text storage, grapheme positions, byte and UTF-16 conversion, edit transactions, branching undo/redo, loading, conflict detection, and atomic saving | Owns text and disk identity. It has no terminal, project-search, or tool-process knowledge. The current representation is line-based strings, not a rope/piece table, so the largest size/performance goals still need measurement and likely further work. |
 | `editor` | Modal state machine, panes/layout, per-pane cursor/viewport, buffers, registers/macros, selection, prompts, picker/explorer state, diagnostics, and typed integration requests | Consumes terminal-neutral `Key` values and mutates `Buffer`s. It emits `EditorRequest` values rather than launching tools. Vim compatibility is intentionally bounded; see [COMMANDS.md](COMMANDS.md). |
-| `explorer` | Cached directory listings, visible tree rows, expansion, selection, and active-file reveal | Performs no filesystem I/O. `app` supplies bounded batches from one lazy directory scan at a time; the file finder retains its independent recursive index. |
+| `explorer` | Cached directory listings, visible tree rows, expansion, selection, and active-file reveal | Performs no filesystem I/O. `app` supplies bounded batches from one lazy directory scan at a time, and replaces a cached listing with a complete fresh one after a save in that directory or a change of its modification time; the file finder retains its independent recursive index. |
 | `input` | Small terminal-neutral key vocabulary | Keeps Crossterm types out of the editor state machine and leaves room for another frontend. |
 | `ui` | Crossterm terminal lifecycle, input translation, cell canvas, Unicode display width, and changed-cell rendering | The only terminal-specific module. Its RAII guard restores raw mode, cursor, bracketed paste, and alternate screen on ordinary drop; a panic hook performs emergency restoration. Suspend/resume behavior and deterministic full-frame snapshots are not yet complete. |
 | `command` | Declarative typed command IDs and built-in leader hierarchy | Shared vocabulary for editor and `rust-analyzer` actions. The registry describes commands; context availability and actual execution remain the orchestrator/editor's responsibility. |
@@ -61,8 +61,9 @@ are checked against their originating active path/version, and versioned stale
 diagnostics are discarded; cancellation and staleness handling for the rest of
 the response UI remain incomplete. Workers do not hold the interactive path
 waiting on I/O. The current foreground config reload and two-second clean-file
-metadata polling are exceptions to the broader nonblocking-I/O goal; a detected
-change also causes a foreground reread. These paths still need to move or be
+and listed-directory metadata polling are exceptions to the broader
+nonblocking-I/O goal; a detected file change also causes a foreground reread,
+while a changed directory is listed again on a background worker. These paths still need to move or be
 measured.
 
 ## Core invariants
@@ -93,7 +94,9 @@ measured.
   query cancels stale work. The file-finder worker owns normalized relative
   paths and reuses matching scratch storage; only current query/index results
   reach the picker. Scan batches append to the index instead of republishing
-  the entire growing project. Regex compilation also runs in the search worker.
+  the entire growing project, and repeated paths are ignored. A rescan marks
+  the paths it sees and sweeps the rest only after a complete walk, so the
+  index stays searchable while it refreshes. Regex compilation also runs in the search worker.
 - Persisted state and recovery formats are versioned. Session data contains
   paths/layout metadata, never buffer contents; recovery records hold dirty
   text separately.
@@ -158,8 +161,8 @@ method. The following areas require continued integration and verification:
 - safe UI flows for external file changes and dirty-buffer conflicts;
 - complete completion/signature/snippet, navigation, rename, code-action,
   formatting, diagnostics, and inlay-hint UX above the generic LSP transport;
-- explorer mutation/confirmation flows and automatic
-  external-filesystem refresh;
+- explorer mutation/confirmation flows, and external-filesystem refresh
+  without polling;
 - system clipboard providers and persistent undo;
 - large-file degradation policy up to the stated limits;
 - config reload/provenance and health-report completeness;

@@ -306,6 +306,8 @@ pub enum EditorRequest {
     DocumentSaved(PathBuf),
     TerminalToggle(bool),
     TerminalInput(Vec<u8>),
+    /// Rescan project files for the file finder without clearing its index.
+    RescanProjectFiles,
     CargoCheck,
     RustAnalyzer(CommandId),
     RustAnalyzerWithArgument(CommandId, String),
@@ -493,6 +495,19 @@ impl Editor {
             .is_some_and(|p| p.kind == PickerKind::Files)
         {
             self.refresh_picker();
+        }
+    }
+
+    /// Start a rescan whose completion drops files it did not see again.
+    pub fn begin_project_file_rescan(&mut self) {
+        if let Some(finder) = &self.file_finder {
+            finder.begin_sweep();
+        }
+    }
+
+    pub fn finish_project_file_rescan(&mut self) {
+        if let Some(finder) = &self.file_finder {
+            finder.sweep();
         }
     }
 
@@ -3693,6 +3708,9 @@ impl Editor {
             return_mode,
             current_buffer_diagnostics: false,
         });
+        if kind == PickerKind::Files {
+            self.request = EditorRequest::RescanProjectFiles;
+        }
         self.refresh_picker();
     }
 

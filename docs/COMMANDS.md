@@ -288,7 +288,12 @@ Type to refine a picker, use Up/Down or `<C-p>`/`<C-n>` to move, `Enter` to
 open, `<C-v>` to open in a vertical split, `<C-s>` to open in a horizontal
 split, and `Esc` to close. File results are fuzzy-ranked; buffer, recent,
 message, diagnostic, symbol, and reference lists use fuzzy filtering in their
-existing order. Project grep is a separate cancellable asynchronous regex operation
+existing order. The file finder starts from the startup index; opening it
+rescans the project in the background, at most once every two seconds, keeping
+the current results searchable, adding new files as they are found, and
+removing files that no longer exist once the rescan completes. Saved files and
+re-listed explorer directories are added to the index immediately. Project grep
+is a separate cancellable asynchronous regex operation
 rather than a shell call to `ripgrep`. Reference results show source-code
 excerpts beneath their locations. Disk previews are limited to 8 MiB per file
 and excerpts to the first 16 KiB of a line; unavailable previews retain the
@@ -315,8 +320,12 @@ When the explorer has focus:
 Opening or focusing the explorer reveals the active file by expanding its
 ancestors. Expanded directories are remembered in project sessions. Creation,
 renaming, and deletion are not performed from the explorer; deletion reports
-that explicit filesystem confirmation is unavailable. External filesystem
-changes do not automatically refresh the tree.
+that explicit filesystem confirmation is unavailable. Saving a file re-lists
+its directory immediately, so a new file appears at once. Every two seconds
+while idle, each listed directory's modification time is compared with the
+one recorded when it was listed; changed directories are listed again in the
+background, which shows files created, renamed, or removed elsewhere (for
+example in the integrated terminal).
 
 ## Ex commands
 

@@ -5,7 +5,7 @@
 //! the terminal event loop cannot accidentally wait on a slow filesystem.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::ops::Range;
@@ -917,10 +917,19 @@ pub struct FileFinderResult {
     pub files: Vec<RankedFile>,
 }
 
+/// Index changes apply in order. A sweep removes every path that was not
+/// appended since the latest `BeginSweep`, so a background rescan can refresh
+/// the index without emptying it first.
+enum IndexChange {
+    Reset(PathBuf),
+    Append(Vec<PathBuf>),
+    BeginSweep,
+    Sweep,
+}
+
 #[derive(Default)]
 struct FinderInbox {
-    root: Option<PathBuf>,
-    paths: Vec<PathBuf>,
+    changes: Vec<IndexChange>,
     query: Option<Option<(String, usize)>>,
 }
 
@@ -951,7 +960,9 @@ impl FileFinder {
             .name("project-file-rank".into())
             .spawn(move || {
                 let mut root = root;
-                let mut candidates = Vec::new();
+                let mut candidates: Vec<PathCandidate> = Vec::new();
+                let mut positions: HashMap<PathBuf, usize> = HashMap::new();
+                let mut mark = 0_u64;
                 let mut query = None;
                 let mut scratch = ScoreScratch::default();
                 while wake_rx.recv().is_ok() {
@@ -963,15 +974,39 @@ impl FileFinder {
                         let generation = worker_generation.load(AtomicOrdering::Acquire);
                         (std::mem::take(&mut *inbox), generation)
                     };
-                    if let Some(new_root) = updates.root {
-                        root = new_root;
-                        candidates.clear();
-                    }
-                    for path in updates.paths {
-                        if worker_closing.load(AtomicOrdering::Acquire) {
-                            return;
+                    for change in updates.changes {
+                        match change {
+                            IndexChange::Reset(new_root) => {
+                                root = new_root;
+                                candidates.clear();
+                                positions.clear();
+                            }
+                            IndexChange::Append(paths) => {
+                                for path in paths {
+                                    if worker_closing.load(AtomicOrdering::Acquire) {
+                                        return;
+                                    }
+                                    // Rescans and saved files repeat known paths.
+                                    if let Some(&position) = positions.get(&path) {
+                                        candidates[position].mark = mark;
+                                        continue;
+                                    }
+                                    positions.insert(path.clone(), candidates.len());
+                                    let mut candidate = PathCandidate::new(path, &root);
+                                    candidate.mark = mark;
+                                    candidates.push(candidate);
+                                }
+                            }
+                            IndexChange::BeginSweep => mark += 1,
+                            IndexChange::Sweep => {
+                                candidates.retain(|candidate| candidate.mark == mark);
+                                positions = candidates
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(position, candidate)| (candidate.path.clone(), position))
+                                    .collect();
+                            }
                         }
-                        candidates.push(PathCandidate::new(path, &root));
                     }
                     if let Some(new_query) = updates.query {
                         query = new_query;
@@ -1016,15 +1051,29 @@ impl FileFinder {
 
     pub fn reset(&self, root: PathBuf) {
         self.update(|inbox| {
-            inbox.root = Some(root);
-            inbox.paths.clear();
+            inbox.changes.clear();
+            inbox.changes.push(IndexChange::Reset(root));
         });
     }
 
+    /// Add paths to the index. Paths already indexed are not duplicated.
     pub fn append(&self, paths: Vec<PathBuf>) {
         if !paths.is_empty() {
-            self.update(|inbox| inbox.paths.extend(paths));
+            self.update(|inbox| match inbox.changes.last_mut() {
+                Some(IndexChange::Append(pending)) => pending.extend(paths),
+                _ => inbox.changes.push(IndexChange::Append(paths)),
+            });
         }
+    }
+
+    /// Start a rescan: [`Self::sweep`] later removes every indexed path that
+    /// was not appended again in between.
+    pub fn begin_sweep(&self) {
+        self.update(|inbox| inbox.changes.push(IndexChange::BeginSweep));
+    }
+
+    pub fn sweep(&self) {
+        self.update(|inbox| inbox.changes.push(IndexChange::Sweep));
     }
 
     pub fn request(&self, query: String, limit: usize) {
@@ -1064,6 +1113,8 @@ impl Drop for FileFinder {
 }
 
 struct PathCandidate {
+    /// Sweep generation in which the path was last seen.
+    mark: u64,
     path: PathBuf,
     relative_path: PathBuf,
     characters: Vec<(usize, char)>,
@@ -1083,6 +1134,7 @@ impl PathCandidate {
         let folded = text.to_lowercase();
         let folded_basename = candidate_basename(&characters).to_lowercase();
         Self {
+            mark: 0,
             path,
             relative_path,
             characters,
@@ -1961,6 +2013,51 @@ mod tests {
         let result = current_finder_result(&finder);
         assert_eq!(result.files.len(), 1);
         assert_eq!(result.files[0].relative_path, Path::new("newer.rs"));
+    }
+
+    #[test]
+    fn finder_ignores_repeated_paths_and_sweeps_paths_a_rescan_missed() {
+        let finder = FileFinder::new(PathBuf::from("/project"));
+        let names = |result: FileFinderResult| {
+            let mut names = result
+                .files
+                .iter()
+                .map(|file| file.relative_path.display().to_string())
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        finder.append(vec![
+            PathBuf::from("/project/kept.rs"),
+            PathBuf::from("/project/removed.rs"),
+        ]);
+        finder.append(vec![PathBuf::from("/project/kept.rs")]);
+        finder.request("rs".into(), 10);
+        assert_eq!(
+            names(current_finder_result(&finder)),
+            ["kept.rs", "removed.rs"]
+        );
+
+        finder.begin_sweep();
+        finder.append(vec![
+            PathBuf::from("/project/kept.rs"),
+            PathBuf::from("/project/added.rs"),
+        ]);
+        // The previous index stays searchable until the rescan completes.
+        assert_eq!(
+            names(current_finder_result(&finder)),
+            ["added.rs", "kept.rs", "removed.rs"]
+        );
+        finder.sweep();
+        assert_eq!(
+            names(current_finder_result(&finder)),
+            ["added.rs", "kept.rs"]
+        );
+        finder.append(vec![PathBuf::from("/project/removed.rs")]);
+        assert_eq!(
+            names(current_finder_result(&finder)),
+            ["added.rs", "kept.rs", "removed.rs"]
+        );
     }
 
     #[test]
