@@ -113,7 +113,7 @@ keys are also handled:
 | `Tab` | Insert `editor.tab_width` spaces, or one tab when `insert_spaces = false`. |
 | `Backspace`, `Delete` | Delete one grapheme backward/forward. |
 | Arrow keys, `Home`, `End` | Move without leaving Insert mode. |
-| `<C-Space>` | Request completion from ready `rust-analyzer` and open a result picker. |
+| `<C-Space>` | Request completion from ready `rust-analyzer` and open a result picker. Most terminals send `` Ctrl-` `` as this same key, so it does not toggle the terminal in Insert mode. |
 | `<C-n>`, `<C-p>` | Select the next/previous item while the completion picker is open. |
 | `Enter`, `Esc` | Accept the selected completion, or dismiss the picker and return to Insert mode. |
 
@@ -240,14 +240,22 @@ status.
 
 ### Integrated terminal
 
-The first `<Space>t` starts `$SHELL` in the project root through a PTY. Hiding
-and reopening the panel preserves that shell and its screen. Terminal-focused
-keys and paste are sent to the PTY. `Ctrl-\` returns focus to the editor without
-hiding the panel; `Ctrl-w j` focuses it again. From editor focus, `<Space>t`
-hides the panel. `Shift-PageUp` and `Shift-PageDown` move through bounded
-scrollback by a page, while `Shift-Home` and `Shift-End` jump to its top and
-bottom. Mouse reporting, terminal text selection, and clipboard integration
-are not yet implemented.
+The first `<Space>t` or `` Ctrl-` `` starts `$SHELL` in the project root through
+a PTY. Hiding and reopening the panel preserves that shell and its screen.
+Terminal-focused keys and paste are sent to the PTY. `` Ctrl-` `` toggles the
+panel from editor, explorer, picker, prompt, and terminal focus, leaving any
+pending Visual, Leader, operator, prompt, or picker state first. `Ctrl-\`
+returns focus to the editor without hiding the panel; `Ctrl-w j` focuses it
+again. From editor focus, `<Space>t` also hides the panel. `Shift-PageUp` and
+`Shift-PageDown` move through bounded scrollback by a page, while `Shift-Home`
+and `Shift-End` jump to its top and bottom. Mouse reporting, terminal text
+selection, and clipboard integration are not yet implemented.
+
+Without an enhanced keyboard protocol, terminals encode `` Ctrl-` `` as NUL, the
+same byte as `Ctrl-Space` and `Ctrl-@`, so those keys toggle the panel too and
+are not forwarded to the shell. In Insert mode that byte keeps its
+`<C-Space>` completion meaning; a distinctly reported `` Ctrl-` `` still leaves
+Insert mode and toggles the terminal.
 
 ### Pickers
 

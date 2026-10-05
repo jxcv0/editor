@@ -862,6 +862,10 @@ impl Editor {
     }
 
     pub fn handle_key(&mut self, key: Key) {
+        if self.is_terminal_toggle_key(key) {
+            self.toggle_terminal_from_shortcut();
+            return;
+        }
         if self.focus == Focus::Terminal {
             self.handle_terminal_key(key);
             return;
@@ -909,13 +913,47 @@ impl Editor {
         }
     }
 
+    /// Ctrl-backtick toggles the terminal from any focus. Without an enhanced
+    /// keyboard protocol, terminals encode it as NUL, the same byte as
+    /// Ctrl-Space, which Crossterm reports as Ctrl-Space. Insert mode keeps
+    /// that ambiguous key for manual completion.
+    fn is_terminal_toggle_key(&self, key: Key) -> bool {
+        if key == Key::ctrl('`') {
+            return true;
+        }
+        if key != Key::ctrl(' ') {
+            return false;
+        }
+        let mode = self
+            .picker
+            .as_ref()
+            .map_or(&self.mode, |picker| &picker.return_mode);
+        self.focus != Focus::Editor || !matches!(mode, Mode::Insert)
+    }
+
+    fn toggle_terminal_from_shortcut(&mut self) {
+        if self.focus != Focus::Terminal {
+            if let Some(picker) = self.picker.take() {
+                self.mode = picker.return_mode;
+            }
+            match self.mode {
+                Mode::Insert => self.leave_insert(),
+                Mode::Visual(_) => self.leave_visual(),
+                Mode::Command | Mode::Search { .. } => self.prompt.clear(),
+                _ => {}
+            }
+            self.cancel_pending();
+        }
+        self.execute_command(CommandId::TerminalToggle);
+    }
+
     fn handle_terminal_key(&mut self, key: Key) {
         // Legacy terminal input represents Ctrl-\\ as byte 0x1c. Crossterm
         // decodes that byte as Ctrl-4 unless an enhanced keyboard protocol is
         // active, where it can preserve the physical backslash key.
         if key == Key::ctrl('\\') || key == Key::ctrl('4') {
             self.focus = Focus::Editor;
-            self.message("Terminal unfocused; <Space>t hides it");
+            self.message("Terminal unfocused; <C-`> or <Space>t hides it");
             return;
         }
         if key.modifiers.contains(Modifiers::SHIFT) {
@@ -4047,6 +4085,78 @@ mod tests {
             editor.take_request(),
             EditorRequest::TerminalToggle(false)
         ));
+    }
+
+    #[test]
+    fn ctrl_backtick_toggles_the_terminal_from_editor_and_terminal_focus() {
+        let mut editor = editor("safe");
+        editor.handle_key(Key::ctrl('`'));
+        assert!(editor.terminal.visible);
+        assert_eq!(editor.focus, Focus::Terminal);
+        assert!(matches!(
+            editor.take_request(),
+            EditorRequest::TerminalToggle(true)
+        ));
+
+        // Legacy terminals send Ctrl-` as NUL, which Crossterm reports as
+        // Ctrl-Space; it must hide the panel rather than reach the shell.
+        editor.handle_key(Key::ctrl(' '));
+        assert!(!editor.terminal.visible);
+        assert_eq!(editor.focus, Focus::Editor);
+        assert!(matches!(
+            editor.take_request(),
+            EditorRequest::TerminalToggle(false)
+        ));
+        assert_eq!(editor.mode, Mode::Normal);
+        assert_eq!(editor.active_buffer().text(), "safe");
+    }
+
+    #[test]
+    fn terminal_shortcut_leaves_pending_modes_before_opening() {
+        let mut editor = editor("safe");
+        keys(&mut editor, "vl");
+        editor.handle_key(Key::ctrl(' '));
+        assert_eq!(editor.mode, Mode::Normal);
+        assert!(editor.visual_range().is_none());
+        assert_eq!(editor.focus, Focus::Terminal);
+        editor.handle_key(Key::ctrl(' '));
+        assert_eq!(editor.focus, Focus::Editor);
+
+        keys(&mut editor, " ");
+        assert_eq!(editor.mode, Mode::Leader);
+        editor.handle_key(Key::ctrl(' '));
+        assert_eq!(editor.mode, Mode::Normal);
+        assert!(editor.terminal.visible);
+        assert!(editor.picker.is_none());
+        editor.handle_key(Key::ctrl('`'));
+
+        keys(&mut editor, ":wq");
+        editor.handle_key(Key::ctrl('`'));
+        assert_eq!(editor.mode, Mode::Normal);
+        assert!(editor.prompt.is_empty());
+        assert_eq!(editor.focus, Focus::Terminal);
+    }
+
+    #[test]
+    fn insert_mode_keeps_ctrl_space_for_completion_but_honors_ctrl_backtick() {
+        let mut editor = editor("");
+        keys(&mut editor, "iab");
+        editor.handle_key(Key::ctrl(' '));
+        assert!(!editor.terminal.visible);
+        assert_eq!(editor.mode, Mode::Insert);
+        assert!(matches!(
+            editor.take_request(),
+            EditorRequest::RustAnalyzer(CommandId::Completion)
+        ));
+
+        editor.handle_key(Key::ctrl('`'));
+        assert!(editor.terminal.visible);
+        assert_eq!(editor.mode, Mode::Normal);
+        assert_eq!(editor.focus, Focus::Terminal);
+        assert_eq!(editor.active_buffer().text(), "ab");
+        editor.focus = Focus::Editor;
+        keys(&mut editor, "u");
+        assert_eq!(editor.active_buffer().text(), "");
     }
 
     #[test]

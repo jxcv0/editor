@@ -87,7 +87,7 @@ The editor starts in Normal mode. A minimal first session is:
   `:wq` to save and close that pane; `:bd` to delete a buffer; `:qa` to quit all.
 - `<Space>` for the keyboard-driven command menu; `<Space><Space>` finds files
   and `<Space>e` toggles the explorer.
-- `<Space>t` to open or hide the integrated terminal.
+- `` Ctrl-` `` or `<Space>t` to open or hide the integrated terminal.
 
 The exact supported grammar, leader bindings, Ex commands, picker controls,
 and intentional Vim deviations are documented in
@@ -204,13 +204,19 @@ changes require restarting the editor.
 
 ## Integrated terminal
 
-`<Space>t` toggles a bottom terminal panel and starts `$SHELL` in the project
-root the first time it is opened. `:terminal` and `:term` are aliases. The PTY
-session keeps running while the panel is hidden. While the terminal has focus,
-keys and bracketed paste go directly to the shell; press `Ctrl-\` to return to
-the editor, `Ctrl-w j` to focus a visible terminal again, and `<Space>t` to hide
-it. `Shift-PageUp`/`Shift-PageDown` scroll by one page and `Shift-Home`/`Shift-End`
+`` Ctrl-` `` or `<Space>t` toggles a bottom terminal panel and starts `$SHELL` in
+the project root the first time it is opened. `:terminal` and `:term` are
+aliases. The PTY session keeps running while the panel is hidden. While the
+terminal has focus, keys and bracketed paste go directly to the shell, except
+`` Ctrl-` ``, which hides the panel; press `Ctrl-\` to return to the editor
+without hiding it and `Ctrl-w j` to focus a visible terminal again.
+`Shift-PageUp`/`Shift-PageDown` scroll by one page and `Shift-Home`/`Shift-End`
 jump to the top/bottom of the bounded scrollback.
+
+Most terminals send `` Ctrl-` `` as the same NUL byte as `Ctrl-Space`, so either
+key toggles the panel, and the shell no longer receives `Ctrl-Space`. Insert
+mode is the exception: there `Ctrl-Space` still requests completion, so leave
+Insert mode before using `` Ctrl-` `` unless your terminal reports it distinctly.
 
 The terminal supports ANSI/256/RGB colors, interactive cursor movement, PTY
 resizing, and bounded device/cursor/color capability replies used by modern
