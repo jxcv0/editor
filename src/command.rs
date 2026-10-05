@@ -35,20 +35,12 @@ pub enum CommandId {
     SplitRight,
     ClosePane,
     OnlyPane,
-    CodexToggle,
-    CodexStatus,
-    CodexRestart,
-    CodexRunOnce,
-    CodexLogs,
-    CodexDryRun,
-    CodexWorkspaceWrite,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandSource {
     Editor,
     RustAnalyzer,
-    CodexWatch,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -250,55 +242,6 @@ pub const COMMANDS: &[Command] = &[
         description: "Split right",
         source: CommandSource::Editor,
     },
-    Command {
-        id: CommandId::CodexToggle,
-        name: "codex.toggle",
-        sequence: "at",
-        description: "Start / stop",
-        source: CommandSource::CodexWatch,
-    },
-    Command {
-        id: CommandId::CodexStatus,
-        name: "codex.status",
-        sequence: "as",
-        description: "Show status",
-        source: CommandSource::CodexWatch,
-    },
-    Command {
-        id: CommandId::CodexRestart,
-        name: "codex.restart",
-        sequence: "ar",
-        description: "Restart",
-        source: CommandSource::CodexWatch,
-    },
-    Command {
-        id: CommandId::CodexRunOnce,
-        name: "codex.run_once",
-        sequence: "ao",
-        description: "Run once",
-        source: CommandSource::CodexWatch,
-    },
-    Command {
-        id: CommandId::CodexLogs,
-        name: "codex.logs",
-        sequence: "al",
-        description: "Show logs",
-        source: CommandSource::CodexWatch,
-    },
-    Command {
-        id: CommandId::CodexDryRun,
-        name: "codex.dry_run",
-        sequence: "ad",
-        description: "Use dry-run mode",
-        source: CommandSource::CodexWatch,
-    },
-    Command {
-        id: CommandId::CodexWorkspaceWrite,
-        name: "codex.workspace_write",
-        sequence: "aw",
-        description: "Use workspace-write mode",
-        source: CommandSource::CodexWatch,
-    },
 ];
 
 pub fn by_sequence(sequence: &str) -> Option<&'static Command> {
@@ -350,7 +293,6 @@ pub fn menu_entries(prefix: &str) -> Vec<MenuEntry> {
         let group = rest.chars().count() > 1;
         let label = if group {
             match (prefix, key) {
-                ("", 'a') => "codex-watch",
                 ("", 'b') => "buffers",
                 ("", 'c') => "code",
                 ("", 'f') => "files",

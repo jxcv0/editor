@@ -14,7 +14,6 @@ use serde_json::{Value, json};
 
 use crate::{
     buffer::{Pos, Utf16Pos},
-    codex_watch::{CodexRunMode, CodexWatch, CodexWatchConfig, CodexWatchEvent, CodexWatchState},
     command::CommandId,
     editor::{
         Diagnostic, DiagnosticSeverity, Editor, EditorRequest, Orientation, PickerItem, PickerKind,
@@ -38,9 +37,6 @@ pub struct Runtime {
     frame_builder: ui::FrameBuilder,
     redraw: bool,
     rust_analyzer: Option<RustAnalyzerClient>,
-    codex_watch: Option<CodexWatch>,
-    codex_activity_revision: u64,
-    last_codex_animation: Instant,
     project_scan: Option<BackgroundTask<ProjectEntry>>,
     explorer_scan: Option<(PathBuf, BackgroundTask<ProjectEntry>)>,
     reference_previews: Option<BackgroundTask<project::ReferencePreview>>,
@@ -58,7 +54,6 @@ pub struct Runtime {
     session_rx: Option<Receiver<Option<SessionState>>>,
     restore_session: bool,
     background_started: bool,
-    pending_codex_mode: Option<(CodexRunMode, Instant)>,
     terminal: Option<TerminalProcess>,
 }
 
@@ -119,19 +114,6 @@ impl Runtime {
         ra_config.max_message_bytes = editor.config.limits.tool_message_bytes;
         let rust_analyzer = RustAnalyzerClient::new(ra_config).ok();
 
-        let mut codex_config = CodexWatchConfig::new(root.clone());
-        codex_config.executable = PathBuf::from(&editor.config.tools.codex_watch.path);
-        codex_config.args = editor
-            .config
-            .tools
-            .codex_watch
-            .args
-            .iter()
-            .map(OsString::from)
-            .collect();
-        codex_config.max_event_line_bytes = editor.config.limits.tool_message_bytes;
-        let codex_watch = CodexWatch::new(codex_config).ok();
-
         let journal = state_root
             .as_ref()
             .and_then(|path| Journal::start(path.join("recovery")).ok());
@@ -146,9 +128,6 @@ impl Runtime {
             frame_builder: ui::FrameBuilder::new(),
             redraw: true,
             rust_analyzer,
-            codex_watch,
-            codex_activity_revision: 0,
-            last_codex_animation: Instant::now(),
             project_scan: None,
             explorer_scan: None,
             reference_previews: None,
@@ -166,7 +145,6 @@ impl Runtime {
             session_rx: None,
             restore_session,
             background_started: false,
-            pending_codex_mode: None,
             terminal: None,
         })
     }
@@ -257,8 +235,6 @@ impl Runtime {
         self.redraw |= self.editor.poll_file_finder();
         self.drain_lsp();
         self.drain_reference_previews();
-        self.drain_codex();
-        self.animate_codex(Instant::now());
         self.restore_session_if_ready();
         if idle || self.last_maintenance.elapsed() >= Duration::from_millis(50) {
             self.last_maintenance = Instant::now();
@@ -444,7 +420,6 @@ impl Runtime {
             EditorRequest::RustAnalyzerWithArgument(command, argument) => {
                 self.request_lsp(command, Some(argument));
             }
-            EditorRequest::CodexWatch(command) => self.command_codex(command),
         }
     }
 
@@ -1187,203 +1162,6 @@ impl Runtime {
         self.redraw |= previous_count != self.editor.diagnostics.len();
     }
 
-    fn command_codex(&mut self, command: CommandId) {
-        let Some(watch) = &self.codex_watch else {
-            self.editor
-                .message("codex-watch integration failed to initialize");
-            return;
-        };
-        let status = watch.status();
-        if matches!(
-            command,
-            CommandId::CodexDryRun | CommandId::CodexWorkspaceWrite
-        ) {
-            let mode = if command == CommandId::CodexDryRun {
-                CodexRunMode::DryRun
-            } else {
-                CodexRunMode::WorkspaceWrite
-            };
-            let confirmed = self.pending_codex_mode.is_some_and(|(pending, at)| {
-                pending == mode && at.elapsed() <= Duration::from_secs(5)
-            });
-            if !confirmed {
-                self.pending_codex_mode = Some((mode, Instant::now()));
-                self.editor.message(format!(
-                    "Confirm codex-watch {mode}: press <Space>a{} again within 5 seconds",
-                    if mode == CodexRunMode::DryRun {
-                        "d"
-                    } else {
-                        "w"
-                    }
-                ));
-                return;
-            }
-            self.pending_codex_mode = None;
-        }
-        let result = match command {
-            CommandId::CodexDryRun => watch
-                .enable()
-                .and_then(|_| watch.set_run_mode(CodexRunMode::DryRun)),
-            CommandId::CodexWorkspaceWrite => watch
-                .enable()
-                .and_then(|_| watch.set_run_mode(CodexRunMode::WorkspaceWrite)),
-            CommandId::CodexToggle
-                if status.pid.is_some() || status.state == CodexWatchState::Starting =>
-            {
-                watch.stop()
-            }
-            CommandId::CodexToggle if status.enabled && status.run_mode.is_some() => watch.start(),
-            CommandId::CodexToggle => {
-                self.editor.message(
-                    "Select dry-run (<Space>ad) or workspace-write (<Space>aw) before starting",
-                );
-                return;
-            }
-            CommandId::CodexRestart => watch.restart(),
-            CommandId::CodexRunOnce => watch.run_once(),
-            CommandId::CodexStatus => {
-                self.editor.message(format!(
-                    "codex-watch: {:?}, mode {}",
-                    status.state,
-                    status
-                        .run_mode
-                        .map_or("not selected".into(), |mode| mode.to_string())
-                ));
-                return;
-            }
-            CommandId::CodexLogs => {
-                let (output, truncated) = watch.captured_output();
-                let mut items: Vec<_> = output
-                    .lines()
-                    .rev()
-                    .take(500)
-                    .map(|line| PickerItem {
-                        label: line.to_owned(),
-                        detail: "codex-watch".into(),
-                        path: None,
-                        line: None,
-                        column: None,
-                        insert_text: None,
-                    })
-                    .collect();
-                if truncated > 0 {
-                    items.push(PickerItem {
-                        label: format!("… {truncated} older bytes truncated"),
-                        detail: String::new(),
-                        path: None,
-                        line: None,
-                        column: None,
-                        insert_text: None,
-                    });
-                }
-                self.editor.show_picker_items(PickerKind::Messages, items);
-                return;
-            }
-            _ => return,
-        };
-        match result {
-            Ok(()) => self
-                .editor
-                .message(format!("codex-watch command queued: {command}")),
-            Err(error) => self.editor.message(error.to_string()),
-        }
-    }
-
-    fn drain_codex(&mut self) {
-        let events = self
-            .codex_watch
-            .as_ref()
-            .map(|watch| watch.drain_events(128))
-            .unwrap_or_default();
-        self.redraw |= !events.is_empty();
-        for event in events {
-            match event {
-                CodexWatchEvent::Status(status) => {
-                    self.editor.codex_watch_status =
-                        format!("{:?}", status.state).to_ascii_lowercase();
-                    if let Some(mode) = status.run_mode {
-                        self.editor.codex_watch_status.push_str(&format!(":{mode}"));
-                    }
-                    if let Some(error) = status.last_error {
-                        self.editor.message(error);
-                    }
-                    if status.state == CodexWatchState::Completed {
-                        self.reload_clean_external_changes();
-                    }
-                }
-                CodexWatchEvent::Json(event) => {
-                    let state = event.state_name();
-                    // One task may finish while other files are still being processed,
-                    // so the aggregate watcher status need not become Completed.
-                    if matches!(state, "applied" | "previewed") {
-                        self.reload_clean_external_changes();
-                    }
-                    if matches!(
-                        state,
-                        "queued"
-                            | "preparing"
-                            | "waiting"
-                            | "retrying"
-                            | "applied"
-                            | "previewed"
-                            | "processing"
-                            | "started"
-                            | "completed"
-                            | "failed"
-                    ) {
-                        let detail_key = if matches!(state, "applied" | "previewed" | "completed") {
-                            "summary"
-                        } else {
-                            "message"
-                        };
-                        let detail = event.payload.get(detail_key).and_then(Value::as_str);
-                        if state == "failed"
-                            && detail
-                                .is_some_and(|detail| self.editor.current_message() == Some(detail))
-                        {
-                            continue;
-                        }
-                        self.editor
-                            .message(match detail.filter(|text| !text.trim().is_empty()) {
-                                Some(detail) => format!("codex-watch: {state}: {detail}"),
-                                None => format!("codex-watch: {state}"),
-                            });
-                    }
-                }
-                CodexWatchEvent::Stderr(line) => {
-                    self.editor.message(format!("codex-watch: {line}"))
-                }
-                CodexWatchEvent::Error(error) => self.editor.message(error),
-                CodexWatchEvent::EventsDropped(count) => self
-                    .editor
-                    .message(format!("codex-watch dropped {count} UI events")),
-            }
-        }
-        if let Some((revision, lines)) = self
-            .codex_watch
-            .as_ref()
-            .and_then(|watch| watch.working_lines_since(self.codex_activity_revision))
-        {
-            if self.editor.codex_working_lines.is_empty() {
-                self.editor.codex_spinner_frame = 0;
-                self.last_codex_animation = Instant::now();
-            }
-            self.codex_activity_revision = revision;
-            self.editor.codex_working_lines = lines;
-            self.redraw = true;
-        }
-    }
-
-    fn animate_codex(&mut self, now: Instant) {
-        if !self.editor.codex_working_lines.is_empty()
-            && now.duration_since(self.last_codex_animation) >= Duration::from_millis(120)
-        {
-            self.last_codex_animation = now;
-            self.editor.codex_spinner_frame = self.editor.codex_spinner_frame.wrapping_add(1);
-            self.redraw = true;
-        }
-    }
-
     fn journal_buffers(&mut self) {
         let Some(journal) = &self.journal else { return };
         let project_key = state::project_key(&self.editor.explorer.root);
@@ -1505,7 +1283,6 @@ impl Runtime {
 
     fn show_health(&mut self) {
         let ra = self.rust_analyzer.as_ref().map(|client| client.status());
-        let codex = self.codex_watch.as_ref().map(|watch| watch.status());
         let items = vec![
             PickerItem {
                 label: "Terminal".into(),
@@ -1532,19 +1309,6 @@ impl Runtime {
                         status
                             .last_error
                             .map_or(String::new(), |error| format!(": {error}"))
-                    )
-                }),
-                path: None,
-                line: None,
-                column: None,
-                insert_text: None,
-            },
-            PickerItem {
-                label: "codex-watch".into(),
-                detail: codex.map_or("worker unavailable".into(), |status| {
-                    format!(
-                        "{:?}, enabled={}, mode={:?}",
-                        status.state, status.enabled, status.run_mode
                     )
                 }),
                 path: None,
@@ -1850,7 +1614,6 @@ mod tests {
         let editor = Editor::new(Config::default(), root.to_owned());
         let mut runtime = Runtime::with_state_root(editor, false, None).unwrap();
         runtime.rust_analyzer = None;
-        runtime.codex_watch = None;
         runtime
     }
 
@@ -1962,196 +1725,6 @@ mod tests {
     fn text_edit(line: usize, start: usize, end: usize, text: &str) -> Value {
         json!({"range": {"start": {"line": line, "character": start},
             "end": {"line": line, "character": end}}, "newText": text})
-    }
-
-    #[cfg(unix)]
-    fn start_codex_event_peer(runtime: &mut Runtime, events: &[Value]) {
-        // cat emits the installed watcher's real JSON schema, then waits on stdin.
-        // This exercises process delivery without executing Codex or editing its config.
-        let path = runtime.editor.explorer.root.join("watcher-events.jsonl");
-        let mut data = Vec::new();
-        for event in events {
-            serde_json::to_writer(&mut data, event).unwrap();
-            data.push(b'\n');
-        }
-        fs::write(&path, data).unwrap();
-        let mut config = CodexWatchConfig::new(&runtime.editor.explorer.root);
-        config.executable = PathBuf::from("/bin/cat");
-        config.args = vec![path.into_os_string()];
-        config.json_events_arg = "-".into();
-        config.dry_run_args.clear();
-        config.process_limits.shutdown_timeout = Duration::from_millis(50);
-        let watch = CodexWatch::new(config).unwrap();
-        watch.enable().unwrap();
-        watch.set_run_mode(CodexRunMode::DryRun).unwrap();
-        watch.start().unwrap();
-        runtime.codex_watch = Some(watch);
-    }
-
-    #[cfg(unix)]
-    fn wait_codex_message(runtime: &mut Runtime, expected: &str) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while runtime.editor.current_message() != Some(expected) {
-            runtime.drain_codex();
-            assert!(
-                Instant::now() < deadline,
-                "missing Codex message {expected:?}"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn codex_line_spinners_animate_without_input_and_stop_with_the_watcher() {
-        let directory = tempdir().unwrap();
-        let mut runtime = local_runtime(directory.path());
-        let path = open_test_file(&mut runtime, "active.rs", "first\n// @codex change this\n");
-        start_codex_event_peer(
-            &mut runtime,
-            &[
-                json!({"type":"status","state":"preparing","path":"active.rs","line":2,"task":1}),
-                json!({"type":"status","state":"waiting","path":"active.rs","line":2,"task":1}),
-            ],
-        );
-        wait_codex_message(&mut runtime, "codex-watch: waiting");
-        assert_eq!(
-            runtime.editor.codex_working_lines[&path],
-            std::collections::BTreeSet::from([1])
-        );
-        runtime.redraw = false;
-        let now = runtime.last_codex_animation;
-        runtime.animate_codex(now + Duration::from_millis(119));
-        assert!(!runtime.redraw);
-        runtime.animate_codex(now + Duration::from_millis(120));
-        assert!(runtime.redraw);
-        assert_eq!(runtime.editor.codex_spinner_frame, 1);
-        runtime.codex_watch.as_ref().unwrap().stop().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !runtime.editor.codex_working_lines.is_empty() {
-            runtime.drain_codex();
-            assert!(Instant::now() < deadline);
-            thread::sleep(Duration::from_millis(1));
-        }
-        runtime.redraw = false;
-        runtime.animate_codex(now + Duration::from_secs(1));
-        assert!(!runtime.redraw);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn codex_task_completion_reloads_clean_files_while_another_task_is_processing() {
-        for completed_state in ["applied", "previewed"] {
-            let directory = tempdir().unwrap();
-            let mut runtime = local_runtime(directory.path());
-            let clean_path = open_test_file(&mut runtime, "clean.rs", "old\n");
-            let clean = runtime.editor.active_pane().buffer;
-            let dirty_path = open_test_file(&mut runtime, "dirty.rs", "original\n");
-            let dirty = runtime.editor.active_pane().buffer;
-            runtime
-                .editor
-                .active_buffer_mut()
-                .insert(Pos::ZERO, "local ")
-                .unwrap();
-            fs::write(&clean_path, "new contents\n").unwrap();
-            fs::write(&dirty_path, "external contents\n").unwrap();
-            start_codex_event_peer(
-                &mut runtime,
-                &[
-                    json!({"version":1,"type":"status","state":"preparing","path":clean_path,"line":1,"task":1}),
-                    json!({"version":1,"type":"status","state":"waiting","path":dirty_path,"line":1,"task":1}),
-                    json!({"version":1,"type":"status","state":"idle","path":"unrelated.rs"}),
-                    json!({"version":1,"type":"status","state":completed_state,"path":clean_path,"line":1,"task":1,"summary":"Movement updated"}),
-                ],
-            );
-            wait_codex_message(
-                &mut runtime,
-                &format!("codex-watch: {completed_state}: Movement updated"),
-            );
-            assert_eq!(
-                runtime.codex_watch.as_ref().unwrap().status().state,
-                CodexWatchState::Processing
-            );
-            assert_eq!(runtime.editor.codex_watch_status, "processing:dry-run");
-            assert!(!runtime.editor.codex_working_lines.contains_key(&clean_path));
-            assert!(runtime.editor.codex_working_lines.contains_key(&dirty_path));
-            assert_eq!(
-                runtime.editor.buffers[clean].buffer.text(),
-                "new contents\n"
-            );
-            assert_eq!(
-                runtime.editor.buffers[dirty].buffer.text(),
-                "local original\n"
-            );
-            assert!(runtime.editor.buffers[dirty].buffer.is_dirty());
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn codex_task_failure_is_visible_while_another_task_is_processing() {
-        let directory = tempdir().unwrap();
-        let mut runtime = local_runtime(directory.path());
-        start_codex_event_peer(
-            &mut runtime,
-            &[
-                json!({"version":1,"type":"status","state":"waiting","path":"one.rs","line":1,"task":1}),
-                json!({"version":1,"type":"status","state":"waiting","path":"two.rs","line":1,"task":1}),
-                json!({"version":1,"type":"status","state":"failed","path":"one.rs","message":"Codex executable was unavailable"}),
-            ],
-        );
-        wait_codex_message(&mut runtime, "Codex executable was unavailable");
-        assert_eq!(runtime.editor.codex_watch_status, "processing:dry-run");
-        assert_eq!(
-            runtime
-                .editor
-                .messages
-                .iter()
-                .filter(|message| message.contains("Codex executable was unavailable"))
-                .count(),
-            1
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn codex_toggle_stops_a_live_watcher_after_completion_or_failure() {
-        for (state, message) in [
-            ("applied", "codex-watch: applied: Finished"),
-            ("failed", "Task failed"),
-        ] {
-            let directory = tempdir().unwrap();
-            let mut runtime = local_runtime(directory.path());
-            start_codex_event_peer(
-                &mut runtime,
-                &[
-                    json!({"version":1,"type":"status","state":state,"path":"one.rs","summary":"Finished","message":"Task failed"}),
-                ],
-            );
-            wait_codex_message(&mut runtime, message);
-            assert!(runtime.codex_watch.as_ref().unwrap().status().pid.is_some());
-            runtime.command_codex(CommandId::CodexToggle);
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while runtime.codex_watch.as_ref().unwrap().status().pid.is_some() {
-                runtime.drain_codex();
-                assert!(
-                    Instant::now() < deadline,
-                    "toggle did not stop watcher after {state}"
-                );
-                thread::sleep(Duration::from_millis(1));
-            }
-            assert_eq!(
-                runtime.codex_watch.as_ref().unwrap().status().state,
-                CodexWatchState::Stopped
-            );
-            assert!(
-                !runtime
-                    .editor
-                    .messages
-                    .iter()
-                    .any(|message| message.contains("already running"))
-            );
-        }
     }
 
     #[test]

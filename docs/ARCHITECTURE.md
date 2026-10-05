@@ -12,31 +12,27 @@ mutate editor text directly.
 | --- | --- | --- |
 | `main` | CLI action handling, project selection, configuration load, initial buffers/cursor, and handoff to the runtime | This is the thin executable composition root. It performs no terminal drawing or tool-protocol work itself. |
 | `cli` | Typed parsing of paths, stdin, one-based startup positions, `--no-session`, help/version, and `--` | Preserves paths as `OsString`/`PathBuf` and deliberately leaves filesystem classification, project selection, and all side effects to `main`. |
-| `app` | Foreground event loop, rendering cadence, terminal-process polling, background scan/search polling, LSP and `codex-watch` dispatch, diagnostics, clean-file reloads, journaling, session I/O, and health output | Owns process/integration handles and is the only layer that converts `EditorRequest` values or worker events into UI/core actions. Worker drains are bounded. Periodic clean-file checks use synchronous metadata only when unchanged, but changed files are still reread on the foreground thread; config reload is synchronous too. |
+| `app` | Foreground event loop, rendering cadence, terminal-process polling, background scan/search polling, LSP dispatch, diagnostics, clean-file reloads, journaling, session I/O, and health output | Owns process/integration handles and is the only layer that converts `EditorRequest` values or worker events into UI/core actions. Worker drains are bounded. Periodic clean-file checks use synchronous metadata only when unchanged, but changed files are still reread on the foreground thread; config reload is synchronous too. |
 | `buffer` | UTF-8 text storage, grapheme positions, byte and UTF-16 conversion, edit transactions, branching undo/redo, loading, conflict detection, and atomic saving | Owns text and disk identity. It has no terminal, project-search, or tool-process knowledge. The current representation is line-based strings, not a rope/piece table, so the largest size/performance goals still need measurement and likely further work. |
 | `editor` | Modal state machine, panes/layout, per-pane cursor/viewport, buffers, registers/macros, selection, prompts, picker/explorer state, diagnostics, and typed integration requests | Consumes terminal-neutral `Key` values and mutates `Buffer`s. It emits `EditorRequest` values rather than launching tools. Vim compatibility is intentionally bounded; see [COMMANDS.md](COMMANDS.md). |
 | `explorer` | Cached directory listings, visible tree rows, expansion, selection, and active-file reveal | Performs no filesystem I/O. `app` supplies bounded batches from one lazy directory scan at a time; the file finder retains its independent recursive index. |
 | `input` | Small terminal-neutral key vocabulary | Keeps Crossterm types out of the editor state machine and leaves room for another frontend. |
 | `ui` | Crossterm terminal lifecycle, input translation, cell canvas, Unicode display width, and changed-cell rendering | The only terminal-specific module. Its RAII guard restores raw mode, cursor, bracketed paste, and alternate screen on ordinary drop; a panic hook performs emergency restoration. Suspend/resume behavior and deterministic full-frame snapshots are not yet complete. |
-| `command` | Declarative typed command IDs and built-in leader hierarchy | Shared vocabulary for editor, `rust-analyzer`, and `codex-watch` actions. The registry describes commands; context availability and actual execution remain the orchestrator/editor's responsibility. |
+| `command` | Declarative typed command IDs and built-in leader hierarchy | Shared vocabulary for editor and `rust-analyzer` actions. The registry describes commands; context availability and actual execution remain the orchestrator/editor's responsibility. |
 | `config` | Versioned TOML schema, defaults, user/project layer merge, validation, and project-tool trust filtering | Contains no evaluation hook. Keymap values can name typed commands but are not applied. `:reloadconfig` replaces valid typed settings, while existing explorer/undo state and integration workers are not reconstructed. |
 | `project` | Project-root discovery, ignored/hidden-aware walking, fuzzy ranking, and literal/regex project search | The short ancestor-based root discovery is synchronous during composition. Full scans/searches run on cancellable background threads and stream through bounded channels. The module has no editor mutation access; preview/open behavior is handled above it. |
 | `syntax` | Lightweight, line-local Rust/TOML/Markdown highlighting | Always-available fallback with no parser process. It is lexical and deliberately tolerant, not a full incremental syntax tree or semantic highlighter. |
 | `terminal` | PTY shell lifecycle, bounded asynchronous output, VT screen/scrollback state, resizing, terminal-key encoding, and bounded capability replies | The editor owns only the renderable emulator state and emits typed input/toggle requests; `app` owns the fallible OS process handle. The interactive shell starts only after an explicit terminal command. |
 | `bin/editor-bench` | Repeatable local smoke measurement for warm 1 MiB open and edit-plus-frame p95 | Measures useful core proxies, not full process-launch-to-terminal-flush latency. Target-laptop baselines and regression enforcement are still needed. |
-| `process` | Direct child spawning, bounded stdin/stdout/stderr, process-group shutdown, bounded logs, and line framing helpers | Security/reliability boundary shared by integrations. It never invokes a shell. On Unix it creates a child process group; non-Unix shutdown falls back to the platform process API. |
+| `process` | Direct child spawning, bounded stdin/stdout/stderr, process-group shutdown, and bounded logs | Security/reliability boundary shared by integrations. It never invokes a shell. On Unix it creates a child process group; non-Unix shutdown falls back to the platform process API. |
 | `lsp` | Asynchronous `rust-analyzer` lifecycle and JSON-RPC/LSP transport, document snapshots/version checks, generic request/notification routing, and bounded events/errors | Runs process and protocol work on a dedicated worker. `app` maps typed actions to methods and handles a practical response subset; comprehensive capability-aware UX remains incomplete. |
-| `codex_watch` | Explicit enablement/run-mode state machine, `codex-watch --json-events` supervision, bounded event parsing/logs, and start/stop/restart/run-once operations | Runs on a dedicated worker and refuses to start without enablement plus a selected dry-run/workspace-write mode. Applying filesystem changes safely remains an editor/orchestrator concern. |
 | `state` | Private asynchronous recovery journal and content-free versioned session files | During periodic maintenance, `app` journals dirty named and scratch/stdin buffers, queues removal after observing them clean, reports available recovery records, joins queued journal work at shutdown, and saves/loads named-file session metadata. Active selection, pane cursors/viewports, and explorer state are restored; recovery selection/application, unnamed session buffers, exact split topology/orientation, and persistent undo remain MVP work. |
 
 ## Runtime ownership and data flow
 
 The foreground `app::Runtime` thread owns `Editor`, terminal input, and
 rendering. It performs small, nonblocking polls of worker handles between input
-events. Active Codex marker lines animate in the gutter every 120 ms. Their
-bounded activity snapshot is polled separately from the lossy UI event queue,
-so missed notifications cannot leave stale spinners. Idle ticks otherwise
-continue polling services but render only after input or a
+events. Idle ticks continue polling services but render only after input or a
 worker result changes visible state. `ui::FrameBuilder` retains line syntax
 and display checkpoints using buffer-provided line identities. Lexical work
 is capped at 16 KiB per line; the remainder remains readable as plain text.
@@ -49,10 +45,10 @@ terminal event -> input::Key -> editor::Editor -> buffer::Buffer
                                   |                   |
                                   v                   v
                               ui::Canvas        app::Runtime
-                                  |          /    |      |       \
-                                  v     terminal project lsp   codex_watch
-                           ui::Renderer        |        |        |
-                                              +--- bounded events --+
+                                  |          /        |         \
+                                  v    terminal    project      lsp
+                           ui::Renderer    |          |          |
+                                           +--- bounded events --+
 
 buffer changes -> state::Journal (queued snapshot)
 clean exit     -> state::SessionState (paths/layout only)
@@ -126,13 +122,11 @@ explicit environment overrides as structured values. `SupervisedChild` starts
 it directly and owns piped stdio plus a bounded shutdown interval. This avoids
 shell parsing and keeps child lifetime management reusable.
 
-`RustAnalyzerClient` and `CodexWatch` each add a protocol/state worker above
-that primitive. Both expose nonblocking command and event APIs. They are
-optional: construction/start failures become status/messages while the local
-buffer and terminal editor continue to work. `app` starts `rust-analyzer` only
-after rendering the first frame and routes explicit restart requests to its
-worker; `codex-watch` never starts until a leader command selects a run mode
-and requests execution.
+`RustAnalyzerClient` adds a protocol/state worker above that primitive and
+exposes nonblocking command and event APIs. It is optional: construction/start
+failures become status/messages while the local buffer and terminal editor
+continue to work. `app` starts `rust-analyzer` only after rendering the first
+frame and routes explicit restart requests to its worker.
 
 The integrated terminal is a separate, explicitly interactive boundary. It
 intentionally starts the user's `$SHELL` directly in a PTY after `<Space>t` or
@@ -152,7 +146,7 @@ do not infer end-to-end support merely from a command ID or public client
 method. The following areas require continued integration and verification:
 
 - complete edge-case behavior for every documented modal, picker, explorer,
-  LSP, `codex-watch`, recovery, and session path;
+  LSP, recovery, and session path;
 - safe UI flows for external file changes and dirty-buffer conflicts;
 - complete completion/signature/snippet, navigation, rename, code-action,
   formatting, diagnostics, and inlay-hint UX above the generic LSP transport;

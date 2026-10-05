@@ -53,10 +53,9 @@ into the text model or process integrations.
   search. Bounded queues prevent background producers from growing memory
   without limit.
 - **Alternatives considered:** `std::sync::mpsc` is already sufficient for the
-  long-lived LSP and `codex-watch` controllers, but it lacks the same convenient
-  bounded sender and timed-send behavior used by project tasks. An async
-  runtime would be much larger and would add scheduling machinery to the input
-  path.
+  long-lived LSP controller, but it lacks the same convenient bounded sender and
+  timed-send behavior used by project tasks. An async runtime would be much
+  larger and would add scheduling machinery to the input path.
 - **Startup/performance:** No global runtime or startup work. Channel operations
   add a small synchronization cost on worker/UI handoff and allow the UI to
   drain a bounded number of events without blocking.
@@ -186,14 +185,13 @@ terminal; its process and memory boundaries are kept outside the text model.
 
 ### `serde_json` 1 (locked: 1.0.151)
 
-- **Purpose:** JSON-RPC/LSP messages, newline-delimited `codex-watch` events,
-  and private state/recovery files.
+- **Purpose:** JSON-RPC/LSP messages and private state/recovery files.
 - **Alternatives considered:** A hand-written JSON implementation would be a
   security and protocol-correctness risk. Faster specialized parsers often add
   unsafe code, architecture assumptions, or mutation requirements that do not
   benefit the current bounded message sizes.
 - **Startup/performance:** No eager initialization. Parsing/encoding allocates
-  in proportion to a message; the process layer caps frame/line sizes and uses
+  in proportion to a message; the process layer caps frame sizes and uses
   bounded queues. Protocol parsing stays off the input/render path.
 - **Portability/build:** Pure Rust and no native build step.
 - **Security/maintenance:** Mature and broadly reviewed, but JSON from external
@@ -315,12 +313,11 @@ escape streams while preserving expected interactive terminal behavior.
 
 ## External executables (not linked dependencies)
 
-`rust-analyzer` and `codex-watch` are optional, separately installed processes.
-They are launched directly with argument vectors through `process`, never via a
-shell. Their stdout/stderr and protocol frames are bounded, and failure must not
-disable ordinary editing. `rust-analyzer` is never downloaded automatically.
-Starting `codex-watch` additionally requires project enablement and an explicit
-run mode. These integrations do not create a general-purpose plugin runtime.
+`rust-analyzer` is an optional, separately installed process. It is launched
+directly with an argument vector through `process`, never via a shell. Its
+stdout/stderr and protocol frames are bounded, and failure must not disable
+ordinary editing. It is never downloaded automatically. This integration does
+not create a general-purpose plugin runtime.
 The integrated terminal is separately user-triggered and directly launches the
 user's shell through `portable-pty`; it is not used to implement tool commands.
 

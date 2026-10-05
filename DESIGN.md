@@ -14,11 +14,11 @@ native C/C++ code may be adopted only after assessing:
 - Security and maintenance risk
 - Licensing
 
-`rust-analyzer` and `codex-watch` are the initially required external tool
-integrations, not linked implementation dependencies. External tools shall be
-connected through a small, reusable process and protocol abstraction so that
-future integrations can be added without changing the editing core or
-introducing a general-purpose plugin runtime.
+`rust-analyzer` is the initially required external tool integration, not a
+linked implementation dependency. External tools shall be connected through a
+small, reusable process and protocol abstraction so that future integrations
+can be added without changing the editing core or introducing a general-purpose
+plugin runtime.
 
 ## Requirement 2 — Performance budgets
 
@@ -29,8 +29,8 @@ laptop:
   p95 with a warm filesystem cache.
 - Input handling and production of the resulting frame shall take at most 8 ms
   at p95.
-- Project discovery, `rust-analyzer`, `codex-watch`, and other external tools
-  shall initialize asynchronously and never delay basic editing.
+- Project discovery, `rust-analyzer`, and other external tools shall initialize
+  asynchronously and never delay basic editing.
 - Repeatable benchmarks shall track these budgets and report regressions.
 
 ## Requirement 3 — Modal editing contract
@@ -96,8 +96,8 @@ to LazyVim's `which-key` experience.
 
 - A keyboard-driven overlay shall show valid next keys, descriptions, and
   nested command groups.
-- Commands from the editor, `rust-analyzer`, and `codex-watch` shall share one
-  declarative command registry.
+- Commands from the editor and `rust-analyzer` shall share one declarative
+  command registry.
 - Only supported commands shall appear; temporarily unavailable actions shall
   be visibly disabled with a reason.
 - The menu shall close after executing a command or pressing `Esc`.
@@ -106,28 +106,7 @@ to LazyVim's `which-key` experience.
   relevant, such as files, buffers, code, search, and diagnostics.
 - Menu bindings shall be configurable without requiring a scripting runtime.
 
-## Requirement 7 — `codex-watch` integration
-
-The editor shall supervise one `codex-watch --json-events` process per active
-Git project.
-
-- Starting it shall require explicit per-project enablement, which may be
-  remembered.
-- The UI shall show whether it is stopped, watching, processing, completed, or
-  failed.
-- Users shall be able to start, stop, restart, run once, and inspect captured
-  output.
-- Dry-run and workspace-write modes shall require explicit selection and remain
-  visibly indicated.
-- Task lifecycle events shall appear without blocking editing.
-- Changes to clean open buffers shall reload safely while preserving cursor
-  position where possible.
-- Changes conflicting with unsaved buffers shall never overwrite them silently;
-  the editor shall offer review or reload choices.
-- Missing binaries, malformed events, and crashes shall be reported without
-  affecting normal editing.
-
-## Requirement 8 — Initial platform and terminal UI
+## Requirement 7 — Initial platform and terminal UI
 
 The initial product shall be a terminal editor optimized for this laptop's
 Linux environment.
@@ -146,7 +125,7 @@ Linux environment.
 - The editing core shall remain separated from terminal-specific input and
   rendering so another frontend could be added later without rewriting it.
 
-## Requirement 9 — Toggleable project file browser
+## Requirement 8 — Toggleable project file browser
 
 The TUI shall provide a docked project-tree panel on the left, similar to
 LazyVim's explorer.
@@ -166,7 +145,7 @@ LazyVim's explorer.
 - External filesystem changes shall update the tree without blocking editing.
 - Panel width and expanded directories shall be remembered for the session.
 
-## Requirement 10 — Buffers and split panes
+## Requirement 9 — Buffers and split panes
 
 The editor shall support multiple open buffers displayed in arbitrary
 horizontal and vertical split panes.
@@ -187,7 +166,7 @@ horizontal and vertical split panes.
 - An always-visible buffer tab bar and Vim-style tab pages are not required
   initially; the buffer switcher and panes form the primary navigation model.
 
-## Requirement 11 — Project finding and search
+## Requirement 10 — Project finding and search
 
 The editor shall provide built-in, asynchronous project navigation without
 requiring `fzf`, `ripgrep`, or another external search process.
@@ -208,7 +187,7 @@ requiring `fzf`, `ripgrep`, or another external search process.
 - The implementation should use pure-Rust libraries and require no persistent
   index.
 
-## Requirement 12 — File integrity and crash recovery
+## Requirement 11 — File integrity and crash recovery
 
 The editor shall prioritize preventing silent source loss or corruption.
 
@@ -220,6 +199,8 @@ The editor shall prioritize preventing silent source loss or corruption.
   filesystem.
 - Before saving, the editor shall detect whether the on-disk file changed since
   it was loaded or last saved.
+- External changes to clean open buffers shall reload safely while preserving
+  cursor position where possible.
 - A dirty buffer shall never be overwritten by an external change; the user
   shall be offered diff, reload, or explicit overwrite actions.
 - Modified buffers shall be journaled asynchronously to a private recovery
@@ -229,7 +210,7 @@ The editor shall prioritize preventing silent source loss or corruption.
 - Recovery data shall be removed once its buffer is safely saved or explicitly
   discarded.
 
-## Requirement 13 — Syntax and diagnostic presentation
+## Requirement 12 — Syntax and diagnostic presentation
 
 Rust code shall remain readable immediately after opening, without waiting for
 `rust-analyzer`.
@@ -253,7 +234,7 @@ Rust code shall remain readable immediately after opening, without waiting for
 - Highlighting technology and any native parser dependency shall undergo the
   dependency assessment required by Requirement 1.
 
-## Requirement 14 — Completion and Rust code actions
+## Requirement 13 — Completion and Rust code actions
 
 When `rust-analyzer` is ready, Insert mode shall provide asynchronous completion
 without delaying typing.
@@ -277,7 +258,7 @@ without delaying typing.
 - Unavailable actions shall explain whether the analyzer is still starting,
   failed, or lacks the capability.
 
-## Requirement 15 — Typed configuration without scripting
+## Requirement 14 — Typed configuration without scripting
 
 The editor shall be fully usable with built-in defaults and support optional
 declarative TOML configuration.
@@ -301,7 +282,7 @@ declarative TOML configuration.
 - Configuration shall never load Lua, JavaScript, Python, shared libraries, or
   editor plugins.
 
-## Requirement 16 — Minimal persistent UI
+## Requirement 15 — Minimal persistent UI
 
 The default TUI shall expose essential state without dashboards, animations, or
 decorative plugin-style chrome.
@@ -309,8 +290,7 @@ decorative plugin-style chrome.
 - Each editor pane shall have a gutter with relative line numbers, an absolute
   number on the cursor line, and diagnostic signs.
 - A single status line shall show the current mode, file path,
-  modified/read-only state, cursor position, `rust-analyzer` status, and
-  `codex-watch` status.
+  modified/read-only state, cursor position, and `rust-analyzer` status.
 - A bottom command/message line shall handle Ex commands, search input, errors,
   and short-lived notifications.
 - Messages shall also be retained in a bounded history for later inspection.
@@ -323,7 +303,7 @@ decorative plugin-style chrome.
 - There shall be no startup dashboard; launching without a file shall open an
   empty scratch buffer immediately.
 
-## Requirement 17 — Undo, repeat, and macros
+## Requirement 16 — Undo, repeat, and macros
 
 Editing shall use explicit transactions that support Vim-like undo behavior.
 
@@ -345,7 +325,7 @@ Editing shall use explicit transactions that support Vim-like undo behavior.
 - Recovery data and persistent undo data shall remain separate so recovering a
   crash cannot corrupt established history.
 
-## Requirement 18 — Text model and size boundaries
+## Requirement 17 — Text model and size boundaries
 
 The editor shall represent text and positions without ambiguity across storage,
 display, editing commands, and LSP messages.
@@ -370,7 +350,7 @@ display, editing commands, and LSP messages.
 - Files beyond the configured safety limit shall produce a clear prompt or
   error rather than risking uncontrolled memory use.
 
-## Requirement 19 — Clipboard and baseline Rust editing conveniences
+## Requirement 18 — Clipboard and baseline Rust editing conveniences
 
 Internal registers and editing shall remain fully functional without access to
 a desktop clipboard.
@@ -396,7 +376,7 @@ a desktop clipboard.
 - Automatic insertion of matching delimiters and quotes is not required for the
   initial release.
 
-## Requirement 20 — CLI, project selection, and sessions
+## Requirement 19 — CLI, project selection, and sessions
 
 The command-line interface shall support `editor [PATH ...]`, directories,
 standard input via `-`, `+LINE[:COLUMN] FILE`, `--help`, and `--version`.
@@ -420,7 +400,7 @@ standard input via `-`, `+LINE[:COLUMN] FILE`, `--help`, and `--version`.
 - Session files shall be private, versioned, bounded, and stored under the
   appropriate XDG state directory.
 
-## Requirement 21 — Default `<Space>` hierarchy
+## Requirement 20 — Default `<Space>` hierarchy
 
 The built-in leader hierarchy shall be compact, mnemonic, and populated only by
 commands available in the current context.
@@ -438,15 +418,12 @@ commands available in the current context.
 | `<Space>x` | Diagnostics | `xX` buffer diagnostics, `xx` workspace diagnostics |
 | `<Space>u` | UI | `uh` toggle inlay hints |
 | `<Space>w` | Windows | `wd` close, `wo` keep only, `w-` split below, `w|` split right |
-| `<Space>a` | `codex-watch` | `at` start/stop, `as` status, `ar` restart, `ao` run once, `al` logs, `ad` dry-run, `aw` workspace-write |
 
 `<Space>-` and `<Space>|` shall remain direct aliases for splitting below and to
-the right. Dry-run and workspace-write controls shall appear within the
-`<Space>a` menu only when `codex-watch` is stopped, and changing either shall
-require confirmation. User configuration may remap commands or groups while
-retaining validation for collisions and unreachable bindings.
+the right. User configuration may remap commands or groups while retaining
+validation for collisions and unreachable bindings.
 
-## Requirement 22 — Process security, diagnostics, and privacy
+## Requirement 21 — Process security, diagnostics, and privacy
 
 External tool integrations shall be treated as supervised, fallible processes rather than
 trusted extensions of the editor core.
@@ -473,7 +450,7 @@ trusted extensions of the editor core.
   network access. Any network behavior of a launched tool remains explicit in
   that tool's configuration and status.
 
-## Requirement 23 — MVP boundary and release criteria
+## Requirement 22 — MVP boundary and release criteria
 
 The initial release intentionally excludes full Vim/Neovim compatibility,
 Vimscript or Lua, a plugin/package manager, a Git client, debugger integration,
@@ -488,9 +465,8 @@ The MVP is complete only when:
   representative Rust workspace using the documented modal command set.
 - Project exploration, file finding, grep, buffers, and splits work without
   optional external utilities.
-- The required `rust-analyzer` operations and supervised `codex-watch` workflow
-  pass end-to-end tests, including missing, slow, malformed, and crashed process
-  cases.
+- The required `rust-analyzer` operations pass end-to-end tests, including
+  missing, slow, malformed, and crashed process cases.
 - Unicode editing, coordinate conversion, modal composition, file persistence,
   and recovery have property, regression, or fuzz coverage appropriate to their
   risk.

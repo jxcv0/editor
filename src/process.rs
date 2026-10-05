@@ -749,82 +749,6 @@ impl BoundedLog {
     }
 }
 
-/// Incremental newline framing with a strict per-line bound.
-#[derive(Clone, Debug)]
-pub struct BoundedLineDecoder {
-    pending: Vec<u8>,
-    max_line_bytes: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LineDecodeError {
-    LineTooLong { limit: usize },
-}
-
-impl fmt::Display for LineDecodeError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::LineTooLong { limit } => {
-                write!(formatter, "protocol line exceeds the {limit}-byte limit")
-            }
-        }
-    }
-}
-
-impl std::error::Error for LineDecodeError {}
-
-impl BoundedLineDecoder {
-    pub fn new(max_line_bytes: usize) -> Self {
-        Self {
-            pending: Vec::new(),
-            max_line_bytes: max_line_bytes.max(1),
-        }
-    }
-
-    /// Append bytes and return all complete lines.  The newline and an optional preceding carriage
-    /// return are omitted.
-    pub fn push(&mut self, mut bytes: &[u8]) -> Result<Vec<Vec<u8>>, LineDecodeError> {
-        let mut lines = Vec::new();
-        while let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') {
-            let (part, remainder) = bytes.split_at(newline);
-            if self.pending.len().saturating_add(part.len()) > self.max_line_bytes {
-                self.pending.clear();
-                return Err(LineDecodeError::LineTooLong {
-                    limit: self.max_line_bytes,
-                });
-            }
-            self.pending.extend_from_slice(part);
-            if self.pending.last() == Some(&b'\r') {
-                self.pending.pop();
-            }
-            lines.push(std::mem::take(&mut self.pending));
-            bytes = &remainder[1..];
-        }
-
-        if self.pending.len().saturating_add(bytes.len()) > self.max_line_bytes {
-            self.pending.clear();
-            return Err(LineDecodeError::LineTooLong {
-                limit: self.max_line_bytes,
-            });
-        }
-        self.pending.extend_from_slice(bytes);
-        Ok(lines)
-    }
-
-    /// Return the final unterminated line, if any.
-    pub fn finish(&mut self) -> Option<Vec<u8>> {
-        if self.pending.is_empty() {
-            None
-        } else {
-            Some(std::mem::take(&mut self.pending))
-        }
-    }
-
-    pub fn pending_len(&self) -> usize {
-        self.pending.len()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1154,28 +1078,6 @@ mod tests {
             done.send(()).unwrap();
         });
         finished.recv_timeout(Duration::from_secs(2)).unwrap();
-    }
-
-    #[test]
-    fn line_decoder_handles_fragmented_crlf_and_multiple_lines() {
-        let mut decoder = BoundedLineDecoder::new(32);
-        assert!(decoder.push(b"one\r").unwrap().is_empty());
-        assert_eq!(
-            decoder.push(b"\ntwo\nthree").unwrap(),
-            vec![b"one".to_vec(), b"two".to_vec()]
-        );
-        assert_eq!(decoder.finish(), Some(b"three".to_vec()));
-    }
-
-    #[test]
-    fn line_decoder_rejects_an_unterminated_oversized_line() {
-        let mut decoder = BoundedLineDecoder::new(4);
-        assert!(decoder.push(b"1234").unwrap().is_empty());
-        assert_eq!(
-            decoder.push(b"5"),
-            Err(LineDecodeError::LineTooLong { limit: 4 })
-        );
-        assert_eq!(decoder.pending_len(), 0);
     }
 
     #[test]

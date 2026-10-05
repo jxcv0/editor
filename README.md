@@ -2,9 +2,9 @@
 
 `editor` is an experimental, modal terminal editor written entirely in Rust.
 It targets a focused Linux/Rust workflow: fast local editing, built-in project
-navigation, a small discoverable leader menu, and supervised optional
-`rust-analyzer` and `codex-watch` processes—without Vim/Neovim runtimes or an
-embedded scripting language.
+navigation, a small discoverable leader menu, and a supervised optional
+`rust-analyzer` process—without Vim/Neovim runtimes or an embedded scripting
+language.
 
 > **Status:** early MVP, not a finished release. The repository has tested text,
 > modal, terminal, search, persistence, and process-protocol building blocks,
@@ -101,7 +101,9 @@ clusters, and buffer/LSP position conversions distinguish grapheme, byte, and
 UTF-16 coordinates.
 
 Normal saves reject a file that changed on disk since it was opened or last
-saved. Where the platform permits, saving uses a same-directory atomic
+saved. While idle, clean buffers are checked for external changes every two
+seconds and reloaded on the foreground thread; modified buffers are left
+untouched. Where the platform permits, saving uses a same-directory atomic
 replacement while preserving the existing line endings, final-newline state,
 Unix permissions, and symlink target. `:w!`, `:e!`, `:bd!`, and `:q!` are the
 explicit force/discard paths; review the command reference before using them.
@@ -178,10 +180,6 @@ selection = "#2b4548"
 path = "rust-analyzer"
 args = []
 
-[tools.codex_watch]
-path = "codex-watch"
-args = ["--json-events"]
-
 [limits]
 max_file_bytes = 104857600
 large_file_bytes = 10485760
@@ -222,8 +220,8 @@ runner. Closing the editor closes the PTY and terminates its shell.
 
 ## Optional external tools
 
-Neither integration is required for editing, and the editor does not download,
-update, or invoke either tool through a shell.
+No external tool is required for editing, and the editor does not download,
+update, or invoke one through a shell.
 
 ### `rust-analyzer`
 
@@ -250,34 +248,6 @@ completely apply multi-file workspace edits or code actions.
 Request cancellation and several presentation details remain incomplete. See
 [docs/COMMANDS.md](docs/COMMANDS.md).
 
-### `codex-watch`
-
-Install a compatible `codex-watch` executable separately. The integration
-expects one JSON object per stdout line with a nonempty `type`, `event`, or
-`kind` string and owns the `--json-events`, `--once`, `--dry-run`, and
-`--workspace-write` control flags.
-
-Construction alone never launches it. A project must be explicitly enabled
-and assigned either dry-run or workspace-write mode before start/run-once.
-Selecting either mode requires pressing the same leader action twice within
-five seconds; this is the current confirmation gate, not a separate dialog.
-Status, parsed JSON, stderr, malformed input, queue overflow, and crashes are
-exposed as events. Bounded raw output is retained separately for the logs view.
-The watcher's `{"type":"status","state":"waiting",...}` events drive the status
-bar: preparing, waiting, and retrying show processing; applied/previewed show
-completion when no other file is active. Task summaries and failures appear in
-messages. Active tasks with a reported line show an animated spinner beside that
-line's number, alongside any diagnostic marker. Spinners update every 120 ms and
-clear when the task finishes, fails, becomes idle, or the watcher stops. The
-reported line identifies the task's `@codex` marker; events without a valid line
-do not add a spinner. Line activity survives dropped UI events and is bounded
-to 4,096 task locations and 4 MiB of retained path text.
-Completed files trigger a reload of clean buffers even while another
-task is processing. Active task tracking is capped at 4,096 paths and 4 MiB of
-path text; exceeding either limit fails the integration with an explicit error.
-Safe automatic reload/review of files changed by the tool is not complete, so
-inspect changes with version control—especially in workspace-write mode.
-
 ## Integration status
 
 “Implemented” below means code and focused tests exist. It does not imply that
@@ -291,7 +261,6 @@ all of `DESIGN.md`'s end-to-end or performance release criteria have passed.
 | Project discovery, finder, and text/regex search | Root selection is a synchronous ancestor walk before the first frame. Full-tree scanning and text search then run in background threads, stream through bounded cancellable queues, and honor hidden/ignored controls. The interactive grep picker uses regex mode and cancels the previous task when its query changes; previews are not yet rendered. |
 | Explorer | Expandable directory tree with lazy background loading, keyboard navigation, active-file reveal, hidden/ignored filters, and session-persisted expansion. Automatic external-filesystem refresh and confirmed create/rename/delete operations remain. |
 | `rust-analyzer` | Supervised asynchronous transport, initialization, manual restart, versioned full-text sync, typed requests, diagnostics, basic response UI/edit application, size bounds, and failure status are wired. Snippets, code-action execution, multi-file rename, inlay rendering, request cancellation, and capability-specific disabled states remain. |
-| `codex-watch` | Supervised lifecycle, explicit enable/mode gate, double-action confirmation within five seconds, JSON event parsing, status, and bounded logs are wired. Enablement is not remembered and dirty-buffer conflict review is incomplete. Clean files receive a synchronous metadata poll; detected external changes are reread/reloaded on the foreground thread, including a check after Codex completion. |
 | Recovery and sessions | Dirty named and scratch/stdin buffers are journaled asynchronously, queued journal work is joined at shutdown, and content-free named-file sessions restore active selection, pane cursor/viewports, and explorer metadata. Recovery choice/application, unnamed session buffers, exact split topology/orientation, explicit-discard cleanup, and persistent undo are not release-complete. |
 | Performance/release evidence | `editor-bench` reports warm 1 MiB buffer-open and component p95 checks for insertion, long-word movement, whole-file indentation, long-line rendering, and finder input. It does not measure process launch through terminal flush or runtime maintenance, has no target-laptop/CI baseline yet, and therefore does not prove the complete 50 ms/8 ms release budgets. Broader fuzz/property coverage remains release work. |
 

@@ -306,7 +306,6 @@ pub enum EditorRequest {
     TerminalInput(Vec<u8>),
     RustAnalyzer(CommandId),
     RustAnalyzerWithArgument(CommandId, String),
-    CodexWatch(CommandId),
     CheckHealth,
 }
 
@@ -362,9 +361,6 @@ pub struct Editor {
     pub messages: VecDeque<String>,
     pub diagnostics: Vec<Diagnostic>,
     pub rust_analyzer_status: String,
-    pub codex_watch_status: String,
-    pub codex_working_lines: crate::codex_watch::CodexWorkingLines,
-    pub codex_spinner_frame: usize,
     pub inlay_hints: bool,
     pub should_quit: bool,
     pub request: EditorRequest,
@@ -431,9 +427,6 @@ impl Editor {
             messages: VecDeque::new(),
             diagnostics: Vec::new(),
             rust_analyzer_status: "starting".into(),
-            codex_watch_status: "stopped".into(),
-            codex_working_lines: crate::codex_watch::CodexWorkingLines::new(),
-            codex_spinner_frame: 0,
             inlay_hints: true,
             should_quit: false,
             request: EditorRequest::None,
@@ -1802,13 +1795,6 @@ impl Editor {
                     self.request = EditorRequest::RustAnalyzer(id);
                 }
             }
-            CommandId::CodexToggle
-            | CommandId::CodexStatus
-            | CommandId::CodexRestart
-            | CommandId::CodexRunOnce
-            | CommandId::CodexLogs
-            | CommandId::CodexDryRun
-            | CommandId::CodexWorkspaceWrite => self.request = EditorRequest::CodexWatch(id),
         }
     }
 

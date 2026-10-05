@@ -11,9 +11,9 @@ not currently capped again. `Esc` cancels a pending operator, count, register,
 find, `g`/diagnostic prefix, leader sequence, prompt, or selection.
 
 This reference distinguishes editing-core support from external integration.
-An LSP or `codex-watch` binding may be registered and visible while its final
-UI action is unavailable; in that case the command must report status instead
-of editing text.
+An LSP binding may be registered and visible while its final UI action is
+unavailable; in that case the command must report status instead of editing
+text.
 
 ## Normal mode
 
@@ -232,10 +232,6 @@ registry is:
 | `<Space>\|`, `<Space>w\|` | Split right | Create a vertical split showing the same buffer. |
 | `<Space>wd` | Close pane | Refuses to close the last pane. The buffer remains open. |
 | `<Space>wo` | Keep only pane | Remove the other panes without deleting their buffers. |
-| `<Space>at` | `codex-watch` start/stop | Routed to the supervised integration; explicit enablement and run mode are still required. |
-| `<Space>as` | `codex-watch` status | Routed to the integration. |
-| `<Space>ar`, `<Space>ao`, `<Space>al` | Restart, run once, logs | Routed to the integration. |
-| `<Space>ad`, `<Space>aw` | Dry-run/workspace-write | Press the same action twice within five seconds to confirm, enable the project integration, and select that mode. |
 
 The menu registry is declarative, but context filtering/disabled annotations
 are incomplete. A registered integration command can therefore be shown even

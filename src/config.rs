@@ -62,7 +62,6 @@ pub struct ThemeConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct ToolsConfig {
     pub rust_analyzer: ToolConfig,
-    pub codex_watch: ToolConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -145,10 +144,6 @@ impl Default for ToolsConfig {
             rust_analyzer: ToolConfig {
                 path: "rust-analyzer".into(),
                 args: Vec::new(),
-            },
-            codex_watch: ToolConfig {
-                path: "codex-watch".into(),
-                args: vec!["--json-events".into()],
             },
         }
     }
