@@ -287,6 +287,40 @@ segmentation implementation.
 **Decision:** Accepted to isolate the host terminal from child-controlled
 escape streams while preserving expected interactive terminal behavior.
 
+## Optional desktop dependencies (`gui` feature)
+
+These dependencies are absent from the default terminal build. The desktop
+retains Rust first-party code and adds no scripting or plugin runtime. The
+native-library statements above describe the original terminal dependency
+set; the GUI additionally loads the system Vulkan/window-system libraries.
+
+| Direct dependency | Purpose and alternative considered | Costs and boundary | License |
+| --- | --- | --- | --- |
+| `egui` =0.33.3 | Native widgets, layout, font atlas, and tessellation. A bespoke widget system would duplicate focus, DPI, clipping, and layout behavior. | Pure Rust; bundled fonts allow startup without font-file discovery. CPU tessellation and atlas allocation add frame/startup costs, not yet covered by the TUI budget benchmark. | MIT OR Apache-2.0 |
+| `egui-wgpu` =0.33.3 | Upload egui textures/geometry and issue the render pass. A local renderer would duplicate this version-coupled adapter. | Rust; bounded visible cells generate meshes and texture updates. Default features are disabled. Versions are pinned together with egui. | MIT OR Apache-2.0 |
+| `egui-winit` =0.33.3 | Window input, DPI, clipboard, and platform output. Direct platform adapters would duplicate Wayland/X11/IME behavior. | Rust adapter; clipboard uses arboard/smithay-clipboard and communicates with the desktop clipboard service. Only clipboard, Wayland, and X11 features are requested; URL launching is not enabled. | MIT OR Apache-2.0 |
+| `winit` 0.30.13 | Native event loop, windows, resize, focus, keyboard, and IME events. Terminal input cannot supply these; separate raw X11/Wayland code would expand the maintenance boundary. | Linux backends use system X11/XKB/Wayland APIs, including dynamic loading. Driver/compositor behavior requires native smoke testing. Transitive platform crates include non-Linux native boundaries that are outside the Linux target's validation. | Apache-2.0 |
+| `wgpu` 27.0.1 | GPU device/surface lifecycle and presentation. Direct Vulkan would require a larger unsafe renderer and would not improve widget behavior. | Rust implementation with `std`, `vulkan`, and `wgsl` only. `ash` dynamically loads the system Vulkan loader/driver; that third-party native boundary is explicitly accepted. No Vulkan SDK or shader compiler subprocess is required. GPU initialization, shader compilation, and driver memory are outside the existing startup benchmark. | MIT OR Apache-2.0 |
+| `futures-lite` 2.6.1 | Drive wgpu initialization futures once during native startup. A full asynchronous runtime is unnecessary. | Rust; `block_on` is restricted to window/device setup. Foreground editing uses the existing bounded runtime polling. | MIT OR Apache-2.0 |
+| `ab_glyph` 0.2.32 | Rasterize substituted Fira Code glyph IDs into an egui texture atlas. Reuses egui's existing rasterizer instead of a second text rendering stack. | Pure Rust, already in the GUI graph. Only substituted glyphs need the separate bounded atlas; it is recreated for zoom/DPI changes. | Apache-2.0 |
+| `ttf-parser` 0.25.1 | Read the embedded font's character map and GSUB contextual substitutions. A general text-shaping stack would cover scripts beyond the current cell renderer's scope. | Pure Rust, already in the GUI graph. The evaluator is limited to the pinned font's ASCII `calt` program, audited in tests; it never parses user-supplied fonts. | MIT OR Apache-2.0 |
+
+The GUI also embeds the unmodified FiraCode Nerd Font Mono Regular asset
+(Fira Code 6.2 / Nerd Fonts 3.4.0, about 2.65 MB), licensed under SIL OFL 1.1.
+Its copyright, full license, source, and SHA-256 are in
+[`assets/fonts`](../assets/fonts/README.md). This asset is absent from terminal
+builds and requires no runtime installation or download. Font replacement
+requires reviewing the font-specific shaping assumptions and fixtures.
+
+**Decision:** Accepted for the explicitly requested optional desktop frontend.
+System Vulkan drivers and window/clipboard services are trusted native runtime
+dependencies; their versions, vulnerabilities, and compositor compatibility
+remain platform maintenance responsibilities. Surface/device errors are handled,
+text/worker ownership remains in the core, and no desktop library is loaded by
+a terminal-only build. The larger optional graph must be included in future
+advisory/license reviews. Offscreen validation with Mesa software Vulkan proves
+render-path operation, not hardware performance or window-system correctness.
+
 ## Development dependency
 
 ### `tempfile` 3 (locked: 3.27.0)
@@ -320,6 +354,17 @@ ordinary editing. It is never downloaded automatically. This integration does
 not create a general-purpose plugin runtime.
 The integrated terminal is separately user-triggered and directly launches the
 user's shell through `portable-pty`; it is not used to implement tool commands.
+
+`git` is an optional executable for repository status, diffs, line history,
+and explicitly requested file staging/unstaging. It is also needed by the
+repository/PTY integration tests. Using the installed command avoids a linked
+Git library and keeps repository-format handling in Git. Calls use structured
+OS-string arguments, literal pathspecs, bounded output, ten-second child
+timeouts, and process-group supervision. The background worker starts after
+the first frame; a missing Git installation does not affect local editing.
+External diff/textconv drivers and pagers are disabled, and no network Git
+operations are exposed. Git itself retains its normal repository configuration
+and attributes semantics, including clean filters during explicit staging.
 
 ## Review outcome
 

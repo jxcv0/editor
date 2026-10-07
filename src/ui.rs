@@ -7,7 +7,7 @@ use std::{
     io::{self, Stdout, Write},
     ops::Deref,
     panic,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -23,12 +23,14 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::{
+    animation::Motion,
     buffer::Buffer,
     check::{CheckEntry, CheckLevel, CheckStatus},
     command::{self, CommandSource},
     config::parse_hex_color,
     editor::{
-        DiagnosticSeverity, Editor, Focus, Layout, Mode, Orientation, Pane, PickerKind, VisualKind,
+        DiagnosticSeverity, Editor, Focus, InlayHint, Layout, Mode, Orientation, Pane, PickerKind,
+        VisualKind,
     },
     input::{Key, KeyCode, Modifiers},
     syntax::{self, Highlight},
@@ -180,6 +182,20 @@ pub struct Canvas {
 }
 
 impl Canvas {
+    /// Backend-neutral cells, including wide-glyph continuation cells.
+    #[cfg(feature = "gui")]
+    pub(crate) fn cells(&self) -> impl Iterator<Item = (u16, u16, &str, Style, bool)> {
+        self.cells.iter().enumerate().map(|(i, cell)| {
+            (
+                (i % usize::from(self.width)) as u16,
+                (i / usize::from(self.width)) as u16,
+                cell.symbol.as_str(),
+                cell.style,
+                cell.continuation,
+            )
+        })
+    }
+
     pub fn new(width: u16, height: u16, style: Style) -> Self {
         let cell = Cell {
             style,
@@ -741,9 +757,104 @@ impl CachedLine {
 pub struct FrameBuilder {
     lines: HashMap<u64, CachedLine>,
     frame: u64,
+    motions: HashMap<u64, PaneMotion>,
+    animation_time: Option<Instant>,
+    animating: bool,
+    native_chrome: bool,
+    #[cfg(feature = "gui")]
+    hit_panes: Vec<(Pane, Rect)>,
+    #[cfg(feature = "gui")]
+    hit_terminal: Option<Rect>,
+    #[cfg(feature = "gui")]
+    hit_check: Option<Rect>,
+}
+
+struct PaneMotion {
+    identity: (u64, u64),
+    rect: Rect,
+    viewport: Motion,
+    cursor: Option<Motion>,
+    last_viewport: (usize, usize),
+    scrolled: bool,
+    used_frame: u64,
 }
 
 impl FrameBuilder {
+    #[cfg(feature = "gui")]
+    pub(crate) fn draw_workspace(
+        &mut self,
+        editor: &mut Editor,
+        width: u16,
+        height: u16,
+    ) -> (Canvas, Option<(u16, u16)>) {
+        self.native_chrome = true;
+        let frame = self.draw_animated_at(editor, width, height, Instant::now());
+        self.native_chrome = false;
+        frame
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) fn place_cursor(&mut self, editor: &mut Editor, x: u16, y: u16) {
+        if editor.git.visible || editor.picker.is_some() || editor.mode == Mode::Leader {
+            return;
+        }
+        let contains = |r: Rect| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
+        if self.hit_terminal.is_some_and(contains) || self.hit_check.is_some_and(contains) {
+            let terminal = self.hit_terminal.is_some_and(contains);
+            editor.focus = Focus::Editor;
+            editor.handle_key(Key::plain(KeyCode::Esc));
+            editor.focus = if terminal {
+                Focus::Terminal
+            } else {
+                Focus::Check
+            };
+            return;
+        }
+        let Some((shown, rect)) = self
+            .hit_panes
+            .iter()
+            .find(|(_, r)| x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height)
+            .cloned()
+        else {
+            return;
+        };
+        // Finish transactions before switching panes or moving the insertion point.
+        editor.focus = Focus::Editor;
+        editor.handle_key(Key::plain(KeyCode::Esc));
+        editor.active_pane = shown.id;
+        editor.focus = Focus::Editor;
+        let buffer = editor.active_buffer();
+        let line = (shown.viewport_line + usize::from(y - rect.y))
+            .min(buffer.line_count().saturating_sub(1));
+        let digits = buffer.line_count().max(1).to_string().len() as u16;
+        let gutter = (digits + 3 + git_gutter(editor, buffer)).min(rect.width.saturating_sub(1));
+        let target = usize::from(x.saturating_sub(rect.x + gutter)) + shown.viewport_column;
+        let text = buffer.line(line).unwrap_or("");
+        let hints = line_hints(editor, buffer, line);
+        let (mut column, mut source, mut index) = (0usize, 0usize, 0usize);
+        for (i, g) in text.graphemes(true).enumerate() {
+            column += hints
+                .iter()
+                .filter(|h| h.position.grapheme == i)
+                .map(|h| UnicodeWidthStr::width(h.label.as_str()))
+                .sum::<usize>();
+            let width = if g == "\t" {
+                editor.config.editor.tab_width - source % editor.config.editor.tab_width
+            } else {
+                UnicodeWidthStr::width(g).max(1)
+            };
+            if target < column + width {
+                index = i;
+                break;
+            }
+            source += width;
+            column += width;
+            index = i + 1;
+        }
+        editor.active_pane_mut().cursor = crate::buffer::Pos::new(line, index);
+        editor.active_pane_mut().desired_column = index;
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -754,12 +865,155 @@ impl FrameBuilder {
         width: u16,
         height: u16,
     ) -> (Canvas, Option<(u16, u16)>) {
+        self.animation_time = None;
+        self.draw_frame(editor, width, height)
+    }
+
+    /// Advance presentation without delaying input or changing logical panes.
+    pub fn draw_animated_at(
+        &mut self,
+        editor: &mut Editor,
+        width: u16,
+        height: u16,
+        now: Instant,
+    ) -> (Canvas, Option<(u16, u16)>) {
+        self.animation_time = Some(now);
+        self.draw_frame(editor, width, height)
+    }
+
+    pub fn is_animating(&self) -> bool {
+        self.animating
+    }
+
+    fn draw_frame(
+        &mut self,
+        editor: &mut Editor,
+        width: u16,
+        height: u16,
+    ) -> (Canvas, Option<(u16, u16)>) {
+        self.animating = false;
+        #[cfg(feature = "gui")]
+        self.hit_panes.clear();
         self.frame = self.frame.wrapping_add(1);
         let result = build_frame(self, editor, width, height);
         if self.lines.len() > 256 {
             self.lines.retain(|_, line| line.used_frame == self.frame);
         }
+        self.motions
+            .retain(|_, motion| motion.used_frame == self.frame);
         result
+    }
+
+    fn presented_pane(&mut self, editor: &Editor, pane: &Pane, rect: Rect) -> Pane {
+        let mut shown = pane.clone();
+        let Some(now) = self.animation_time.filter(|_| {
+            editor.mode == Mode::Normal
+                && editor.focus == Focus::Editor
+                && editor.picker.is_none()
+                && editor.hover.is_none()
+                && !editor.git.visible
+        }) else {
+            self.motions.remove(&pane.id);
+            return shown;
+        };
+        let buffer = &editor.buffers[pane.buffer].buffer;
+        let identity = (buffer.line_cache_key(0).unwrap_or(0), buffer.revision());
+        let target = (pane.viewport_column, pane.viewport_line);
+        let motion = self.motions.entry(pane.id).or_insert_with(|| PaneMotion {
+            identity,
+            rect,
+            viewport: Motion::new(target, now),
+            cursor: None,
+            last_viewport: target,
+            scrolled: false,
+            used_frame: self.frame,
+        });
+        if motion.identity != identity || motion.rect != rect {
+            motion.identity = identity;
+            motion.rect = rect;
+            motion.viewport = Motion::new(target, now);
+            motion.cursor = None;
+        }
+        motion.used_frame = self.frame;
+        if editor.config.ui.smooth_scroll {
+            motion.viewport.retarget(
+                target,
+                now,
+                Duration::from_millis(100),
+                (usize::from(rect.width / 2), usize::from(rect.height / 2)),
+            );
+        } else {
+            motion.viewport = Motion::new(target, now);
+        }
+        let (column, line) = motion.viewport.position(now);
+        motion.scrolled = motion.viewport.active(now) || motion.last_viewport != (column, line);
+        motion.last_viewport = (column, line);
+        shown.viewport_column = column;
+        shown.viewport_line = line;
+        self.animating |= motion.viewport.active(now);
+        shown
+    }
+
+    fn presented_cursor(
+        &mut self,
+        canvas: &Canvas,
+        editor: &Editor,
+        id: u64,
+        cursor: Option<(u16, u16)>,
+    ) -> Option<(u16, u16)> {
+        let Some(now) = self.animation_time else {
+            return cursor;
+        };
+        let Some(motion) = self.motions.get_mut(&id) else {
+            return cursor;
+        };
+        let Some((x, y)) = cursor else {
+            if motion.viewport.active(now) {
+                return motion.cursor.as_ref().map(|cursor| {
+                    let (x, y) = cursor.position(now);
+                    let (mut x, y) = (x as u16, y as u16);
+                    while x > motion.rect.x
+                        && canvas
+                            .index(x, y)
+                            .is_some_and(|i| canvas.cells[i].continuation)
+                    {
+                        x -= 1;
+                    }
+                    (x, y)
+                });
+            }
+            motion.cursor = None;
+            return None;
+        };
+        let target = (usize::from(x), usize::from(y));
+        if !editor.config.ui.cursor_animation || motion.scrolled {
+            motion.cursor = Some(Motion::new(target, now));
+            return cursor;
+        }
+        let tween = motion
+            .cursor
+            .get_or_insert_with(|| Motion::new(target, now));
+        tween.retarget(
+            target,
+            now,
+            Duration::from_millis(70),
+            (
+                usize::from(motion.rect.width),
+                usize::from(motion.rect.height),
+            ),
+        );
+        let (x, y) = tween.position(now);
+        self.animating |= tween.active(now);
+        let (mut x, y) = (x as u16, y as u16);
+        // Never place the terminal cursor on the trailing cell of a wide glyph.
+        while x > motion.rect.x
+            && canvas
+                .index(x, y)
+                .is_some_and(|i| canvas.cells[i].continuation)
+        {
+            x -= 1;
+        }
+        Some((x, y))
     }
 
     fn line(&mut self, buffer: &Buffer, number: usize, tab_width: usize) -> &mut CachedLine {
@@ -805,7 +1059,7 @@ fn build_frame(
         height: height.saturating_sub(chrome_height),
     };
     let (mut content, terminal_rect) = terminal_layout(content, editor.terminal.visible);
-    if editor.explorer.open && content.width >= 40 {
+    if editor.explorer.open && content.width >= 40 && !builder.native_chrome {
         let explorer_width = editor
             .explorer
             .width
@@ -839,6 +1093,11 @@ fn build_frame(
     } else {
         None
     };
+    #[cfg(feature = "gui")]
+    {
+        builder.hit_terminal = terminal_rect;
+        builder.hit_check = check_rect;
+    }
 
     let mut pane_rects = Vec::new();
     layout_rects(&editor.layout, content, &mut pane_rects);
@@ -846,9 +1105,12 @@ fn build_frame(
     let mut editor_cursor = None;
     for (pane_id, rect) in &pane_rects {
         if let Some(pane) = editor.panes.iter().find(|pane| pane.id == *pane_id) {
-            let cursor = render_pane(builder, &mut canvas, editor, pane, *rect, palette);
+            let shown = builder.presented_pane(editor, pane, *rect);
+            #[cfg(feature = "gui")]
+            builder.hit_panes.push((shown.clone(), *rect));
+            let cursor = render_pane(builder, &mut canvas, editor, &shown, *rect, palette);
             if *pane_id == editor.active_pane {
-                editor_cursor = cursor;
+                editor_cursor = builder.presented_cursor(&canvas, editor, *pane_id, cursor);
             }
         }
     }
@@ -903,11 +1165,23 @@ fn build_frame(
         );
     }
 
+    if editor.mode == Mode::Normal
+        && editor.focus == Focus::Editor
+        && editor.picker.is_none()
+        && let Some(cursor) = editor_cursor
+        && let Some((_, rect)) = pane_rects.iter().find(|(id, _)| *id == editor.active_pane)
+    {
+        render_hover(&mut canvas, editor, *rect, cursor, palette);
+    }
     if matches!(editor.mode, Mode::Leader) {
         render_leader(&mut canvas, editor, palette);
     }
     if editor.picker.is_some() {
         render_picker(&mut canvas, editor, palette);
+    }
+    if editor.git.visible {
+        render_git(&mut canvas, editor, palette);
+        return (canvas, None);
     }
 
     let cursor = if let Some(picker) = &editor.picker {
@@ -961,6 +1235,275 @@ fn terminal_layout(content: Rect, visible: bool) -> (Rect, Option<Rect>) {
     (editor, Some(terminal))
 }
 
+fn render_git(canvas: &mut Canvas, editor: &mut Editor, palette: Palette) {
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        width: canvas.width,
+        height: canvas.height.saturating_sub(1),
+    };
+    if rect.height == 0 {
+        return;
+    }
+    canvas.fill(rect, " ", Style::new(palette.foreground, palette.surface));
+    let panel = &mut editor.git;
+    let title = if panel.loading {
+        "Git · loading…".to_owned()
+    } else if let Some(doc) = &panel.document {
+        doc.title.clone()
+    } else {
+        format!(
+            "Git · {} · staged / unstaged",
+            panel
+                .snapshot
+                .as_ref()
+                .map_or("unavailable", |s| s.branch.as_str())
+        )
+    };
+    canvas.text(
+        0,
+        0,
+        &title,
+        rect.width,
+        Style::new(palette.accent, palette.status).bold(),
+    );
+    let body = usize::from(rect.height.saturating_sub(2));
+    if let Some(error) = &panel.error {
+        for (i, row) in wrap_text(error, usize::from(rect.width), 0)
+            .iter()
+            .take(body)
+            .enumerate()
+        {
+            canvas.text(
+                0,
+                1 + i as u16,
+                row,
+                rect.width,
+                Style::new(palette.error, palette.surface),
+            );
+        }
+    } else if let Some(doc) = &panel.document {
+        if rect.width >= 64
+            && doc
+                .rows
+                .iter()
+                .any(|row| matches!(row, crate::git::DiffRow::Lines { .. }))
+        {
+            render_split_diff(
+                canvas,
+                doc,
+                &mut panel.scroll,
+                panel.horizontal,
+                rect,
+                palette,
+            );
+        } else {
+            panel.scroll = panel
+                .scroll
+                .min(doc.lines.len().saturating_sub(body.max(1)));
+            for (i, line) in doc.lines.iter().skip(panel.scroll).take(body).enumerate() {
+                let color = if line.starts_with('+') {
+                    palette.accent
+                } else if line.starts_with('-') {
+                    palette.error
+                } else if line.starts_with("@@") {
+                    palette.info
+                } else {
+                    palette.foreground
+                };
+                let text: String = line
+                    .graphemes(true)
+                    .skip(panel.horizontal)
+                    .take(usize::from(rect.width))
+                    .collect();
+                canvas.text(
+                    0,
+                    1 + i as u16,
+                    &text,
+                    rect.width,
+                    Style::new(color, palette.surface),
+                );
+            }
+        }
+    } else if let Some(snapshot) = &panel.snapshot {
+        panel.scroll = panel.scroll.min(panel.selected);
+        if panel.selected >= panel.scroll.saturating_add(body) {
+            panel.scroll = panel.selected.saturating_sub(body.saturating_sub(1));
+        }
+        if snapshot.entries.is_empty() && body > 0 {
+            canvas.text(
+                1,
+                1,
+                "Working tree clean",
+                rect.width.saturating_sub(1),
+                Style::new(palette.muted, palette.surface),
+            );
+        }
+        for (i, entry) in snapshot
+            .entries
+            .iter()
+            .enumerate()
+            .skip(panel.scroll)
+            .take(body)
+        {
+            let y = 1 + (i - panel.scroll) as u16;
+            let bg = if i == panel.selected {
+                palette.selection
+            } else {
+                palette.surface
+            };
+            canvas.fill(
+                Rect {
+                    y,
+                    height: 1,
+                    ..rect
+                },
+                " ",
+                Style::new(palette.foreground, bg),
+            );
+            let label = format!("{}{} {}", entry.index, entry.worktree, entry.path.display());
+            let text: String = label
+                .graphemes(true)
+                .skip(panel.horizontal)
+                .take(usize::from(rect.width))
+                .collect();
+            canvas.text(0, y, &text, rect.width, Style::new(palette.foreground, bg));
+        }
+    }
+    if rect.height >= 2 {
+        canvas.text(0, rect.height - 1, "j/k move  d/D/H diff  s stage  u unstage  o open  r refresh  Backspace status  q close",
+            rect.width, Style::new(palette.muted, palette.status));
+    }
+}
+
+fn render_split_diff(
+    canvas: &mut Canvas,
+    doc: &crate::git::Document,
+    scroll: &mut usize,
+    horizontal: usize,
+    rect: Rect,
+    palette: Palette,
+) {
+    let middle = rect.width / 2;
+    let right = middle + 1;
+    let body = usize::from(rect.height.saturating_sub(3));
+    if rect.height < 3 {
+        return;
+    }
+    canvas.text(
+        0,
+        1,
+        "  BEFORE",
+        middle,
+        Style::new(palette.error, palette.status).bold(),
+    );
+    canvas.text(
+        right,
+        1,
+        "  AFTER",
+        rect.width - right,
+        Style::new(palette.accent, palette.status).bold(),
+    );
+    *scroll = (*scroll).min(doc.rows.len().saturating_sub(body.max(1)));
+    for (i, row) in doc.rows.iter().skip(*scroll).take(body).enumerate() {
+        let y = 2 + i as u16;
+        match row {
+            crate::git::DiffRow::Header(text) => {
+                canvas.text(
+                    0,
+                    y,
+                    text,
+                    rect.width,
+                    Style::new(palette.info, palette.status),
+                );
+            }
+            crate::git::DiffRow::Lines { old, new } => {
+                for (line, x, width, color, marker) in [
+                    (old, 0, middle, palette.error, '-'),
+                    (new, right, rect.width - right, palette.accent, '+'),
+                ] {
+                    let bg = if line.as_ref().is_some_and(|l| l.changed) {
+                        palette.surface.mix(color, 12)
+                    } else {
+                        palette.surface
+                    };
+                    canvas.fill(
+                        Rect {
+                            x,
+                            y,
+                            width,
+                            height: 1,
+                        },
+                        " ",
+                        Style::new(palette.foreground, bg),
+                    );
+                    if let Some(line) = line {
+                        let number = format!(
+                            "{:>5} {} ",
+                            line.number,
+                            if line.changed { marker } else { ' ' }
+                        );
+                        let gutter = (number.len() as u16).min(width);
+                        canvas.text(
+                            x,
+                            y,
+                            &number,
+                            gutter,
+                            Style::new(if line.changed { color } else { palette.muted }, bg),
+                        );
+                        let text = if line.no_newline {
+                            Cow::Owned(format!("{}  [no newline]", line.text))
+                        } else {
+                            Cow::Borrowed(line.text.as_str())
+                        };
+                        draw_diff_text(
+                            canvas,
+                            x + gutter,
+                            y,
+                            &text,
+                            width - gutter,
+                            horizontal,
+                            Style::new(palette.foreground, bg),
+                        );
+                    }
+                }
+                canvas.put_grapheme(middle, y, "│", Style::new(palette.border, palette.surface));
+            }
+        }
+    }
+}
+
+/// Horizontal offsets are display cells on both sides. Tabs have fixed stops;
+/// clipping a wide grapheme leaves a blank instead of breaking alignment.
+fn draw_diff_text(
+    canvas: &mut Canvas,
+    x: u16,
+    y: u16,
+    text: &str,
+    width: u16,
+    offset: usize,
+    style: Style,
+) {
+    let mut column = 0usize;
+    for g in text.graphemes(true) {
+        let cells = if g == "\t" {
+            4 - column % 4
+        } else {
+            UnicodeWidthStr::width(g).max(1)
+        };
+        if column >= offset {
+            let local = column - offset;
+            if local.saturating_add(cells) > usize::from(width) {
+                break;
+            }
+            if g != "\t" {
+                canvas.put_grapheme(x + local as u16, y, g, style);
+            }
+        }
+        column = column.saturating_add(cells);
+    }
+}
+
 /// Dock the cargo check panel right of the panes, only when both keep a
 /// usable width.
 fn check_panel_layout(content: Rect) -> (Rect, Option<Rect>) {
@@ -993,7 +1536,7 @@ fn render_check_panel(canvas: &mut Canvas, editor: &mut Editor, rect: Rect, pale
     let title_width = canvas.text(
         header.x.saturating_add(1),
         header.y,
-        "CARGO CHECK",
+        &format!("CARGO {}", editor.check.command.name().to_ascii_uppercase()),
         header.width.saturating_sub(2),
         Style::new(
             if focused {
@@ -1044,7 +1587,7 @@ fn render_check_panel(canvas: &mut Canvas, editor: &mut Editor, rect: Rect, pale
             String::new()
         };
         hints.push_str(if focused {
-            "Enter open · r rerun · q back"
+            "Enter open · r rerun · s stop · q back"
         } else {
             "Ctrl-W l focus · <Space>cw hide"
         });
@@ -1065,11 +1608,17 @@ fn render_check_panel(canvas: &mut Canvas, editor: &mut Editor, rect: Rect, pale
     if entries.is_empty() {
         let (text, color) = match &editor.check.status {
             CheckStatus::Idle => ("Not run yet".into(), palette.muted),
-            CheckStatus::Running => ("Running cargo check…".into(), palette.muted),
+            CheckStatus::Running => (
+                format!("Running cargo {}…", editor.check.command.name()),
+                palette.muted,
+            ),
             CheckStatus::Cancelled => ("Cancelled".into(), palette.muted),
             CheckStatus::Failed(error) => (error.clone(), palette.error),
             CheckStatus::Finished { success: false, .. } => (
-                "cargo check failed without diagnostics".into(),
+                format!(
+                    "cargo {} failed without diagnostics",
+                    editor.check.command.name()
+                ),
                 palette.error,
             ),
             CheckStatus::Finished { .. } => ("✓ No errors or warnings".into(), palette.accent),
@@ -1256,7 +1805,7 @@ fn render_terminal(
     } else if editor.focus == Focus::Terminal {
         "  Ctrl-\\ editor  Shift-PgUp scroll".into()
     } else {
-        "  Ctrl-W j focus  <Space>t hide".into()
+        "  Ctrl-W j focus  Ctrl-` hide".into()
     };
     let title_width = canvas.text(
         header.x.saturating_add(1),
@@ -1503,9 +2052,15 @@ fn sync_viewports(builder: &mut FrameBuilder, editor: &mut Editor, rects: &[(u64
         let cursor_column = builder
             .line(buffer, cursor.line, tab_width)
             .at_grapheme(line, cursor.grapheme)
-            .column;
-        let gutter = (buffer.line_count().max(1).to_string().len() as u16 + 3)
-            .min(rect.width.saturating_sub(1));
+            .column
+            + line_hints(editor, buffer, cursor.line)
+                .iter()
+                .filter(|hint| hint.position.grapheme <= cursor.grapheme)
+                .map(|hint| UnicodeWidthStr::width(hint.label.as_str()))
+                .sum::<usize>();
+        let gutter =
+            (buffer.line_count().max(1).to_string().len() as u16 + 3 + git_gutter(editor, buffer))
+                .min(rect.width.saturating_sub(1));
         let visible_lines = usize::from(rect.height.max(1));
         let visible_columns = usize::from(rect.width.saturating_sub(gutter).max(1));
         let pane = &mut editor.panes[pane_index];
@@ -1540,7 +2095,8 @@ fn render_pane(
     let slot = &editor.buffers[pane.buffer];
     let buffer = &slot.buffer;
     let digits = buffer.line_count().max(1).to_string().len() as u16;
-    let gutter = (digits + 3).min(rect.width.saturating_sub(1));
+    let git_width = git_gutter(editor, buffer);
+    let gutter = (digits + 3 + git_width).min(rect.width.saturating_sub(1));
     let content_x = rect.x.saturating_add(gutter);
     let content_width = rect.width.saturating_sub(gutter);
     let diagnostics = editor
@@ -1617,21 +2173,89 @@ fn render_pane(
             );
         }
         let line = buffer.line(line_number).unwrap_or("");
+        if git_width > 0 && rect.width > digits + 4 {
+            let changes = editor
+                .git
+                .snapshot
+                .as_ref()
+                .and_then(|s| s.file.as_ref())
+                .unwrap();
+            let (staged, unstaged) = changes.markers(line_number);
+            for (offset, marker) in [staged, unstaged].into_iter().enumerate() {
+                if let Some(marker) = marker {
+                    let color = match marker {
+                        '+' => palette.accent,
+                        '-' => palette.error,
+                        _ => palette.warning,
+                    };
+                    canvas.text(
+                        rect.x + digits + 2 + offset as u16,
+                        rect.y + row,
+                        &marker.to_string(),
+                        1,
+                        Style::new(color, line_background),
+                    );
+                }
+            }
+        }
         let tab_width = editor.config.editor.tab_width.max(1);
         let cached = builder.line(buffer, line_number, tab_width);
-        let start = cached.at_column(line, pane.viewport_column);
-        let cursor_column =
-            active_line.then(|| cached.at_grapheme(line, pane.cursor.grapheme).column);
+        let hints = line_hints(editor, buffer, line_number);
+        let hint_width: usize = hints
+            .iter()
+            .map(|hint| UnicodeWidthStr::width(hint.label.as_str()))
+            .sum();
+        let start = cached.at_column(line, pane.viewport_column.saturating_sub(hint_width));
+        let cursor_column = active_line.then(|| {
+            cached.at_grapheme(line, pane.cursor.grapheme).column
+                + hints
+                    .iter()
+                    .filter(|hint| hint.position.grapheme <= pane.cursor.grapheme)
+                    .map(|hint| UnicodeWidthStr::width(hint.label.as_str()))
+                    .sum::<usize>()
+        });
         let mut spans = cached.spans.iter().peekable();
-        let mut display_column = start.column;
+        let mut display_column = start.column
+            + hints
+                .iter()
+                .filter(|hint| hint.position.grapheme < start.grapheme)
+                .map(|hint| UnicodeWidthStr::width(hint.label.as_str()))
+                .sum::<usize>();
+        let mut hints = hints
+            .iter()
+            .filter(|hint| hint.position.grapheme >= start.grapheme)
+            .peekable();
+        let mut source_column = start.column;
+        let line_rect = Rect {
+            x: content_x,
+            y: rect.y + row,
+            width: content_width,
+            height: 1,
+        };
+        let mut reached_end = true;
         for (offset, (byte, grapheme)) in line[start.byte..].grapheme_indices(true).enumerate() {
             let grapheme_index = start.grapheme + offset;
             let byte = start.byte + byte;
+            while hints
+                .peek()
+                .is_some_and(|hint| hint.position.grapheme == grapheme_index)
+            {
+                let hint = hints.next().unwrap();
+                render_virtual_text(
+                    canvas,
+                    line_rect,
+                    &hint.label,
+                    &mut display_column,
+                    pane.viewport_column,
+                    Style::new(palette.muted, line_background),
+                );
+            }
             let width = if grapheme == "\t" {
-                tab_width - (display_column % tab_width)
+                tab_width - (source_column % tab_width)
             } else {
                 UnicodeWidthStr::width(grapheme).max(1)
             };
+            source_column += width;
             let next_column = display_column + width;
             if next_column <= pane.viewport_column {
                 display_column = next_column;
@@ -1639,6 +2263,7 @@ fn render_pane(
             }
             let screen_column = display_column.saturating_sub(pane.viewport_column);
             if screen_column >= usize::from(content_width) {
+                reached_end = false;
                 break;
             }
             let selected = is_selected(editor, pane, line_number, grapheme_index);
@@ -1656,7 +2281,9 @@ fn render_pane(
                 style.bg = palette.selection;
             }
             if grapheme == "\t" {
-                for offset in 0..width.min(usize::from(content_width).saturating_sub(screen_column))
+                for offset in 0..width
+                    .min(next_column.saturating_sub(pane.viewport_column))
+                    .min(usize::from(content_width).saturating_sub(screen_column))
                 {
                     canvas.put_grapheme(
                         content_x + (screen_column + offset) as u16,
@@ -1665,7 +2292,9 @@ fn render_pane(
                         style,
                     );
                 }
-            } else {
+            } else if display_column >= pane.viewport_column
+                && screen_column + width <= usize::from(content_width)
+            {
                 canvas.put_grapheme(
                     content_x + screen_column as u16,
                     rect.y + row,
@@ -1674,6 +2303,18 @@ fn render_pane(
                 );
             }
             display_column = next_column;
+        }
+        if reached_end {
+            for hint in hints {
+                render_virtual_text(
+                    canvas,
+                    line_rect,
+                    &hint.label,
+                    &mut display_column,
+                    pane.viewport_column,
+                    Style::new(palette.muted, line_background),
+                );
+            }
         }
         let mut inline_column = display_column
             .saturating_sub(pane.viewport_column)
@@ -1686,7 +2327,9 @@ fn render_pane(
             DiagnosticSeverity::Hint,
         ] {
             for diagnostic in diagnostics.iter().filter(|diagnostic| {
-                diagnostic.line == line_number && diagnostic.severity == severity
+                editor.mode == Mode::Normal
+                    && diagnostic.line == line_number
+                    && diagnostic.severity == severity
             }) {
                 if inline_column >= usize::from(content_width) {
                     break;
@@ -1720,6 +2363,143 @@ fn render_pane(
         }
     }
     cursor
+}
+
+fn git_gutter(editor: &Editor, buffer: &Buffer) -> u16 {
+    if editor
+        .git
+        .snapshot
+        .as_ref()
+        .and_then(|s| s.file.as_ref())
+        .is_some_and(|file| {
+            Some(file.path.as_path()) == buffer.path()
+                && file.revision == buffer.revision()
+                && !buffer.is_dirty()
+        })
+    {
+        2
+    } else {
+        0
+    }
+}
+
+fn line_hints<'a>(editor: &'a Editor, buffer: &Buffer, line: usize) -> &'a [InlayHint] {
+    if editor.mode != Mode::Normal || !editor.inlay_hints {
+        return &[];
+    }
+    let Some(snapshot) = buffer
+        .path()
+        .and_then(|path| editor.inlay_snapshots.get(path))
+    else {
+        return &[];
+    };
+    if snapshot.revision != buffer.revision() {
+        return &[];
+    }
+    let start = snapshot
+        .hints
+        .partition_point(|hint| hint.position.line < line);
+    let end = snapshot
+        .hints
+        .partition_point(|hint| hint.position.line <= line);
+    &snapshot.hints[start..end]
+}
+
+fn render_virtual_text(
+    canvas: &mut Canvas,
+    rect: Rect,
+    text: &str,
+    column: &mut usize,
+    viewport: usize,
+    style: Style,
+) {
+    for grapheme in text.graphemes(true) {
+        let width = UnicodeWidthStr::width(grapheme).max(1);
+        if *column >= viewport && column.saturating_sub(viewport) + width <= usize::from(rect.width)
+        {
+            canvas.put_grapheme(
+                rect.x + (*column - viewport) as u16,
+                rect.y,
+                grapheme,
+                style,
+            );
+        }
+        *column += width;
+    }
+}
+
+fn render_hover(
+    canvas: &mut Canvas,
+    editor: &mut Editor,
+    pane: Rect,
+    cursor: (u16, u16),
+    palette: Palette,
+) {
+    let Some(hover) = &editor.hover else {
+        return;
+    };
+    if pane.width < 8 || pane.height < 4 {
+        return;
+    }
+    let width = pane.width.min(80);
+    let rows: Vec<_> = hover
+        .text
+        .lines()
+        .flat_map(|line| wrap_text(line, usize::from(width.saturating_sub(4)), 0))
+        .collect();
+    let above = cursor.1.saturating_sub(pane.y);
+    let below = (pane.y + pane.height).saturating_sub(cursor.1 + 1);
+    // Prefer the requested location above the cursor, but keep the popup
+    // usable on the first rows of a pane by placing it below when necessary.
+    let place_above = above >= 4 || above >= below;
+    let available = if place_above { above } else { below };
+    if available < 3 {
+        return;
+    }
+    let height = available.min(16).min(rows.len().saturating_add(2) as u16);
+    let body_height = usize::from(height.saturating_sub(2));
+    let scroll = hover.scroll.min(rows.len().saturating_sub(body_height));
+    editor.hover.as_mut().unwrap().scroll = scroll;
+    let rect = Rect {
+        x: cursor
+            .0
+            .saturating_sub(1)
+            .min(pane.x + pane.width - width)
+            .max(pane.x),
+        y: if place_above {
+            cursor.1 - height
+        } else {
+            cursor.1 + 1
+        },
+        width,
+        height,
+    };
+    render_popup(canvas, rect, palette);
+    canvas.text(
+        rect.x + 2,
+        rect.y,
+        " Hover ",
+        width.saturating_sub(4),
+        Style::new(palette.accent, palette.surface),
+    );
+    for (index, line) in rows.iter().skip(scroll).take(body_height).enumerate() {
+        canvas.text(
+            rect.x + 2,
+            rect.y + 1 + index as u16,
+            line,
+            width.saturating_sub(4),
+            Style::new(palette.foreground, palette.surface),
+        );
+    }
+    if rows.len() > body_height {
+        canvas.text(
+            rect.x + 2,
+            rect.y + height - 1,
+            " C-f/C-b scroll · Esc close ",
+            width.saturating_sub(4),
+            Style::new(palette.muted, palette.surface),
+        );
+    }
 }
 
 fn diagnostic_severity_rank(severity: DiagnosticSeverity) -> u8 {
@@ -1972,7 +2752,22 @@ fn render_status(canvas: &mut Canvas, editor: &Editor, rect: Rect, palette: Pale
     }
     // Reserve space for the path and safety flags before adding optional tools.
     // Long tool failures must never overwrite the mode, filename, or position.
-    for (name, status, minimum_width) in [("RA", editor.rust_analyzer_status.as_str(), 55)] {
+    let git_status = editor.git.snapshot.as_ref().map(|s| {
+        let staged = s
+            .entries
+            .iter()
+            .filter(|e| e.index != ' ' && e.index != '?')
+            .count();
+        let unstaged = s.entries.iter().filter(|e| e.worktree != ' ').count();
+        format!("{} S:{staged} U:{unstaged}", s.branch)
+    });
+    for (name, status, minimum_width) in [
+        ("Git", git_status.as_deref().unwrap_or(""), 75),
+        ("RA", editor.rust_analyzer_status.as_str(), 55),
+    ] {
+        if status.is_empty() {
+            continue;
+        }
         let label = format!("  {name} · {status} ");
         let label_width = UnicodeWidthStr::width(label.as_str()).min(usize::from(u16::MAX)) as u16;
         if rect.width < minimum_width
@@ -2355,6 +3150,118 @@ mod tests {
     use super::*;
     use crate::{buffer::Buffer, config::Config, editor::BufferSlot};
     use std::path::PathBuf;
+
+    #[test]
+    fn animation_frames_preserve_logical_positions_and_settle_without_more_input() {
+        let mut editor = Editor::new(Config::default(), PathBuf::from("/work"));
+        editor.buffers[0].buffer = Buffer::from_text("abcdefghijklmnop\n".repeat(100));
+        let mut builder = FrameBuilder::new();
+        let now = Instant::now();
+        let (_, initial) = builder.draw_animated_at(&mut editor, 40, 12, now);
+        editor.active_pane_mut().cursor = crate::buffer::Pos::new(0, 12);
+        let (_, first) = builder.draw_animated_at(&mut editor, 40, 12, now);
+        assert_eq!(first, initial);
+        assert!(builder.is_animating());
+        assert_eq!(editor.active_pane().cursor.grapheme, 12);
+        let (_, middle) =
+            builder.draw_animated_at(&mut editor, 40, 12, now + Duration::from_millis(20));
+        assert!(middle.unwrap().0 > initial.unwrap().0);
+        let (_, final_cursor) =
+            builder.draw_animated_at(&mut editor, 40, 12, now + Duration::from_millis(120));
+        assert_eq!(final_cursor, draw_editor(&mut editor, 40, 12).1);
+        assert!(!builder.is_animating());
+
+        let jump = now + Duration::from_millis(200);
+        editor.active_pane_mut().cursor = crate::buffer::Pos::new(70, 0);
+        let (first, _) = builder.draw_animated_at(&mut editor, 40, 12, jump);
+        let viewport = editor.active_pane().viewport_line;
+        assert_eq!(viewport, 61);
+        assert!(builder.is_animating());
+        let (last, _) =
+            builder.draw_animated_at(&mut editor, 40, 12, jump + Duration::from_millis(120));
+        assert_ne!(row(&first, 0), row(&last, 0));
+        assert_eq!(editor.active_pane().viewport_line, viewport);
+        assert_eq!(editor.active_pane().cursor.line, 70);
+        assert!(!builder.is_animating());
+        assert_eq!(row(&last, 0), row(&draw_editor(&mut editor, 40, 12).0, 0));
+    }
+
+    #[test]
+    fn animations_snap_for_insert_resize_disable_and_do_not_land_on_wide_cell_tails() {
+        let mut editor = Editor::new(Config::default(), PathBuf::from("/work"));
+        editor.buffers[0].buffer = Buffer::from_text("界界界界界界\n".repeat(20));
+        let now = Instant::now();
+        let mut builder = FrameBuilder::new();
+        builder.draw_animated_at(&mut editor, 40, 10, now);
+        editor.active_pane_mut().cursor = crate::buffer::Pos::new(0, 5);
+        builder.draw_animated_at(&mut editor, 40, 10, now);
+        for ms in [10, 20, 30, 50] {
+            let (canvas, cursor) =
+                builder.draw_animated_at(&mut editor, 40, 10, now + Duration::from_millis(ms));
+            let (x, y) = cursor.unwrap();
+            assert!(!canvas.cells[canvas.index(x, y).unwrap()].continuation);
+        }
+        editor.mode = Mode::Insert;
+        let actual = builder.draw_animated_at(&mut editor, 40, 10, now).1;
+        assert_eq!(actual, draw_editor(&mut editor, 40, 10).1);
+        assert!(!builder.is_animating());
+        editor.mode = Mode::Normal;
+        builder.draw_animated_at(&mut editor, 40, 10, now);
+        editor.active_pane_mut().cursor = crate::buffer::Pos::new(15, 0);
+        builder.draw_animated_at(&mut editor, 40, 10, now);
+        assert!(builder.is_animating());
+        builder.draw_animated_at(&mut editor, 50, 12, now);
+        assert!(!builder.is_animating());
+        editor.config.ui.smooth_scroll = false;
+        editor.config.ui.cursor_animation = false;
+        editor.active_pane_mut().cursor = crate::buffer::Pos::new(0, 0);
+        let actual = builder.draw_animated_at(&mut editor, 50, 12, now).1;
+        assert_eq!(actual, draw_editor(&mut editor, 50, 12).1);
+        assert!(!builder.is_animating());
+    }
+
+    #[test]
+    fn git_gutters_are_separate_and_hidden_for_dirty_or_stale_buffers() {
+        use crate::git::{FileChanges, Hunk, Snapshot};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file.rs");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let mut editor = Editor::new(Config::default(), dir.path().to_owned());
+        editor.open_path(&path).unwrap();
+        let hunk = Hunk {
+            old_start: 0,
+            old_len: 0,
+            new_start: 0,
+            new_len: 1,
+        };
+        editor.git.snapshot = Some(Snapshot {
+            root: dir.path().to_owned(),
+            branch: "main".into(),
+            file: Some(FileChanges {
+                path,
+                revision: editor.active_buffer().revision(),
+                staged: vec![hunk],
+                unstaged: vec![Hunk {
+                    new_start: 2,
+                    old_start: 2,
+                    ..hunk
+                }],
+            }),
+            ..Snapshot::default()
+        });
+        let (canvas, _) = draw_editor(&mut editor, 80, 10);
+        assert_eq!(canvas.cells[3].symbol, "+");
+        assert_eq!(canvas.cells[2 * 80 + 4].symbol, "+");
+        editor.handle_key(Key::char('i'));
+        editor.handle_key(Key::char('x'));
+        assert_eq!(git_gutter(&editor, editor.active_buffer()), 0);
+        editor.git.visible = true;
+        for width in 0..10 {
+            for height in 0..6 {
+                assert!(draw_editor(&mut editor, width, height).1.is_none());
+            }
+        }
+    }
 
     #[test]
     fn canvas_marks_wide_grapheme_continuation() {
@@ -2796,7 +3703,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(frame.contains("▲ warning: unused variable"));
-        assert!(frame.contains("Enter open · r rerun · q back"));
+        assert!(frame.contains("Enter open · r rerun · s stop"));
         assert!(editor.check.scroll > 0);
         let selected_row = (0..24)
             .find(|&y| row(&canvas, y).contains("▲ warning"))
@@ -2872,7 +3779,8 @@ mod tests {
             .join("\n");
         assert!(frame.contains("Commands · Space"));
         assert!(frame.contains("buffers ›"));
-        assert!(frame.contains("Terminal"));
+        assert!(!frame.contains("Terminal"));
+        assert!(frame.contains("cargo"));
         assert!(matches!(editor.mode, Mode::Leader));
     }
 
@@ -3023,6 +3931,112 @@ mod tests {
     }
 
     #[test]
+    fn diagnostics_hide_inline_text_in_every_mode_except_normal_even_when_current() {
+        let mut editor = Editor::new(Config::default(), PathBuf::from("/work"));
+        editor.diagnostics.push(crate::editor::Diagnostic {
+            path: None,
+            line: 0,
+            column: 0,
+            severity: DiagnosticSeverity::Error,
+            message: "current diagnostic".into(),
+            version: editor.active_buffer().revision(),
+        });
+        for mode in [
+            Mode::Insert,
+            Mode::Command,
+            Mode::Visual(VisualKind::Character),
+            Mode::Normal,
+        ] {
+            editor.mode = mode.clone();
+            let (frame, _) = draw_editor(&mut editor, 60, 10);
+            assert_eq!(
+                row(&frame, 0).contains("current diagnostic"),
+                mode == Mode::Normal
+            );
+            assert!(row(&frame, 0).contains('●'), "gutter marker stays visible");
+        }
+    }
+
+    #[test]
+    fn inlays_preserve_unicode_cursor_positions_scroll_and_never_change_buffer_text() {
+        use crate::{
+            buffer::Pos,
+            editor::{InlayHint, InlaySnapshot},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("main.rs");
+        let source = "let 名 = 1;\n";
+        std::fs::write(&path, source).unwrap();
+        let mut editor = Editor::new(Config::default(), directory.path().to_owned());
+        editor.open_path(&path).unwrap();
+        editor.inlay_snapshots.insert(
+            path.clone(),
+            InlaySnapshot {
+                revision: editor.active_buffer().revision(),
+                hints: vec![InlayHint {
+                    position: Pos::new(0, 5),
+                    label: ": i32".into(),
+                }],
+            },
+        );
+        editor.active_pane_mut().cursor = Pos::new(0, 8);
+        for width in [60, 15, 8] {
+            let (frame, cursor) = draw_editor(&mut editor, width, 6);
+            let (x, y) = cursor.unwrap();
+            assert!(x < width);
+            assert_eq!(frame.cells[frame.index(x, y).unwrap()].symbol, "1");
+            if width == 60 {
+                assert!(row(&frame, 0).contains("名: i32 = 1;"));
+            }
+        }
+        editor.active_pane_mut().viewport_column = 0;
+        for mode in [Mode::Insert, Mode::Normal] {
+            editor.mode = mode.clone();
+            let (frame, _) = draw_editor(&mut editor, 60, 6);
+            assert_eq!(row(&frame, 0).contains(": i32"), mode == Mode::Normal);
+        }
+        editor.inlay_hints = false;
+        assert!(!row(&draw_editor(&mut editor, 60, 6).0, 0).contains(": i32"));
+        assert_eq!(editor.active_buffer().text(), source);
+        assert!(!editor.active_buffer().is_dirty());
+        editor.inlay_hints = true;
+        editor.active_buffer_mut().insert(Pos::ZERO, "x").unwrap();
+        assert!(!row(&draw_editor(&mut editor, 60, 6).0, 0).contains(": i32"));
+    }
+
+    #[test]
+    fn hover_box_prefers_above_cursor_falls_below_and_handles_small_panes() {
+        use crate::{buffer::Pos, editor::HoverPopup};
+        let mut editor = Editor::new(Config::default(), PathBuf::from("/work"));
+        editor
+            .active_buffer_mut()
+            .insert(Pos::ZERO, &"source\n".repeat(20))
+            .unwrap();
+        editor.hover = Some(HoverPopup {
+            text: "fn example()\nUnicode 名 documentation".into(),
+            scroll: 0,
+        });
+        editor.active_pane_mut().cursor = Pos::new(10, 2);
+        let (frame, cursor) = draw_editor(&mut editor, 60, 24);
+        let top = (0..24).find(|y| row(&frame, *y).contains("Hover")).unwrap();
+        assert!(top < cursor.unwrap().1);
+        assert!(row(&frame, top + 1).contains("fn example()"));
+        assert!(row(&frame, top).contains('╭'));
+        editor.active_pane_mut().cursor = Pos::ZERO;
+        editor.active_pane_mut().viewport_line = 0;
+        let (frame, cursor) = draw_editor(&mut editor, 60, 24);
+        let top = (0..24).find(|y| row(&frame, *y).contains("Hover")).unwrap();
+        assert!(top > cursor.unwrap().1);
+        for width in 0..12 {
+            for height in 0..8 {
+                draw_editor(&mut editor, width, height);
+            }
+        }
+        editor.handle_key(Key::plain(KeyCode::Esc));
+        assert!(editor.hover.is_none());
+    }
+
+    #[test]
     fn uncommitted_insert_immediately_hides_the_previous_diagnostic_revision() {
         let mut editor = Editor::new(Config::default(), PathBuf::from("/work"));
         editor.buffers[0] = BufferSlot {
@@ -3089,5 +4103,72 @@ mod tests {
         assert!(error_x < warning_x);
         assert_eq!(canvas.cells[error_x].style.fg, Color(247, 118, 142));
         assert_eq!(canvas.cells[warning_x].style.fg, Color(224, 175, 104));
+    }
+    #[test]
+    fn side_by_side_diff_keeps_context_aligned_and_falls_back_when_narrow() {
+        let mut editor = Editor::new(Config::default(), PathBuf::from("/work"));
+        let lines: Vec<String> = "@@ -1,4 +1,3 @@\n context\n-old\n-extra\n+new\n tail"
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        editor.git.visible = true;
+        editor.git.document = Some(crate::git::Document {
+            title: "Unstaged".into(),
+            rows: crate::git::align_diff(&lines),
+            lines,
+        });
+        let (canvas, _) = draw_editor(&mut editor, 100, 14);
+        assert!(row(&canvas, 1).contains("BEFORE"));
+        assert!(row(&canvas, 1).contains("AFTER"));
+        let context = row(&canvas, 3);
+        assert_eq!(context.matches("context").count(), 2);
+        let extra = row(&canvas, 5);
+        assert!(extra[..50].contains("extra"));
+        assert!(extra[53..].trim().is_empty());
+        assert_eq!(row(&canvas, 6).matches("tail").count(), 2);
+        editor.git.scroll = usize::MAX;
+        editor.git.horizontal = 8;
+        let (narrow, _) = draw_editor(&mut editor, 30, 6);
+        assert!(!row(&narrow, 1).contains("BEFORE"));
+        // All geometries and scroll extremes stay bounded, including tiny frames.
+        for width in [0, 1, 30, 63, 64, 65, 100] {
+            for height in [0, 1, 2, 3, 4] {
+                draw_editor(&mut editor, width, height);
+            }
+        }
+    }
+
+    #[test]
+    fn diff_clipping_uses_cells_for_tabs_and_wide_graphemes() {
+        let mut canvas = Canvas::new(12, 1, Style::default());
+        draw_diff_text(
+            &mut canvas,
+            0,
+            0,
+            "\t界a\u{301}tail",
+            12,
+            5,
+            Style::default(),
+        );
+        assert!(row(&canvas, 0).starts_with(" a\u{301}tail"));
+    }
+
+    #[cfg(feature = "gui")]
+    #[test]
+    fn desktop_hit_testing_uses_graphemes_tabs_and_the_clicked_pane() {
+        let mut editor = Editor::new(Config::default(), PathBuf::from("/work"));
+        editor.buffers[0].buffer = Buffer::from_text("\t界a\u{301}bc");
+        editor.explorer.open = true; // Native tree is outside the workspace grid.
+        let mut builder = FrameBuilder::new();
+        builder.draw_workspace(&mut editor, 80, 20);
+        builder.place_cursor(&mut editor, 9, 0); // second cell of 界 after a four-cell tab
+        assert_eq!(editor.active_pane().cursor, crate::buffer::Pos::new(0, 1));
+        builder.place_cursor(&mut editor, 10, 0);
+        assert_eq!(editor.active_pane().cursor, crate::buffer::Pos::new(0, 2));
+        editor.split(Orientation::Vertical);
+        builder.draw_workspace(&mut editor, 80, 20);
+        let first = editor.panes[0].id;
+        builder.place_cursor(&mut editor, 4, 0);
+        assert_eq!(editor.active_pane, first);
     }
 }

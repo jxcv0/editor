@@ -783,7 +783,7 @@ impl LspWorker {
             }],
             "capabilities": {
                 "general": {"positionEncodings": ["utf-16"]},
-                "workspace": {"configuration": true, "workspaceFolders": true},
+                "workspace": {"configuration": true, "workspaceFolders": true, "inlayHint": {"refreshSupport": true}},
                 "textDocument": {
                     "synchronization": {"dynamicRegistration": false, "didSave": true},
                     "completion": {"completionItem": {"snippetSupport": true}},

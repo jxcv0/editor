@@ -1,5 +1,6 @@
 //! Editing core and terminal-independent services for the `editor` binary.
 
+mod animation;
 pub mod app;
 pub mod buffer;
 pub mod check;
@@ -8,6 +9,9 @@ pub mod command;
 pub mod config;
 pub mod editor;
 pub mod explorer;
+pub mod git;
+#[cfg(feature = "gui")]
+pub mod gui;
 pub mod input;
 pub mod lsp;
 pub mod process;

@@ -36,6 +36,8 @@ pub struct EditorConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UiConfig {
+    pub smooth_scroll: bool,
+    pub cursor_animation: bool,
     pub relative_numbers: bool,
     pub true_color: bool,
     pub explorer_width: u16,
@@ -114,6 +116,8 @@ impl Default for EditorConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
+            smooth_scroll: true,
+            cursor_animation: true,
             relative_numbers: true,
             true_color: true,
             explorer_width: 30,

@@ -23,18 +23,78 @@ mutate editor text directly.
 | `project` | Project-root discovery, ignored/hidden-aware walking, fuzzy ranking, and literal/regex project search | The short ancestor-based root discovery is synchronous during composition. Full scans/searches run on cancellable background threads and stream through bounded channels. The module has no editor mutation access; preview/open behavior is handled above it. |
 | `syntax` | Lightweight, line-local Rust/TOML/Markdown highlighting | Always-available fallback with no parser process. It is lexical and deliberately tolerant, not a full incremental syntax tree or semantic highlighter. |
 | `terminal` | PTY shell lifecycle, bounded asynchronous output, VT screen/scrollback state, resizing, terminal-key encoding, and bounded capability replies | The editor owns only the renderable emulator state and emits typed input/toggle requests; `app` owns the fallible OS process handle. The interactive shell starts only after an explicit terminal command. |
-| `check` | `cargo check` process runs, JSON diagnostic parsing, path resolution, and the check panel's result state | A worker thread owns parsing and streams compact entries through a bounded queue; the editor owns only the renderable panel state and emits run requests, while `app` owns the cancellable task. Checks start only after an explicit command or a watched save while the panel is visible. |
+| `check` | Common Cargo process runs, program output, JSON diagnostic parsing, path resolution, and panel state | A worker parses and streams bounded entries; the editor owns the renderable state while `app` owns the cancellable task. Commands start explicitly; check alone can also rerun after watched saves. |
+| `git` | Saved-file repository status, literal paths, unified diffs/hunks, staged-to-worktree coordinate mapping, line blame/commit views, and explicit file staging | A bounded background worker owns supervised Git children. The editor owns the status/diff presentation; runtime rejects stale line data. Each child has a timeout and output cap. Index writes require explicit commands and never save buffers. |
+| `animation` | Time-based, bounded presentation interpolation | No buffer or terminal ownership. `ui::FrameBuilder` retains per-pane motion separately from logical cursors/viewports. Deterministic timestamp-driven tests cover retargeting and settling. |
 | `bin/editor-bench` | Repeatable local smoke measurement for warm 1 MiB open and edit-plus-frame p95 | Measures useful core proxies, not full process-launch-to-terminal-flush latency. Target-laptop baselines and regression enforcement are still needed. |
 | `process` | Direct child spawning, bounded stdin/stdout/stderr, process-group shutdown, and bounded logs | Security/reliability boundary shared by integrations. It never invokes a shell. On Unix it creates a child process group; non-Unix shutdown falls back to the platform process API. |
 | `lsp` | Asynchronous `rust-analyzer` lifecycle and JSON-RPC/LSP transport, document snapshots/version checks, generic request/notification routing, and bounded events/errors | Runs process and protocol work on a dedicated worker. `app` maps typed actions to methods and handles a practical response subset; comprehensive capability-aware UX remains incomplete. |
 | `state` | Private asynchronous recovery journal and content-free versioned session files | During periodic maintenance, `app` journals dirty named and scratch/stdin buffers, queues removal after observing them clean, reports available recovery records, joins queued journal work at shutdown, and saves/loads named-file session metadata. Active selection, pane cursors/viewports, and explorer state are restored; recovery selection/application, unnamed session buffers, exact split topology/orientation, and persistent undo remain MVP work. |
 
+## Optional desktop frontend
+
+The `gui` Cargo feature compiles `gui::{font,graphics,input,view}`. The same `editor`
+binary selects the native frontend with `--gui`; default builds do not link
+egui, winit, or wgpu. Startup composition and file/session arguments are shared.
+
+`gui::App` owns the existing `app::Runtime` on the winit foreground thread.
+Native events become the same `InputEvent`/`Key` values as terminal events.
+It polls integrations every 25 ms without blocking input, begins background
+services after the first presented frame, and requests frames only for input,
+worker changes, or animation/repaint deadlines. It never enters Crossterm raw
+mode. Normal exit saves session metadata and dropping the runtime drains the
+journal and tears down its child processes.
+
+`gui::graphics` owns the Vulkan surface/device, egui input adapter, texture
+uploads, render pass, resize/scale changes, and surface-loss retries. Device
+errors end the frontend with an error instead of silently losing the window.
+Zero-sized windows skip presentation. `gui::view` owns native chrome, font size,
+pointer/clipboard presentation, and the unsaved-close dialog. The resizable
+explorer and tabs use core state; toolbar commands finish open transactions
+before dispatching ordinary typed or Ex actions. Window close checks every
+buffer, including hidden dirty buffers.
+
+The shared `ui::FrameBuilder` composes source, syntax, inlays, diagnostics,
+split panes, pickers, Git, and terminal cells. The desktop omits the terminal
+explorer and replaces the status row with native chrome, then paints the cells
+as egui glyphs and merged background strips. It does not run the TUI in a child
+process. Hit testing uses the presented pane geometry, tab stops, Unicode
+graphemes, and inlay widths. Motion retains its cell coordinate model.
+
+`gui::font` embeds FiraCode Nerd Font Mono as the default font for both egui
+families, retaining bundled fallback fonts. Identically styled ASCII cells
+form runs for the font's `calt` programming ligatures. The evaluator handles
+the pinned font's single substitutions and chained contexts; a reachability
+test audits its supported lookup forms and one-cell advances. It is not a
+general Unicode shaper. Unicode graphemes use the ordinary egui path, and
+style/row boundaries terminate runs. Shaping changes only glyphs, never buffer
+text, canvas widths, cursor positions, or hit testing. Up to 1,024 shaped runs
+are cached; substituted glyphs share a bounded 1,024-square atlas, rebuilt on
+font-size/DPI changes. If it fills, affected runs use ordinary glyphs. The font
+asset, version, checksum, and license are recorded in `assets/fonts/README.md`.
+
+Git `Document`s include original unified text and worker-prepared `DiffRow`s.
+The parser tracks old/new hunk counts, pairs contiguous removals/additions in
+linear time, and keeps context aligned with blank cells for unequal blocks.
+Both frontends reuse the same split renderer, with a unified fallback below
+64 columns. Binary/rename/commit metadata stays readable. No similarity search
+or per-frame patch parsing is performed.
+
+GUI unit tests cover input translation, modal clipboard selection, window-close
+protection, conflict-aware toolbar saves, Unicode pointer mapping, and egui
+tessellation at multiple sizes/scales. The ignored `offscreen_desktop_and_diff_render`
+test exercises wgpu with a real Vulkan adapter (including Mesa software Vulkan),
+checks for GPU validation errors, and saves screenshots. Interactive Wayland/X11
+input, clipboard, and IME still require desktop validation.
+
 ## Runtime ownership and data flow
 
 The foreground `app::Runtime` thread owns `Editor`, terminal input, and
 rendering. It performs small, nonblocking polls of worker handles between input
-events. Idle ticks continue polling services but render only after input or a
-worker result changes visible state. `ui::FrameBuilder` retains line syntax
+events. Idle ticks continue polling services but render only after input, a
+worker result, or an active animation requires a frame. Motion uses a 16 ms
+poll interval until settled, then restores the ordinary 25 ms service poll.
+`ui::FrameBuilder` retains line syntax
 and display checkpoints using buffer-provided line identities. Lexical work
 is capped at 16 KiB per line; the remainder remains readable as plain text.
 Project traversal and child-process work are isolated behind bounded queues:
@@ -133,21 +193,57 @@ continue to work. `app` starts `rust-analyzer` only after rendering the first
 frame and routes explicit restart requests to its worker.
 
 The integrated terminal is a separate, explicitly interactive boundary. It
-intentionally starts the user's `$SHELL` directly in a PTY after `<Space>t` or
+intentionally starts the user's `$SHELL` directly in a PTY after Ctrl-backtick or
 `:terminal`, never as an implicit implementation detail of another command.
 The PTY reader uses a bounded queue, the VT model keeps bounded scrollback,
 terminal capability responses are queued with a fixed limit, and dropping the
 runtime closes the PTY and terminates the owned shell.
 
-`cargo check` runs are another explicit boundary. `<Space>cc`, `:check`, or a
+Cargo commands are another explicit boundary. `<Space>C` and `:cargo` select
+from typed common subcommands. The existing check worker also retains bounded,
+live program output for run/test and cancels the process group when replaced
+or stopped. It never starts a shell or supplies interactive stdin.
+`<Space>cc`, `:check`, or a
 save of a Rust source or Cargo manifest while the watch panel is visible starts
 `cargo check --message-format=json` directly through `SupervisedChild`. A
 worker thread parses stdout into bounded entries and classifies stderr status
 lines; at most one run exists, and starting another, hiding the panel, or
 dropping the runtime kills the previous run's process group.
 
+Format-on-save carries a pending save intent with its document revision and
+originating pane. The runtime applies valid formatting edits in one undo
+transaction, performs the conflict-aware write, sends didSave, and only then
+completes a requested pane close. Stale intents cannot write; unavailable or
+timed-out formatting falls back to a normal save. Inlay responses carry the
+same document revision checks, and hover responses also check the input
+generation. The UI draws hints and diagnostic text only in Normal mode and
+keeps hover boxes within the active pane.
+
 There is deliberately no dynamic library loading, embedded language, arbitrary
 plugin callback, or general task runner.
+
+Git status starts after the first frame and refreshes on active-file changes,
+saves, and idle intervals. One worker serializes bounded subprocess calls,
+with at most one explicit request waiting behind it. Paths retain OS-string
+identity through NUL-separated status parsing and literal argument vectors.
+Diff/textconv helpers are disabled. Separate zero-context staged/unstaged
+hunks drive the gutters; binary searches map staged index coordinates through
+unstaged hunks without scanning every hunk per visible line. Markers are
+accepted only for clean matching revisions whose disk metadata still matches.
+View generations prevent dismissed background requests reopening overlays.
+Whole-file staging and unstaging never modify buffer text; workers join at
+shutdown after cancellation. Repository state can change externally, so Git
+views remain refreshable snapshots rather than transactions across Git calls.
+
+The terminal frontend already uses a custom changed-cell renderer. Animation
+adds per-pane presentation state without introducing a TUI or graphics
+dependency. Normal-mode viewport/cursor transitions ease for 100/70 ms;
+logical navigation updates immediately. Large scroll travel is bounded to
+half a pane, and edits, resize, overlays, and Insert mode reset motion.
+`draw_editor` stays deterministic for benchmarks/tests; the runtime uses
+`draw_animated_at` and keeps rendering until all motion settles. No animation
+state is written to session metadata. Independent configuration and a leader
+toggle provide reduced motion.
 
 ## Honest MVP status
 

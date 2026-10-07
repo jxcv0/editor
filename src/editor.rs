@@ -15,6 +15,7 @@ use crate::{
     check::{CheckLocation, CheckPanel},
     command::{self, CommandId},
     config::{Config, parse_hex_color},
+    git::{GitAction, GitPanel},
     input::{Key, KeyCode, Modifiers},
     terminal::TerminalPanel,
 };
@@ -300,6 +301,31 @@ pub enum DiagnosticSeverity {
 }
 
 #[derive(Debug, Clone)]
+pub struct InlayHint {
+    pub position: Pos,
+    pub label: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct InlaySnapshot {
+    pub revision: u64,
+    pub hints: Vec<InlayHint>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HoverPopup {
+    pub text: String,
+    pub scroll: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SaveIntent {
+    pub argument: String,
+    pub forced: bool,
+    pub quit: bool,
+}
+
+#[derive(Debug, Clone)]
 pub enum EditorRequest {
     None,
     RefreshProject,
@@ -309,6 +335,10 @@ pub enum EditorRequest {
     /// Rescan project files for the file finder without clearing its index.
     RescanProjectFiles,
     CargoCheck,
+    Cargo(crate::check::CargoCommand, Vec<String>),
+    CargoCancel,
+    Git(GitAction, Option<PathBuf>),
+    FormatAndSave(SaveIntent),
     RustAnalyzer(CommandId),
     RustAnalyzerWithArgument(CommandId, String),
     CheckHealth,
@@ -361,6 +391,7 @@ pub struct Editor {
     pub explorer: Explorer,
     pub terminal: TerminalPanel,
     pub check: CheckPanel,
+    pub git: GitPanel,
     pub picker: Option<Picker>,
     pub prompt: String,
     pub leader_prefix: String,
@@ -368,6 +399,9 @@ pub struct Editor {
     pub diagnostics: Vec<Diagnostic>,
     pub rust_analyzer_status: String,
     pub inlay_hints: bool,
+    pub inlay_snapshots: HashMap<PathBuf, InlaySnapshot>,
+    pub hover: Option<HoverPopup>,
+    pub interaction: u64,
     pub should_quit: bool,
     pub request: EditorRequest,
     count: Option<usize>,
@@ -435,8 +469,12 @@ impl Editor {
             diagnostics: Vec::new(),
             rust_analyzer_status: "starting".into(),
             inlay_hints: true,
+            inlay_snapshots: HashMap::new(),
+            hover: None,
+            interaction: 0,
             should_quit: false,
             request: EditorRequest::None,
+            git: GitPanel::default(),
             count: None,
             pending_operator: None,
             awaiting: Awaiting::None,
@@ -666,11 +704,42 @@ impl Editor {
 
     pub fn apply_lsp_edits(
         &mut self,
-        edits: Vec<(crate::buffer::Utf16Pos, crate::buffer::Utf16Pos, String)>,
+        mut edits: Vec<(crate::buffer::Utf16Pos, crate::buffer::Utf16Pos, String)>,
     ) -> Result<(), BufferError> {
-        let mut converted = edits
+        // Validate the complete batch against the original snapshot before
+        // exposing an implicit EOF line or changing any bytes.
+        for (start, end, _) in &edits {
+            let range = TextRange::new(
+                self.active_buffer().utf16_to_pos(*start)?,
+                self.active_buffer().utf16_to_pos(*end)?,
+            );
+            if start > end {
+                return Err(BufferError::InvalidRange(range));
+            }
+        }
+        edits.sort_by_key(|item| std::cmp::Reverse(item.0));
+        for pair in edits.windows(2) {
+            if pair[1].1 > pair[0].0 {
+                return Err(BufferError::InvalidRange(TextRange::new(
+                    self.active_buffer().utf16_to_pos(pair[1].0)?,
+                    self.active_buffer().utf16_to_pos(pair[1].1)?,
+                )));
+            }
+        }
+        let needs_eof = edits.iter().any(|(start, end, _)| {
+            start.line == self.active_buffer().line_count()
+                || end.line == self.active_buffer().line_count()
+        });
+        self.active_buffer_mut().begin_transaction()?;
+        if needs_eof {
+            self.active_buffer_mut().materialize_eof_line();
+        }
+        let converted = edits
             .into_iter()
             .map(|(start, end, text)| {
+                let text = text
+                    .replace("\r\n", "\n")
+                    .replace('\n', self.active_buffer().line_ending().as_str());
                 Ok((
                     TextRange::new(
                         self.active_buffer().utf16_to_pos(start)?,
@@ -679,9 +748,15 @@ impl Editor {
                     text,
                 ))
             })
-            .collect::<Result<Vec<_>, BufferError>>()?;
+            .collect::<Result<Vec<_>, BufferError>>();
+        let mut converted = match converted {
+            Ok(converted) => converted,
+            Err(error) => {
+                self.active_buffer_mut().rollback_transaction()?;
+                return Err(error);
+            }
+        };
         converted.sort_by_key(|item| std::cmp::Reverse(item.0.start));
-        self.active_buffer_mut().begin_transaction()?;
         for (range, text) in converted {
             if let Err(error) = self.active_buffer_mut().replace(range, &text) {
                 let _ = self.active_buffer_mut().rollback_transaction();
@@ -863,6 +938,11 @@ impl Editor {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
+        if self.git.visible {
+            return;
+        }
+        self.interaction = self.interaction.wrapping_add(1);
+        self.hover = None;
         if self.focus == Focus::Terminal {
             let bytes = self.terminal.encode_paste(text);
             self.request = EditorRequest::TerminalInput(bytes);
@@ -882,6 +962,31 @@ impl Editor {
     }
 
     pub fn handle_key(&mut self, key: Key) {
+        self.interaction = self.interaction.wrapping_add(1);
+        if self.git.visible {
+            if self.is_terminal_toggle_key(key) {
+                self.git.visible = false;
+                self.git.generation = self.git.generation.wrapping_add(1);
+                self.toggle_terminal_from_shortcut();
+            } else {
+                self.handle_git_key(key);
+            }
+            return;
+        }
+        if let Some(hover) = &mut self.hover {
+            if key == Key::ctrl('f') || key == Key::ctrl('b') {
+                hover.scroll = if key == Key::ctrl('f') {
+                    hover.scroll.saturating_add(4)
+                } else {
+                    hover.scroll.saturating_sub(4)
+                };
+                return;
+            }
+            self.hover = None;
+            if key.code == KeyCode::Esc {
+                return;
+            }
+        }
         if self.is_terminal_toggle_key(key) {
             self.toggle_terminal_from_shortcut();
             return;
@@ -977,7 +1082,7 @@ impl Editor {
         // active, where it can preserve the physical backslash key.
         if key == Key::ctrl('\\') || key == Key::ctrl('4') {
             self.focus = Focus::Editor;
-            self.message("Terminal unfocused; <C-`> or <Space>t hides it");
+            self.message("Terminal unfocused; <C-`> hides it");
             return;
         }
         if key.modifiers.contains(Modifiers::SHIFT) {
@@ -1223,6 +1328,10 @@ impl Editor {
             'O' => self.open_line_above(),
             'd' => self.begin_operator(Operator::Delete, count, count_explicit),
             'c' => self.begin_operator(Operator::Change, count, count_explicit),
+            'D' => {
+                self.begin_operator(Operator::Change, count, count_explicit);
+                self.apply_operator_motion(Motion::LineEnd, count);
+            }
             'y' => self.begin_operator(Operator::Yank, count, count_explicit),
             '>' => self.begin_operator(Operator::Indent, count, count_explicit),
             '<' => self.begin_operator(Operator::Dedent, count, count_explicit),
@@ -1729,7 +1838,11 @@ impl Editor {
             KeyCode::Home | KeyCode::Char('g') => self.check.selected = 0,
             KeyCode::End | KeyCode::Char('G') => self.check.select_last(),
             KeyCode::Enter | KeyCode::Char('o' | 'l') => self.open_selected_check_entry(),
-            KeyCode::Char('r') => self.execute_command(CommandId::CargoCheck),
+            KeyCode::Char('r') => {
+                self.request =
+                    EditorRequest::Cargo(self.check.command, self.check.arguments.clone());
+            }
+            KeyCode::Char('s') => self.request = EditorRequest::CargoCancel,
             KeyCode::Char(' ') => {
                 self.focus = Focus::Editor;
                 self.mode = Mode::Leader;
@@ -1852,8 +1965,153 @@ impl Editor {
         });
     }
 
-    fn execute_command(&mut self, id: CommandId) {
+    fn git_action(&mut self, action: GitAction, path: Option<PathBuf>) {
+        if matches!(action, GitAction::NextHunk | GitAction::PreviousHunk) {
+            let buffer = self.active_buffer();
+            let changes = self
+                .git
+                .snapshot
+                .as_ref()
+                .and_then(|s| s.file.as_ref())
+                .filter(|file| {
+                    Some(file.path.as_path()) == buffer.path()
+                        && file.revision == buffer.revision()
+                        && !buffer.is_dirty()
+                });
+            let Some(changes) = changes else {
+                self.message("Save and :git refresh before navigating changed lines");
+                return;
+            };
+            let lines = changes.hunk_lines();
+            let current = self.active_pane().cursor.line;
+            let line = if action == GitAction::NextHunk {
+                lines
+                    .iter()
+                    .copied()
+                    .find(|line| *line > current)
+                    .or_else(|| lines.first().copied())
+            } else {
+                lines
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|line| *line < current)
+                    .or_else(|| lines.last().copied())
+            };
+            if let Some(line) = line {
+                let line = line.min(buffer.line_count().saturating_sub(1));
+                self.active_pane_mut().cursor = Pos::new(line, 0);
+            } else {
+                self.message("No changed text hunks");
+            }
+            return;
+        }
+        self.request = EditorRequest::Git(action, path);
+    }
+
+    fn handle_git_key(&mut self, key: Key) {
+        if key.code == KeyCode::Esc || key == Key::char('q') {
+            self.git.visible = false;
+            self.git.generation = self.git.generation.wrapping_add(1);
+            return;
+        }
+        if self.git.loading {
+            return;
+        }
+        let document = self.git.document.is_some();
+        let amount = if matches!(key.code, KeyCode::PageDown | KeyCode::PageUp)
+            || key == Key::ctrl('f')
+            || key == Key::ctrl('b')
+        {
+            12
+        } else {
+            1
+        };
+        if matches!(key.code, KeyCode::Down | KeyCode::PageDown)
+            || key == Key::char('j')
+            || key == Key::ctrl('f')
+        {
+            if document {
+                self.git.scroll = self.git.scroll.saturating_add(amount);
+            } else {
+                let count = self.git.snapshot.as_ref().map_or(0, |s| s.entries.len());
+                self.git.selected = self
+                    .git
+                    .selected
+                    .saturating_add(amount)
+                    .min(count.saturating_sub(1));
+            }
+        } else if matches!(key.code, KeyCode::Up | KeyCode::PageUp)
+            || key == Key::char('k')
+            || key == Key::ctrl('b')
+        {
+            if document {
+                self.git.scroll = self.git.scroll.saturating_sub(amount);
+            } else {
+                self.git.selected = self.git.selected.saturating_sub(amount);
+            }
+        } else if key == Key::char('G') {
+            if let Some(doc) = &self.git.document {
+                self.git.scroll = doc.lines.len();
+            } else {
+                self.git.selected = self
+                    .git
+                    .snapshot
+                    .as_ref()
+                    .map_or(0, |s| s.entries.len().saturating_sub(1));
+            }
+        } else if key == Key::char('g') {
+            self.git.scroll = 0;
+            if !document {
+                self.git.selected = 0;
+            }
+        } else if key == Key::char('l') || key.code == KeyCode::Right {
+            self.git.horizontal = self.git.horizontal.saturating_add(8);
+        } else if key == Key::char('h') || key.code == KeyCode::Left {
+            self.git.horizontal = self.git.horizontal.saturating_sub(8);
+        } else {
+            let path = self.git.selected_path();
+            match key.code {
+                KeyCode::Char('r') => self.git_action(GitAction::Status, None),
+                KeyCode::Char('s') if path.is_some() => self.git_action(GitAction::Stage, path),
+                KeyCode::Char('u') if path.is_some() => self.git_action(GitAction::Unstage, path),
+                KeyCode::Char('d') | KeyCode::Enter if path.is_some() => {
+                    self.git_action(GitAction::Unstaged, path)
+                }
+                KeyCode::Char('D') if path.is_some() => self.git_action(GitAction::Staged, path),
+                KeyCode::Char('H') if path.is_some() => self.git_action(GitAction::Head, path),
+                KeyCode::Backspace => {
+                    self.git.document = None;
+                    self.git.scroll = 0;
+                    self.git.horizontal = 0;
+                    self.git.generation = self.git.generation.wrapping_add(1);
+                }
+                KeyCode::Char('o') if path.is_some() => {
+                    self.git.visible = false;
+                    self.git.generation = self.git.generation.wrapping_add(1);
+                    if let Err(error) = self.open_path(path.unwrap()) {
+                        self.message(error.to_string());
+                    }
+                    self.focus = Focus::Editor;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub(crate) fn execute_command(&mut self, id: CommandId) {
         match id {
+            CommandId::Git(action) => self.git_action(action, None),
+            CommandId::ToggleAnimations => {
+                let enabled = !(self.config.ui.smooth_scroll || self.config.ui.cursor_animation);
+                self.config.ui.smooth_scroll = enabled;
+                self.config.ui.cursor_animation = enabled;
+                self.message(if enabled {
+                    "Animations enabled"
+                } else {
+                    "Animations disabled"
+                });
+            }
             CommandId::FindFiles => self.open_picker(PickerKind::Files),
             CommandId::ProjectGrep => self.open_picker(PickerKind::Grep),
             CommandId::ExplorerToggle => {
@@ -1895,11 +2153,13 @@ impl Editor {
             CommandId::OnlyPane => self.only_pane(),
             CommandId::CargoCheck => {
                 self.check.visible = true;
+                self.check.watch = true;
                 self.request = EditorRequest::CargoCheck;
                 self.message("Running cargo check");
             }
             CommandId::CargoCheckWatch => {
                 self.check.visible = !self.check.visible;
+                self.check.watch = self.check.visible;
                 if self.check.visible {
                     self.request = EditorRequest::CargoCheck;
                     self.message("Watching cargo check; saving Rust files re-runs it");
@@ -1921,6 +2181,13 @@ impl Editor {
                     }
                 ));
             }
+            CommandId::Cargo(command) => {
+                self.check.visible = true;
+                self.check.watch = command == crate::check::CargoCommand::Check;
+                self.request = EditorRequest::Cargo(command, Vec::new());
+                self.message(format!("Running cargo {}", command.name()));
+            }
+            CommandId::CargoCancel => self.request = EditorRequest::CargoCancel,
             CommandId::Rename => {
                 self.mode = Mode::Command;
                 self.prompt = "rename ".into();
@@ -2264,7 +2531,10 @@ impl Editor {
         } else {
             motion
         };
-        let Some(target) = self.motion_target(current, target_motion, count, false) else {
+        // Use the exclusive line end for `$`, including on empty lines. An
+        // inclusive target there would advance across the following newline.
+        let line_end = matches!(target_motion, Motion::LineEnd);
+        let Some(target) = self.motion_target(current, target_motion, count, line_end) else {
             self.message("Motion reached the buffer boundary");
             self.cancel_pending();
             return;
@@ -2273,10 +2543,7 @@ impl Editor {
             target_motion,
             Motion::Up | Motion::Down | Motion::FileStart | Motion::FileEnd
         );
-        let inclusive = matches!(
-            target_motion,
-            Motion::EndWord | Motion::LineEnd | Motion::MatchPair
-        );
+        let inclusive = matches!(target_motion, Motion::EndWord | Motion::MatchPair);
         self.apply_operator_target(target, inclusive, linewise);
         if operator == Some(Operator::Delete) && self.active_buffer().version() != version {
             self.last_change = Some(LastChange::DeleteMotion(motion, count));
@@ -2402,8 +2669,12 @@ impl Editor {
         };
         let range = range.ordered();
         if range.is_empty() {
-            self.message("Empty motion");
             self.cancel_pending();
+            if pending.operator == Operator::Change {
+                self.enter_insert(false);
+            } else {
+                self.message("Empty motion");
+            }
             return;
         }
         if matches!(
@@ -2617,6 +2888,35 @@ impl Editor {
             }
         };
         Some((range, kind))
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) fn clipboard_text(&self) -> Option<String> {
+        if let Some((range, kind)) = self.visual_range() {
+            if kind != VisualKind::Block {
+                return self.active_buffer().text_in_range(range).ok();
+            }
+            let anchor = self.active_pane().anchor?;
+            let cursor = self.active_pane().cursor;
+            let left = anchor.grapheme.min(cursor.grapheme);
+            let right = anchor.grapheme.max(cursor.grapheme).saturating_add(1);
+            let mut pieces = Vec::new();
+            for line in anchor.line.min(cursor.line)..=anchor.line.max(cursor.line) {
+                let count = self.active_buffer().grapheme_count(line).unwrap_or(0);
+                pieces.push(
+                    self.active_buffer()
+                        .text_in_range(TextRange::new(
+                            Pos::new(line, left.min(count)),
+                            Pos::new(line, right.min(count)),
+                        ))
+                        .ok()?,
+                );
+            }
+            return Some(pieces.join("\n"));
+        }
+        self.registers
+            .get(&'"')
+            .map(|register| register.text.clone())
     }
 
     fn apply_visual_operator(&mut self, operator: Operator, kind: VisualKind) {
@@ -3471,14 +3771,12 @@ impl Editor {
         let command = command.trim_end_matches('!');
         match command {
             "w" | "write" => {
-                self.write_buffer(argument, forced);
+                self.save_or_format(argument, forced, false);
             }
             "q" | "quit" => self.quit_pane(forced),
             "qa" | "qall" => self.quit_all(forced),
             "wq" | "x" => {
-                if self.write_buffer(argument, forced) {
-                    self.quit_pane(forced);
-                }
+                self.save_or_format(argument, forced, true);
             }
             "e" | "edit" => {
                 if argument.is_empty() {
@@ -3502,21 +3800,7 @@ impl Editor {
                 if argument.is_empty() {
                     self.message("Usage: :saveas PATH");
                 } else {
-                    let path = self.explorer.root.join(argument);
-                    let result = if forced {
-                        self.active_buffer_mut().save_as_force(&path)
-                    } else {
-                        self.active_buffer_mut().save_as(&path)
-                    };
-                    match result {
-                        Ok(()) => {
-                            let index = self.active_pane().buffer;
-                            self.buffers[index].display_name = argument.into();
-                            self.request = EditorRequest::DocumentSaved(path.clone());
-                            self.message(format!("Wrote {}", path.display()));
-                        }
-                        Err(error) => self.message(error.to_string()),
-                    }
+                    self.save_or_format(argument, forced, false);
                 }
             }
             "b" | "buffer" => {
@@ -3568,7 +3852,24 @@ impl Editor {
             }
             "messages" => self.open_picker(PickerKind::Messages),
             "terminal" | "term" => self.execute_command(CommandId::TerminalToggle),
+            "git" => match GitAction::parse(argument) {
+                Some(action) => self.git_action(action, None),
+                None => self.message("Usage: :git [status|diff|staged|head|blame|commit|stage|unstage|next|prev|refresh]"),
+            },
             "check" | "cargocheck" => self.execute_command(CommandId::CargoCheck),
+            "cargo" => {
+                let mut arguments = argument.split_whitespace();
+                match arguments.next() {
+                    Some("cancel") => self.request = EditorRequest::CargoCancel,
+                    Some(name) if crate::check::CargoCommand::parse(name).is_some() => {
+                        let command = crate::check::CargoCommand::parse(name).unwrap();
+                        self.check.visible = true;
+                        self.check.watch = command == crate::check::CargoCommand::Check;
+                        self.request = EditorRequest::Cargo(command, arguments.map(str::to_owned).collect());
+                    }
+                    _ => self.message("Usage: :cargo check|run|test|build|update|clippy|fmt|doc|clean|cancel [args]"),
+                }
+            }
             "rename" => {
                 if argument.is_empty() {
                     self.message("Usage: :rename NEW_NAME");
@@ -3617,7 +3918,36 @@ impl Editor {
         }
     }
 
-    fn write_buffer(&mut self, argument: &str, forced: bool) -> bool {
+    fn save_or_format(&mut self, argument: &str, forced: bool, quit: bool) {
+        let destination = if argument.is_empty() {
+            self.active_buffer().path().map(Path::to_owned)
+        } else {
+            Some(self.explorer.root.join(argument))
+        };
+        let intent = SaveIntent {
+            argument: argument.into(),
+            forced,
+            quit,
+        };
+        if self.config.editor.format_on_save
+            && destination
+                .as_ref()
+                .is_some_and(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            && !self.buffers[self.active_pane().buffer].large_file
+        {
+            self.request = EditorRequest::FormatAndSave(intent);
+        } else {
+            self.finish_save(intent);
+        }
+    }
+
+    pub fn finish_save(&mut self, intent: SaveIntent) {
+        if self.write_buffer(&intent.argument, intent.forced) && intent.quit {
+            self.quit_pane(intent.forced);
+        }
+    }
+
+    pub fn write_buffer(&mut self, argument: &str, forced: bool) -> bool {
         let result = if argument.is_empty() {
             if forced {
                 self.active_buffer_mut().save_force()
@@ -3634,6 +3964,10 @@ impl Editor {
         };
         match result {
             Ok(()) => {
+                if !argument.is_empty() {
+                    let index = self.active_pane().buffer;
+                    self.buffers[index].display_name = argument.into();
+                }
                 let path = self.active_buffer().path().map(Path::to_owned);
                 let display = path
                     .as_deref()
@@ -3920,7 +4254,7 @@ impl Editor {
         }
     }
 
-    fn switch_buffer(&mut self, index: usize) {
+    pub(crate) fn switch_buffer(&mut self, index: usize) {
         if index >= self.buffers.len() {
             self.message(format!("Invalid buffer {}", index + 1));
             return;
@@ -4066,6 +4400,31 @@ fn parse_ex_count(argument: &str) -> usize {
 mod tests {
     use super::*;
 
+    #[test]
+    fn git_view_is_read_only_and_commands_emit_typed_requests() {
+        let mut editor = editor("unchanged");
+        keys(&mut editor, " gs");
+        assert!(matches!(
+            editor.take_request(),
+            EditorRequest::Git(GitAction::Status, None)
+        ));
+        editor.git.visible = true;
+        editor.handle_paste("never inserted");
+        keys(&mut editor, "ix");
+        assert_eq!(editor.active_buffer().text(), "unchanged");
+        editor.handle_key(Key::char('q'));
+        assert!(!editor.git.visible);
+        editor.execute_ex("git commit");
+        assert!(matches!(
+            editor.take_request(),
+            EditorRequest::Git(GitAction::LineCommit, None)
+        ));
+        keys(&mut editor, " ua");
+        assert!(!editor.config.ui.smooth_scroll && !editor.config.ui.cursor_animation);
+        keys(&mut editor, " ua");
+        assert!(editor.config.ui.smooth_scroll && editor.config.ui.cursor_animation);
+    }
+
     fn editor(text: &str) -> Editor {
         let mut editor = Editor::new(Config::default(), PathBuf::from("/tmp"));
         editor.buffers[0] = BufferSlot {
@@ -4163,6 +4522,80 @@ mod tests {
     }
 
     #[test]
+    fn shift_d_changes_unicode_suffix_with_registers_and_one_undo_step() {
+        for modifiers in [Modifiers::empty(), Modifiers::SHIFT] {
+            let original = "a\u{301}👩‍💻 tail\nnext\n";
+            let mut editor = editor(original);
+            keys(&mut editor, "l\"a");
+            editor.handle_key(Key {
+                code: KeyCode::Char('D'),
+                modifiers,
+            });
+            assert_eq!(editor.mode, Mode::Insert);
+            assert_eq!(editor.active_pane().cursor, Pos::new(0, 1));
+            assert_eq!(editor.active_buffer().text(), "a\u{301}\nnext\n");
+            for name in ['a', '"'] {
+                let register = &editor.registers[&name];
+                assert_eq!(register.text, "👩‍💻 tail");
+                assert_eq!(register.kind, RegisterKind::Character);
+            }
+            keys(&mut editor, "replacement");
+            editor.handle_key(Key::plain(KeyCode::Esc));
+            let changed = "a\u{301}replacement\nnext\n";
+            assert_eq!(editor.active_buffer().text(), changed);
+            keys(&mut editor, "u");
+            assert_eq!(editor.active_buffer().text(), original);
+            editor.handle_key(Key::ctrl('r'));
+            assert_eq!(editor.active_buffer().text(), changed);
+        }
+    }
+
+    #[test]
+    fn change_to_line_end_preserves_empty_lines_and_handles_last_grapheme() {
+        for sequence in ["D", "c$"] {
+            for (original, prefix, changed) in [
+                ("", "", "X"),
+                ("\nnext\n", "", "X\nnext\n"),
+                ("tail\n\n", "G", "tail\nX\n"),
+                ("ab🙂\nnext\n", "$", "abX\nnext\n"),
+                ("ab🙂", "$", "abX"),
+            ] {
+                let mut editor = editor(original);
+                keys(&mut editor, prefix);
+                keys(&mut editor, sequence);
+                assert_eq!(editor.mode, Mode::Insert, "{sequence} on {original:?}");
+                keys(&mut editor, "X");
+                editor.handle_key(Key::plain(KeyCode::Esc));
+                assert_eq!(editor.active_buffer().text(), changed);
+                keys(&mut editor, "u");
+                assert_eq!(editor.active_buffer().text(), original);
+            }
+        }
+        for sequence in ["d$", "y$"] {
+            let mut editor = editor("\nnext\n");
+            keys(&mut editor, sequence);
+            assert_eq!(editor.mode, Mode::Normal);
+            assert_eq!(editor.active_buffer().text(), "\nnext\n");
+        }
+    }
+
+    #[test]
+    fn counted_shift_d_preserves_the_target_lines_newline() {
+        for (original, changed) in [
+            ("abc\ndef\nlast\n", "aX\nlast\n"),
+            ("abc\n\nlast\n", "aX\nlast\n"),
+            ("abc", "aX"),
+        ] {
+            let mut editor = editor(original);
+            keys(&mut editor, "l2DX");
+            editor.handle_key(Key::plain(KeyCode::Esc));
+            assert_eq!(editor.active_buffer().text(), changed);
+            keys(&mut editor, "u");
+            assert_eq!(editor.active_buffer().text(), original);
+        }
+    }
+
+    #[test]
     fn visual_delete_uses_register() {
         let mut editor = editor("abcd");
         keys(&mut editor, "vld");
@@ -4180,9 +4613,9 @@ mod tests {
     }
 
     #[test]
-    fn leader_terminal_toggle_routes_input_and_preserves_the_session_when_unfocused() {
+    fn terminal_command_routes_input_and_preserves_the_session_when_unfocused() {
         let mut editor = editor("safe");
-        keys(&mut editor, " t");
+        editor.execute_ex("terminal");
         assert!(editor.terminal.visible);
         assert_eq!(editor.focus, Focus::Terminal);
         assert!(matches!(
@@ -4209,7 +4642,7 @@ mod tests {
         editor.handle_key(Key::ctrl('4'));
         assert_eq!(editor.focus, Focus::Editor);
 
-        keys(&mut editor, " t");
+        editor.execute_ex("terminal");
         assert!(!editor.terminal.visible);
         assert!(matches!(
             editor.take_request(),

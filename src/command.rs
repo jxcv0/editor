@@ -1,5 +1,6 @@
 //! Declarative command registry shared by the editor and external tools.
 
+use crate::check::CargoCommand;
 use std::{fmt, str::FromStr};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -15,6 +16,10 @@ pub enum CommandId {
     RustAnalyzerRestart,
     CargoCheck,
     CargoCheckWatch,
+    Cargo(CargoCommand),
+    CargoCancel,
+    Git(crate::git::GitAction),
+    ToggleAnimations,
     FindFiles,
     ProjectGrep,
     ExplorerToggle,
@@ -56,6 +61,83 @@ pub struct Command {
 
 pub const COMMANDS: &[Command] = &[
     Command {
+        id: CommandId::Git(crate::git::GitAction::Status),
+        name: "git.status",
+        sequence: "gs",
+        description: "Git status",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::Git(crate::git::GitAction::Unstaged),
+        name: "git.diff",
+        sequence: "gd",
+        description: "Unstaged diff",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::Git(crate::git::GitAction::Staged),
+        name: "git.staged",
+        sequence: "gD",
+        description: "Staged diff",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::Git(crate::git::GitAction::Head),
+        name: "git.head",
+        sequence: "gh",
+        description: "Diff against HEAD",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::Git(crate::git::GitAction::Blame),
+        name: "git.blame",
+        sequence: "gb",
+        description: "Last commit for line",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::Git(crate::git::GitAction::LineCommit),
+        name: "git.commit",
+        sequence: "gc",
+        description: "Show line's commit patch",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::Git(crate::git::GitAction::Stage),
+        name: "git.stage",
+        sequence: "ga",
+        description: "Stage saved file",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::Git(crate::git::GitAction::Unstage),
+        name: "git.unstage",
+        sequence: "gu",
+        description: "Unstage file",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::Git(crate::git::GitAction::NextHunk),
+        name: "git.next",
+        sequence: "gn",
+        description: "Next changed hunk",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::Git(crate::git::GitAction::PreviousHunk),
+        name: "git.prev",
+        sequence: "gp",
+        description: "Previous changed hunk",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::ToggleAnimations,
+        name: "ui.animations",
+        sequence: "ua",
+        description: "Toggle scrolling/cursor animation",
+        source: CommandSource::Editor,
+    },
+    Command {
         id: CommandId::FindFiles,
         name: "files.find",
         sequence: " ",
@@ -77,10 +159,73 @@ pub const COMMANDS: &[Command] = &[
         source: CommandSource::Editor,
     },
     Command {
-        id: CommandId::TerminalToggle,
-        name: "terminal.toggle",
-        sequence: "t",
-        description: "Terminal",
+        id: CommandId::Cargo(CargoCommand::Check),
+        name: "cargo.check",
+        sequence: "Cc",
+        description: "Cargo check",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::Cargo(CargoCommand::Run),
+        name: "cargo.run",
+        sequence: "Cr",
+        description: "Cargo run",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::Cargo(CargoCommand::Test),
+        name: "cargo.test",
+        sequence: "Ct",
+        description: "Cargo test",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::Cargo(CargoCommand::Build),
+        name: "cargo.build",
+        sequence: "Cb",
+        description: "Cargo build",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::Cargo(CargoCommand::Update),
+        name: "cargo.update",
+        sequence: "Cu",
+        description: "Cargo update",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::Cargo(CargoCommand::Clippy),
+        name: "cargo.clippy",
+        sequence: "Cl",
+        description: "Cargo clippy",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::Cargo(CargoCommand::Fmt),
+        name: "cargo.fmt",
+        sequence: "Cf",
+        description: "Cargo fmt",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::Cargo(CargoCommand::Doc),
+        name: "cargo.doc",
+        sequence: "Cd",
+        description: "Cargo doc",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::Cargo(CargoCommand::Clean),
+        name: "cargo.clean",
+        sequence: "Cx",
+        description: "Cargo clean",
+        source: CommandSource::Editor,
+    },
+    Command {
+        id: CommandId::CargoCancel,
+        name: "cargo.cancel",
+        sequence: "Cq",
+        description: "Cancel cargo command",
         source: CommandSource::Editor,
     },
     Command {
@@ -273,6 +418,7 @@ pub fn by_name(name: &str) -> Option<&'static Command> {
 pub fn id_by_name(name: &str) -> Option<CommandId> {
     by_name(name).map(|command| command.id).or(match name {
         "code.hover" => Some(CommandId::Hover),
+        "terminal.toggle" => Some(CommandId::TerminalToggle),
         "code.definition" => Some(CommandId::Definition),
         "code.declaration" => Some(CommandId::Declaration),
         "code.type_definition" => Some(CommandId::TypeDefinition),
@@ -311,7 +457,9 @@ pub fn menu_entries(prefix: &str) -> Vec<MenuEntry> {
             match (prefix, key) {
                 ("", 'b') => "buffers",
                 ("", 'c') => "code",
+                ("", 'C') => "cargo",
                 ("", 'f') => "files",
+                ("", 'g') => "git",
                 ("", 's') => "search",
                 ("", 'u') => "ui",
                 ("", 'w') => "windows",
@@ -337,6 +485,7 @@ impl fmt::Display for CommandId {
             .map(|c| c.name)
             .unwrap_or(match self {
                 Self::Hover => "code.hover",
+                Self::TerminalToggle => "terminal.toggle",
                 Self::Definition => "code.definition",
                 Self::Declaration => "code.declaration",
                 Self::TypeDefinition => "code.type_definition",
@@ -370,7 +519,11 @@ mod tests {
                 .any(|entry| entry.key == 'b' && entry.group)
         );
         assert_eq!(id_by_name("code.hover"), Some(CommandId::Hover));
-        assert_eq!(by_sequence("t").unwrap().id, CommandId::TerminalToggle);
+        assert!(by_sequence("t").is_none());
+        assert_eq!(
+            id_by_name("terminal.toggle"),
+            Some(CommandId::TerminalToggle)
+        );
         assert_eq!(
             by_sequence("cR").map(|command| command.id),
             Some(CommandId::RustAnalyzerRestart)

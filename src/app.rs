@@ -14,11 +14,13 @@ use serde_json::{Value, json};
 
 use crate::{
     buffer::{Pos, Utf16Pos},
-    check::{self, CargoCheckTask, CheckEvent},
+    check::{self, CargoCheckTask, CargoCommand, CheckEvent},
     command::CommandId,
     editor::{
-        Diagnostic, DiagnosticSeverity, Editor, EditorRequest, Orientation, PickerItem, PickerKind,
+        Diagnostic, DiagnosticSeverity, Editor, EditorRequest, HoverPopup, InlayHint,
+        InlaySnapshot, Mode, Orientation, PickerItem, PickerKind, SaveIntent,
     },
+    git::{GitAction, GitRequest, GitTask},
     lsp::{
         LspEvent, LspTextChange, RustAnalyzerClient, RustAnalyzerConfig, RustAnalyzerState,
         path_to_file_uri,
@@ -63,6 +65,11 @@ pub struct Runtime {
     background_started: bool,
     terminal: Option<TerminalProcess>,
     cargo_check: Option<CargoCheckTask>,
+    last_inlay_request: Option<LspMutationOrigin>,
+    git: Option<GitTask>,
+    pending_git: Option<GitRequest>,
+    last_git_refresh: Instant,
+    git_path: Option<PathBuf>,
 }
 
 /// One directory listing in flight. A first load streams into the explorer;
@@ -77,6 +84,10 @@ struct DirectoryListing {
 struct PendingLspRequest {
     command: CommandId,
     mutation_origin: Option<LspMutationOrigin>,
+    save: Option<SaveIntent>,
+    requested_at: Instant,
+    interaction: Option<u64>,
+    save_pane: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,18 +101,29 @@ impl PendingLspRequest {
         Self {
             command,
             mutation_origin: None,
+            save: None,
+            requested_at: Instant::now(),
+            interaction: None,
+            save_pane: None,
         }
     }
 
     fn for_document(command: CommandId, path: &Path, revision: u64) -> Self {
-        let mutation_origin =
-            matches!(command, CommandId::Format | CommandId::Rename).then(|| LspMutationOrigin {
-                path: path.to_owned(),
-                revision,
-            });
+        let mutation_origin = matches!(
+            command,
+            CommandId::Format | CommandId::Rename | CommandId::Hover | CommandId::ToggleInlayHints
+        )
+        .then(|| LspMutationOrigin {
+            path: path.to_owned(),
+            revision,
+        });
         Self {
             command,
             mutation_origin,
+            save: None,
+            requested_at: Instant::now(),
+            interaction: None,
+            save_pane: None,
         }
     }
 }
@@ -111,7 +133,7 @@ impl Runtime {
         Self::with_state_root(editor, restore_session, state::state_dir())
     }
 
-    fn with_state_root(
+    pub(crate) fn with_state_root(
         editor: Editor,
         restore_session: bool,
         state_root: Option<PathBuf>,
@@ -167,6 +189,11 @@ impl Runtime {
             background_started: false,
             terminal: None,
             cargo_check: None,
+            last_inlay_request: None,
+            git: None,
+            pending_git: None,
+            last_git_refresh: Instant::now(),
+            git_path: None,
         })
     }
 
@@ -175,9 +202,15 @@ impl Runtime {
         self.render(&terminal)?;
         self.start_background();
         while !self.editor.should_quit {
-            let input = ui::poll_input(Duration::from_millis(25))?;
+            let input = ui::poll_input(Duration::from_millis(
+                if self.frame_builder.is_animating() {
+                    16
+                } else {
+                    25
+                },
+            ))?;
             self.handle_input(input);
-            if self.redraw {
+            if self.redraw || self.frame_builder.is_animating() {
                 self.render(&terminal)?;
             }
         }
@@ -188,21 +221,60 @@ impl Runtime {
     fn render(&mut self, terminal: &TerminalSession) -> io::Result<()> {
         self.redraw = false;
         let (width, height) = terminal.size()?;
-        let (canvas, cursor) = self
-            .frame_builder
-            .draw_editor(&mut self.editor, width, height);
+        let (canvas, cursor) =
+            self.frame_builder
+                .draw_animated_at(&mut self.editor, width, height, Instant::now());
         self.sync_terminal_size();
         self.renderer
             .draw(&canvas, cursor, ui::cursor_style(&self.editor))
     }
 
-    fn start_background(&mut self) {
+    #[cfg(feature = "gui")]
+    pub(crate) fn needs_redraw(&self) -> bool {
+        self.redraw || self.frame_builder.is_animating()
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) fn gui_frame(
+        &mut self,
+        width: u16,
+        height: u16,
+    ) -> (ui::Canvas, Option<(u16, u16)>) {
+        self.redraw = false;
+        let frame = self
+            .frame_builder
+            .draw_workspace(&mut self.editor, width, height);
+        self.sync_terminal_size();
+        frame
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) fn pointer(&mut self, x: u16, y: u16) {
+        self.frame_builder.place_cursor(&mut self.editor, x, y);
+        self.redraw = true;
+    }
+
+    #[cfg(feature = "gui")]
+    pub(crate) fn drag_pointer(&mut self, x: u16, y: u16, pane: u64, anchor: Pos) {
+        self.pointer(x, y);
+        if self.editor.focus == crate::editor::Focus::Editor
+            && self.editor.active_pane == pane
+            && !self.editor.git.visible
+            && self.editor.picker.is_none()
+        {
+            self.editor.active_pane_mut().anchor = Some(anchor);
+            self.editor.mode = Mode::Visual(crate::editor::VisualKind::Character);
+        }
+    }
+
+    pub(crate) fn start_background(&mut self) {
         if self.background_started {
             return;
         }
         self.background_started = true;
         self.redraw = true;
         self.restart_scan();
+        self.start_git(GitAction::Refresh, None, false);
         if let Some(client) = &self.rust_analyzer {
             if let Err(error) = client.start() {
                 self.editor.message(error.to_string());
@@ -234,7 +306,7 @@ impl Runtime {
         }
     }
 
-    fn handle_input(&mut self, input: InputEvent) {
+    pub(crate) fn handle_input(&mut self, input: InputEvent) {
         let idle = matches!(input, InputEvent::Tick);
         self.redraw |= !idle;
         match input {
@@ -256,7 +328,18 @@ impl Runtime {
         self.drain_project_search();
         self.redraw |= self.editor.poll_file_finder();
         self.drain_lsp();
+        self.expire_lsp_requests();
+        self.request_inlay_hints();
         self.drain_cargo_check();
+        self.drain_git();
+        if self.background_started
+            && self.git.is_none()
+            && !self.editor.git.visible
+            && (self.editor.active_buffer().path() != self.git_path.as_deref()
+                || (idle && self.last_git_refresh.elapsed() >= Duration::from_secs(2)))
+        {
+            self.start_git(GitAction::Refresh, None, false);
+        }
         self.drain_reference_previews();
         self.restore_session_if_ready();
         if idle || self.last_maintenance.elapsed() >= Duration::from_millis(50) {
@@ -562,39 +645,198 @@ impl Runtime {
             EditorRequest::RefreshProject => self.restart_scan(),
             EditorRequest::RescanProjectFiles => self.rescan_project_files(),
             EditorRequest::DocumentSaved(path) => {
+                self.last_git_refresh = Instant::now() - Duration::from_secs(2);
                 self.notify_lsp_document_saved(&path);
                 self.refresh_saved_file_directory(&path);
-                if self.editor.check.visible && check::is_cargo_input(&path) {
+                if self.editor.check.visible
+                    && self.editor.check.watch
+                    && check::is_cargo_input(&path)
+                {
                     self.start_cargo_check();
                 }
             }
             EditorRequest::TerminalToggle(visible) => self.toggle_terminal(visible),
             EditorRequest::TerminalInput(bytes) => self.write_terminal(&bytes),
             EditorRequest::CargoCheck => self.start_cargo_check(),
+            EditorRequest::Cargo(command, arguments) => self.start_cargo(command, arguments),
+            EditorRequest::CargoCancel => {
+                self.cargo_check = None;
+                self.editor.check.cancel();
+                self.editor.message("Cargo command cancelled");
+            }
+            EditorRequest::Git(action, path) => self.start_git(action, path, true),
             EditorRequest::CheckHealth => self.show_health(),
-            EditorRequest::RustAnalyzer(command) => self.request_lsp(command, None),
+            EditorRequest::FormatAndSave(intent) => self.format_and_save(intent),
+            EditorRequest::RustAnalyzer(command) => {
+                self.request_lsp(command, None);
+            }
             EditorRequest::RustAnalyzerWithArgument(command, argument) => {
                 self.request_lsp(command, Some(argument));
             }
         }
     }
 
+    fn start_git(&mut self, action: GitAction, path: Option<PathBuf>, explicit: bool) {
+        if self.git.is_some() && (!explicit || self.pending_git.is_some()) {
+            if explicit {
+                self.editor
+                    .message("Git is busy; try again when it finishes");
+            }
+            return;
+        }
+        let path = path.or_else(|| self.editor.active_buffer().path().map(Path::to_owned));
+        let slot = path.as_ref().and_then(|path| {
+            self.editor
+                .buffers
+                .iter()
+                .find(|slot| slot.buffer.path() == Some(path.as_path()))
+        });
+        if (action.mutates() || matches!(action, GitAction::Blame | GitAction::LineCommit))
+            && slot.is_some_and(|slot| slot.buffer.is_dirty())
+        {
+            self.editor
+                .message("Save the modified buffer before staging or inspecting line history");
+            return;
+        }
+        let revision = slot.map_or(0, |slot| slot.buffer.revision());
+        if explicit {
+            self.editor.git.generation = self.editor.git.generation.wrapping_add(1);
+            self.editor.git.error = None;
+            if action != GitAction::Refresh {
+                self.editor.git.visible = true;
+                self.editor.git.document = None;
+                self.editor.git.path = path.clone();
+                self.editor.git.scroll = 0;
+                self.editor.git.horizontal = 0;
+            }
+            self.editor.git.loading = true;
+        }
+        self.git_path = self.editor.active_buffer().path().map(Path::to_owned);
+        self.last_git_refresh = Instant::now();
+        let request = GitRequest {
+            action,
+            root: self.editor.explorer.root.clone(),
+            path,
+            line: self.editor.active_pane().cursor.line,
+            revision,
+            generation: self.editor.git.generation,
+            explicit,
+        };
+        if self.git.is_some() {
+            self.pending_git = Some(request);
+        } else {
+            self.launch_git(request);
+        }
+    }
+
+    fn launch_git(&mut self, request: GitRequest) {
+        let explicit = request.explicit;
+        // A queued operation must recheck edits made while another read ran.
+        if (request.action.mutates()
+            || matches!(request.action, GitAction::Blame | GitAction::LineCommit))
+            && self
+                .editor
+                .buffers
+                .iter()
+                .any(|slot| slot.buffer.path() == request.path.as_deref() && slot.buffer.is_dirty())
+        {
+            self.editor.git.loading = false;
+            self.editor.git.error =
+                Some("Save the modified buffer before this Git operation".into());
+            return;
+        }
+        self.editor.git.loading = explicit;
+        match GitTask::spawn(request, self.editor.config.limits.tool_message_bytes) {
+            Ok(task) => self.git = Some(task),
+            Err(error) => {
+                self.editor.git.loading = false;
+                if explicit {
+                    self.editor.message(format!("Git: {error}"));
+                }
+            }
+        }
+    }
+
+    fn drain_git(&mut self) {
+        let Some(result) = self.git.as_ref().and_then(GitTask::poll) else {
+            return;
+        };
+        let task = self.git.take().unwrap();
+        let request = &task.request;
+        let current = request.generation == self.editor.git.generation;
+        self.editor.git.loading = false;
+        match result {
+            Ok(mut result) => {
+                if let Some(file) = &result.snapshot.file
+                    && !self.editor.buffers.iter().any(|slot| {
+                        slot.buffer.path() == Some(file.path.as_path())
+                            && slot.buffer.revision() == file.revision
+                            && !slot.buffer.is_dirty()
+                            && matches!(slot.buffer.may_have_changed_on_disk(), Ok(false))
+                    })
+                {
+                    result.snapshot.file = None;
+                }
+                if matches!(request.action, GitAction::Blame | GitAction::LineCommit)
+                    && result.snapshot.file.is_none()
+                    && current
+                {
+                    result.document = None;
+                    self.editor.git.error = Some(
+                        "File changed while reading line history; reload and try again".into(),
+                    );
+                }
+                self.editor.git.replace_snapshot(result.snapshot);
+                if request.explicit && current {
+                    self.editor.git.document = result.document;
+                    if request.action.mutates() {
+                        self.editor.message(if request.action == GitAction::Stage {
+                            "Saved file staged"
+                        } else {
+                            "File unstaged"
+                        });
+                    }
+                }
+            }
+            Err(error) => {
+                // Remove outdated marks after failure or leaving a repository.
+                self.editor.git.snapshot = None;
+                if request.explicit && current {
+                    self.editor.git.error = Some(error.clone());
+                    self.editor.message(format!("Git: {error}"));
+                }
+            }
+        }
+        self.redraw = true;
+        if let Some(request) = self.pending_git.take() {
+            // Read-only views dismissed before launch need no further work.
+            if request.action.mutates() || request.generation == self.editor.git.generation {
+                self.launch_git(request);
+            }
+        }
+    }
+
     /// Start a check, replacing (and killing) any run still in progress.
     fn start_cargo_check(&mut self) {
+        self.start_cargo(CargoCommand::Check, Vec::new());
+    }
+
+    fn start_cargo(&mut self, command: CargoCommand, arguments: Vec<String>) {
         self.cargo_check = None;
         self.redraw = true;
         let root = self.editor.explorer.root.clone();
-        let spec = check::cargo_check_spec(&self.editor.config.tools.cargo, &root);
+        let spec = check::cargo_spec(&self.editor.config.tools.cargo, &root, command, &arguments);
         let program = spec.program.display().to_string();
+        self.editor.check.begin_command(command, arguments);
         match CargoCheckTask::spawn(spec, root) {
             Ok(task) => {
-                self.editor.check.begin();
                 self.cargo_check = Some(task);
             }
             Err(error) => {
                 let error = format!("could not start {program}: {error}");
                 self.editor.check.fail(error.clone());
-                self.editor.message(format!("cargo check failed: {error}"));
+                self.editor
+                    .message(format!("cargo {} failed: {error}", command.name()));
             }
         }
     }
@@ -620,6 +862,9 @@ impl Runtime {
             }
             if finished {
                 self.cargo_check = None;
+                // Cargo fmt and other explicitly run tools can update files.
+                // Reload clean views immediately; dirty buffers retain conflict protection.
+                self.reload_clean_external_changes();
                 break;
             }
         }
@@ -717,6 +962,7 @@ impl Runtime {
         if let Some(status) = status {
             self.redraw = true;
             self.terminal.take();
+            self.editor.terminal.visible = false;
             self.editor.terminal.status = TerminalStatus::Exited(status.clone());
             if self.editor.focus == crate::editor::Focus::Terminal {
                 self.editor.focus = crate::editor::Focus::Editor;
@@ -806,6 +1052,7 @@ impl Runtime {
         for path in closed {
             let _ = client.close_document(path_to_file_uri(&path));
             self.lsp_versions.remove(&path);
+            self.editor.inlay_snapshots.remove(&path);
         }
     }
 
@@ -819,6 +1066,11 @@ impl Runtime {
         for event in events {
             match event {
                 LspEvent::Status(status) => {
+                    if status.state == RustAnalyzerState::Ready
+                        && self.editor.rust_analyzer_status != "ready"
+                    {
+                        self.last_inlay_request = None;
+                    }
                     self.editor.rust_analyzer_status = ra_state_label(status.state).into();
                     if let Some(error) = status.last_error {
                         self.editor.message(error);
@@ -838,6 +1090,10 @@ impl Runtime {
                 }
                 LspEvent::Notification { .. } => {}
                 LspEvent::ServerRequest { id, method, params } => {
+                    if method == "workspace/inlayHint/refresh" {
+                        self.last_inlay_request = None;
+                        self.editor.inlay_snapshots.clear();
+                    }
                     if let Some(client) = &self.rust_analyzer {
                         let result = if method == "workspace/configuration" {
                             let count = params
@@ -853,27 +1109,45 @@ impl Runtime {
                 }
                 LspEvent::Response { id, result, error } => {
                     let request = id.as_u64().and_then(|id| self.pending_lsp.remove(&id));
-                    if let Some(error) = error {
-                        self.editor.message(format!(
-                            "rust-analyzer request failed: {}",
-                            compact_json(&error)
-                        ));
-                    } else if let (Some(request), Some(result)) = (request, result) {
-                        if request.mutation_origin.as_ref().is_some_and(|origin| {
-                            !lsp_mutation_origin_matches(&self.editor, origin)
-                        }) {
-                            self.editor.message(format!(
-                                "Discarded stale {} response: the originating buffer changed or is no longer active",
-                                request.command
-                            ));
+                    if let Some(request) = request {
+                        if let Some(error) = error {
+                            self.fail_lsp_request(request, &compact_json(&error));
                             continue;
                         }
-                        self.handle_lsp_response(request.command, result);
+                        if request.mutation_origin.as_ref().is_some_and(|origin| {
+                            !lsp_mutation_origin_matches(&self.editor, origin)
+                        }) || request
+                            .interaction
+                            .is_some_and(|interaction| interaction != self.editor.interaction)
+                            || request
+                                .save_pane
+                                .is_some_and(|pane| pane != self.editor.active_pane)
+                        {
+                            if request.save.is_some()
+                                || matches!(request.command, CommandId::Format | CommandId::Rename)
+                            {
+                                self.editor.message(format!(
+                                "Discarded stale {} response: the originating buffer changed or is no longer active",
+                                request.command
+                                ));
+                            }
+                            continue;
+                        }
+                        let result = result.unwrap_or(Value::Null);
+                        if let Some(intent) = request.save {
+                            if result.is_null() || self.apply_text_edits(&result) {
+                                self.editor.finish_save(intent);
+                                self.handle_request();
+                            }
+                        } else {
+                            self.handle_lsp_response(request.command, result);
+                        }
                     }
                 }
                 LspEvent::RequestFailed { id, reason } => {
-                    self.pending_lsp.remove(&id);
-                    self.editor.message(reason);
+                    if let Some(request) = self.pending_lsp.remove(&id) {
+                        self.fail_lsp_request(request, &reason);
+                    }
                 }
                 LspEvent::Stderr(chunk) => {
                     for line in chunk.lines().filter(|line| !line.is_empty()) {
@@ -890,14 +1164,219 @@ impl Runtime {
         }
     }
 
-    fn request_lsp(&mut self, command: CommandId, argument: Option<String>) {
+    fn format_and_save(&mut self, mut intent: SaveIntent) {
+        // A repeated save supersedes its earlier asynchronous intent.
+        self.pending_lsp.retain(|_, request| request.save.is_none());
+        self.reload_clean_external_changes();
+        if self.editor.rust_analyzer_status != "ready" || self.rust_analyzer.is_none() {
+            self.editor.finish_save(intent);
+            let outcome = self
+                .editor
+                .current_message()
+                .unwrap_or("Save attempted")
+                .to_owned();
+            self.handle_request();
+            self.editor.message(format!(
+                "{outcome}; formatting unavailable: rust-analyzer is not ready"
+            ));
+            return;
+        }
+        // An unnamed/non-Rust buffer needs a Rust document URI before the LSP
+        // can format it. Establish its destination through the normal save API.
+        if !self
+            .editor
+            .active_buffer()
+            .path()
+            .is_some_and(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        {
+            if !self.editor.write_buffer(&intent.argument, intent.forced) {
+                return;
+            }
+            intent.argument.clear();
+            self.handle_request();
+        }
+        if let Some(id) = self.request_lsp(CommandId::Format, None) {
+            let pending = self.pending_lsp.get_mut(&id).unwrap();
+            pending.save = Some(intent);
+            pending.save_pane = Some(self.editor.active_pane);
+            self.editor.message("Formatting before save…");
+        } else {
+            self.editor.finish_save(intent);
+            self.handle_request();
+        }
+    }
+
+    fn fail_lsp_request(&mut self, request: PendingLspRequest, reason: &str) {
+        if let Some(intent) = request.save {
+            if request
+                .mutation_origin
+                .as_ref()
+                .is_some_and(|origin| lsp_mutation_origin_matches(&self.editor, origin))
+                && request
+                    .save_pane
+                    .is_none_or(|pane| pane == self.editor.active_pane)
+                && !self.editor.active_buffer().in_transaction()
+            {
+                self.editor.finish_save(intent);
+                self.handle_request();
+                // Retain the write outcome (including conflicts) alongside the
+                // formatter failure instead of obscuring a failed save.
+                let outcome = self
+                    .editor
+                    .current_message()
+                    .unwrap_or("Save attempted")
+                    .to_owned();
+                self.editor
+                    .message(format!("{outcome}; formatting unavailable: {reason}"));
+            } else {
+                self.editor
+                    .message("Format-on-save cancelled because the buffer changed; save again");
+            }
+        } else if request.command != CommandId::ToggleInlayHints {
+            self.editor.message(reason.to_owned());
+        }
+    }
+
+    fn expire_lsp_requests(&mut self) {
+        let expired: Vec<_> = self
+            .pending_lsp
+            .iter()
+            .filter(|(_, request)| {
+                request.requested_at.elapsed() >= Duration::from_secs(3)
+                    && (request.save.is_some()
+                        || matches!(
+                            request.command,
+                            CommandId::ToggleInlayHints | CommandId::Hover
+                        ))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            if let Some(request) = self.pending_lsp.remove(&id) {
+                self.fail_lsp_request(request, "request timed out");
+                self.redraw = true;
+            }
+        }
+    }
+
+    fn request_inlay_hints(&mut self) {
+        if !self.editor.inlay_hints {
+            self.last_inlay_request = None;
+            return;
+        }
+        if self.editor.mode != Mode::Normal
+            || self.editor.rust_analyzer_status != "ready"
+            || self.editor.buffers[self.editor.active_pane().buffer].large_file
+        {
+            return;
+        }
+        let Some(path) = self.editor.active_buffer().path() else {
+            return;
+        };
+        if path.extension().is_none_or(|ext| ext != "rs") {
+            return;
+        }
+        let origin = LspMutationOrigin {
+            path: path.to_owned(),
+            revision: self.editor.active_buffer().revision(),
+        };
+        if self.last_inlay_request.as_ref() == Some(&origin) {
+            return;
+        }
+        // One automatic request at a time prevents a slow server from building
+        // an unbounded queue during frequent edits or buffer switches.
+        if self
+            .pending_lsp
+            .values()
+            .any(|request| request.command == CommandId::ToggleInlayHints)
+        {
+            return;
+        }
+        if self
+            .request_lsp(CommandId::ToggleInlayHints, None)
+            .is_some()
+        {
+            self.last_inlay_request = Some(origin);
+        }
+    }
+
+    fn receive_inlay_hints(&mut self, result: &Value) {
+        let buffer = self.editor.active_buffer();
+        let Some(path) = buffer.path().map(Path::to_owned) else {
+            return;
+        };
+        let mut hints = Vec::new();
+        if let Some(values) = result.as_array() {
+            for hint in values.iter().take(4000) {
+                let Some(line) = hint.pointer("/position/line").and_then(Value::as_u64) else {
+                    continue;
+                };
+                let Some(column) = hint.pointer("/position/character").and_then(Value::as_u64)
+                else {
+                    continue;
+                };
+                let Ok(position) =
+                    buffer.utf16_to_pos(Utf16Pos::new(line as usize, column as usize))
+                else {
+                    continue;
+                };
+                let label = match hint.get("label") {
+                    Some(Value::String(label)) => label.clone(),
+                    Some(Value::Array(parts)) => parts
+                        .iter()
+                        .filter_map(|part| part.get("value").and_then(Value::as_str))
+                        .collect(),
+                    _ => continue,
+                };
+                let label: String = label
+                    .chars()
+                    .filter(|ch| !ch.is_control())
+                    .take(128)
+                    .collect();
+                if label.is_empty() {
+                    continue;
+                }
+                let left = if hint.get("paddingLeft").and_then(Value::as_bool) == Some(true) {
+                    " "
+                } else {
+                    ""
+                };
+                let right = if hint.get("paddingRight").and_then(Value::as_bool) == Some(true) {
+                    " "
+                } else {
+                    ""
+                };
+                hints.push(InlayHint {
+                    position,
+                    label: format!("{left}{label}{right}"),
+                });
+            }
+        }
+        hints.sort_by_key(|hint| hint.position);
+        let revision = buffer.revision();
+        self.editor
+            .inlay_snapshots
+            .insert(path, InlaySnapshot { revision, hints });
+    }
+
+    fn request_lsp(&mut self, command: CommandId, argument: Option<String>) -> Option<u64> {
         self.sync_lsp_documents();
         let Some(client) = &self.rust_analyzer else {
             self.editor
                 .message("rust-analyzer integration failed to initialize");
-            return;
+            return None;
         };
         if command == CommandId::RustAnalyzerRestart {
+            self.last_inlay_request = None;
+            self.editor.inlay_snapshots.clear();
+            if self
+                .pending_lsp
+                .values()
+                .any(|request| request.save.is_some())
+            {
+                self.editor
+                    .message("Pending format-on-save cancelled by restart; save again");
+            }
             self.pending_lsp.clear();
             match client.restart() {
                 Ok(()) => {
@@ -906,7 +1385,7 @@ impl Runtime {
                 }
                 Err(error) => self.editor.message(error.to_string()),
             }
-            return;
+            return None;
         }
         if command == CommandId::WorkspaceSymbols {
             match client.request(
@@ -919,11 +1398,11 @@ impl Runtime {
                 }
                 Err(error) => self.editor.message(error.to_string()),
             }
-            return;
+            return None;
         }
         let Some(path) = self.editor.active_buffer().path().map(Path::to_owned) else {
             self.editor.message("This action requires a saved file");
-            return;
+            return None;
         };
         let revision = self.editor.active_buffer().revision();
         let position = self
@@ -931,7 +1410,7 @@ impl Runtime {
             .active_buffer()
             .pos_to_utf16(self.editor.active_pane().cursor)
             .ok();
-        let Some(position) = position else { return };
+        let position = position?;
         let uri = path_to_file_uri(&path);
         let text_document = json!({"uri": uri});
         let at = json!({"line": position.line, "character": position.code_unit});
@@ -972,6 +1451,19 @@ impl Runtime {
                 "textDocument/formatting",
                 json!({"textDocument": text_document, "options": {"tabSize": self.editor.config.editor.tab_width, "insertSpaces": self.editor.config.editor.insert_spaces}}),
             ),
+            CommandId::ToggleInlayHints => {
+                let buffer = self.editor.active_buffer();
+                let last = buffer.line_count().saturating_sub(1);
+                let end = buffer
+                    .pos_to_utf16(Pos::new(last, buffer.grapheme_count(last).unwrap_or(0)))
+                    .ok()?;
+                (
+                    "textDocument/inlayHint",
+                    json!({"textDocument": text_document,
+                    "range": {"start": {"line": 0, "character": 0},
+                    "end": {"line": end.line, "character": end.code_unit}}}),
+                )
+            }
             CommandId::Rename => (
                 "textDocument/rename",
                 json!({"textDocument": text_document, "position": at, "newName": argument.unwrap_or_default()}),
@@ -988,23 +1480,39 @@ impl Runtime {
             _ => {
                 self.editor
                     .message(format!("No LSP request mapping for {command}"));
-                return;
+                return None;
             }
         };
         match client.request(method, params) {
             Ok(id) => {
-                self.pending_lsp.insert(
-                    id,
-                    PendingLspRequest::for_document(command, &path, revision),
-                );
+                let mut pending = PendingLspRequest::for_document(command, &path, revision);
+                if command == CommandId::Hover {
+                    pending.interaction = Some(self.editor.interaction);
+                }
+                self.pending_lsp.insert(id, pending);
+                Some(id)
             }
-            Err(error) => self.editor.message(error.to_string()),
+            Err(error) => {
+                self.editor.message(error.to_string());
+                None
+            }
         }
     }
 
     fn handle_lsp_response(&mut self, command: CommandId, result: Value) {
         match command {
-            CommandId::Hover | CommandId::SignatureHelp => {
+            CommandId::Hover => {
+                if self.editor.mode == Mode::Normal {
+                    let text = hover_text(&result);
+                    if text.trim().is_empty() {
+                        self.editor.message("No hover information");
+                    } else {
+                        self.editor.hover = Some(HoverPopup { text, scroll: 0 });
+                    }
+                }
+            }
+            CommandId::ToggleInlayHints => self.receive_inlay_hints(&result),
+            CommandId::SignatureHelp => {
                 self.editor
                     .message(format!("{}: {}", command, summarize_lsp_text(&result)));
             }
@@ -1051,7 +1559,9 @@ impl Runtime {
                     .collect();
                 self.editor.show_completion(items);
             }
-            CommandId::Format => self.apply_text_edits(&result),
+            CommandId::Format => {
+                self.apply_text_edits(&result);
+            }
             CommandId::Rename => self.apply_workspace_edit(&result),
             CommandId::CodeAction | CommandId::DocumentSymbols | CommandId::WorkspaceSymbols => {
                 let values = result.as_array().cloned().unwrap_or_default();
@@ -1233,22 +1743,27 @@ impl Runtime {
         }
     }
 
-    fn apply_text_edits(&mut self, value: &Value) {
+    fn apply_text_edits(&mut self, value: &Value) -> bool {
         let Some(array) = value.as_array() else {
             self.editor.message("Formatter returned no edits");
-            return;
+            return value.is_null();
         };
         let edits = parse_text_edits(array);
         if edits.len() != array.len() {
             self.editor
                 .message("Could not apply formatting: malformed text edit");
-            return;
+            return false;
         }
         match self.editor.apply_lsp_edits(edits) {
-            Ok(()) => self.editor.message("Formatting applied"),
-            Err(error) => self
-                .editor
-                .message(format!("Could not apply formatting: {error}")),
+            Ok(()) => {
+                self.editor.message("Formatting applied");
+                true
+            }
+            Err(error) => {
+                self.editor
+                    .message(format!("Could not apply formatting: {error}"));
+                false
+            }
         }
     }
 
@@ -1475,7 +1990,7 @@ impl Runtime {
         }
     }
 
-    fn save_session(&self) {
+    pub(crate) fn save_session(&self) {
         let Some(path) = &self.session_path else {
             return;
         };
@@ -1790,6 +2305,39 @@ fn summarize_lsp_text(value: &Value) -> String {
     text.chars().take(500).collect()
 }
 
+fn hover_text(value: &Value) -> String {
+    fn collect(value: &Value, out: &mut String) {
+        if out.len() >= 32_768 {
+            return;
+        }
+        match value {
+            Value::String(text) => {
+                if !out.is_empty() {
+                    out.push_str("\n\n");
+                }
+                out.extend(text.chars().take(8192));
+            }
+            Value::Array(parts) => {
+                for part in parts {
+                    collect(part, out);
+                }
+            }
+            Value::Object(map) => {
+                if let Some(contents) = map.get("contents").or_else(|| map.get("value")) {
+                    collect(contents, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut text = String::new();
+    collect(value, &mut text);
+    text.lines()
+        .filter(|line| !line.trim_start().starts_with("```"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn compact_json(value: &Value) -> String {
     value.to_string().chars().take(500).collect()
 }
@@ -1817,6 +2365,403 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use tempfile::tempdir;
+
+    #[test]
+    fn git_queues_explicit_views_and_discards_closed_or_stale_line_results() {
+        use crate::input::{Key, KeyCode};
+        let directory = tempdir().unwrap();
+        let output = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(directory.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let path = directory.path().join("file.rs");
+        fs::write(&path, "saved\n").unwrap();
+        let mut runtime = local_runtime(directory.path());
+        runtime.editor.open_path(&path).unwrap();
+        let drain = |runtime: &mut Runtime| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while runtime.git.is_some() || runtime.pending_git.is_some() {
+                assert!(Instant::now() < deadline);
+                runtime.drain_git();
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        runtime.start_git(GitAction::Refresh, None, false);
+        runtime.start_git(GitAction::Unstaged, None, true);
+        assert!(runtime.pending_git.is_some());
+        drain(&mut runtime);
+        assert!(
+            runtime
+                .editor
+                .git
+                .document
+                .as_ref()
+                .unwrap()
+                .lines
+                .iter()
+                .any(|line| line == "+saved")
+        );
+
+        runtime.start_git(GitAction::Unstaged, None, true);
+        runtime.editor.handle_key(Key::plain(KeyCode::Esc));
+        drain(&mut runtime);
+        assert!(!runtime.editor.git.visible);
+        assert!(runtime.editor.git.document.is_none());
+
+        // A disk edit has not yet been reloaded. Its hunk coordinates cannot
+        // be assigned to the earlier live text just because it is clean.
+        fs::write(&path, "external\nnew line\n").unwrap();
+        runtime.start_git(GitAction::Refresh, None, false);
+        drain(&mut runtime);
+        assert!(runtime.editor.git.snapshot.as_ref().unwrap().file.is_none());
+        runtime
+            .editor
+            .active_buffer_mut()
+            .insert(Pos::ZERO, "dirty")
+            .unwrap();
+        runtime.start_git(GitAction::Stage, None, true);
+        assert!(runtime.git.is_none());
+        assert!(
+            runtime
+                .editor
+                .messages
+                .back()
+                .unwrap()
+                .contains("Save the modified buffer")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn feature_lsp_peer() {
+        use std::io::{Read, Write};
+        use std::os::fd::FromRawFd;
+        let Some(mode) =
+            std::env::args().find_map(|arg| arg.strip_prefix("feature-peer:").map(str::to_owned))
+        else {
+            return;
+        };
+        // SAFETY: the test wrapper passes an exclusively owned protocol pipe as fd 3.
+        let mut output = unsafe { fs::File::from_raw_fd(3) };
+        let mut decoder = crate::lsp::JsonRpcFrameDecoder::new(16384, 1048576);
+        let mut input = std::io::stdin().lock();
+        let mut bytes = [0; 257];
+        let mut text = String::new();
+        let mut deferred = None;
+        loop {
+            let count = input.read(&mut bytes).unwrap();
+            if count == 0 {
+                break;
+            }
+            for message in decoder.push(&bytes[..count]).unwrap() {
+                let method = message["method"].as_str().unwrap_or("");
+                let id = &message["id"];
+                let result = match method {
+                    "initialize" => Some(
+                        json!({"capabilities": {"inlayHintProvider": true, "documentFormattingProvider": true}}),
+                    ),
+                    "textDocument/didOpen" => {
+                        text = message["params"]["textDocument"]["text"]
+                            .as_str()
+                            .unwrap()
+                            .into();
+                        None
+                    }
+                    "textDocument/didChange" => {
+                        text = message["params"]["contentChanges"][0]["text"]
+                            .as_str()
+                            .unwrap()
+                            .into();
+                        None
+                    }
+                    "textDocument/didSave" => {
+                        fs::write("saved-text", &text).unwrap();
+                        None
+                    }
+                    "textDocument/formatting" => {
+                        let result = if mode == "null" {
+                            Value::Null
+                        } else {
+                            json!([{"range": {"start": {"line": 0, "character": 0},
+                                "end": {"line": 0, "character": text.lines().next().unwrap_or("").encode_utf16().count()}},
+                                "newText": "fn main() {}"}])
+                        };
+                        if mode == "defer" {
+                            deferred = Some(json!({"jsonrpc":"2.0","id":id,"result":result}));
+                            None
+                        } else {
+                            Some(result)
+                        }
+                    }
+                    "textDocument/inlayHint" => Some(json!([
+                        {"position": {"line":0,"character":2}, "label":[{"value":": "},{"value":"u32"}], "paddingRight":true}
+                    ])),
+                    "textDocument/hover" => Some(
+                        json!({"contents":{"kind":"markdown","value":"```rust\nfn main()\n```\nDocumentation"}}),
+                    ),
+                    "test/release" => {
+                        if let Some(response) = deferred.take() {
+                            output
+                                .write_all(
+                                    &crate::lsp::encode_json_rpc(&response, 1048576).unwrap(),
+                                )
+                                .unwrap();
+                            output.flush().unwrap();
+                        }
+                        None
+                    }
+                    "shutdown" => Some(Value::Null),
+                    "exit" => return,
+                    _ => None,
+                };
+                if let Some(result) = result {
+                    let response = json!({"jsonrpc":"2.0","id":id,"result":result});
+                    output
+                        .write_all(&crate::lsp::encode_json_rpc(&response, 1048576).unwrap())
+                        .unwrap();
+                    output.flush().unwrap();
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn feature_runtime(root: &Path, mode: &str) -> Runtime {
+        let mut runtime = local_runtime(root);
+        let mut config = RustAnalyzerConfig::new(root);
+        config.executable = "/bin/sh".into();
+        config.args = vec!["-c".into(),
+            "LLVM_PROFILE_FILE=/dev/null exec \"$1\" --exact app::tests::feature_lsp_peer --nocapture --skip \"$2\" 3>&1 1>&2".into(),
+            "editor-feature-test".into(), std::env::current_exe().unwrap().into_os_string(), format!("feature-peer:{mode}").into()];
+        runtime.rust_analyzer = Some(RustAnalyzerClient::new(config).unwrap());
+        runtime.rust_analyzer.as_ref().unwrap().start().unwrap();
+        pump_until(&mut runtime, |runtime| {
+            runtime.editor.rust_analyzer_status == "ready"
+        });
+        runtime
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn format_on_save_updates_buffer_disk_undo_and_did_save_before_quitting() {
+        for command in ["w", "wq", "saveas renamed.rs"] {
+            let directory = tempdir().unwrap();
+            let mut runtime = feature_runtime(directory.path(), "normal");
+            let path = open_test_file(&mut runtime, "main.rs", "fn main(){}\n");
+            runtime.editor.config.editor.format_on_save = true;
+            runtime
+                .editor
+                .active_buffer_mut()
+                .insert(Pos::new(0, 10), " ")
+                .unwrap();
+            let before = runtime.editor.active_buffer().text();
+            runtime.editor.execute_ex(command);
+            runtime.handle_request();
+            assert!(!runtime.editor.should_quit);
+            pump_until(&mut runtime, |runtime| {
+                !runtime
+                    .pending_lsp
+                    .values()
+                    .any(|pending| pending.save.is_some())
+            });
+            let destination = if command.starts_with("saveas") {
+                directory.path().join("renamed.rs")
+            } else {
+                path
+            };
+            assert_eq!(fs::read_to_string(destination).unwrap(), "fn main() {}\n");
+            assert_eq!(runtime.editor.active_buffer().text(), "fn main() {}\n");
+            assert!(!runtime.editor.active_buffer().is_dirty());
+            assert_eq!(runtime.editor.should_quit, command == "wq");
+            pump_until(&mut runtime, |_| {
+                directory.path().join("saved-text").exists()
+            });
+            assert_eq!(
+                fs::read_to_string(directory.path().join("saved-text")).unwrap(),
+                "fn main() {}\n"
+            );
+            runtime.editor.active_buffer_mut().undo().unwrap();
+            assert_eq!(runtime.editor.active_buffer().text(), before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_format_on_save_never_writes_newer_typing_or_another_buffer() {
+        for switch in [false, true] {
+            let directory = tempdir().unwrap();
+            let mut runtime = feature_runtime(directory.path(), "defer");
+            let path = open_test_file(&mut runtime, "main.rs", "fn main(){}\n");
+            runtime.editor.config.editor.format_on_save = true;
+            runtime.editor.execute_ex("wq");
+            runtime.handle_request();
+            if switch {
+                open_test_file(&mut runtime, "other.rs", "keep\n");
+            } else {
+                runtime.editor.handle_key(crate::input::Key::char('i'));
+                runtime.editor.handle_paste("new");
+            }
+            let current = runtime.editor.active_buffer().text();
+            runtime
+                .rust_analyzer
+                .as_ref()
+                .unwrap()
+                .notify("test/release", Value::Null)
+                .unwrap();
+            pump_until(&mut runtime, |runtime| {
+                !runtime
+                    .pending_lsp
+                    .values()
+                    .any(|pending| pending.save.is_some())
+            });
+            assert_eq!(runtime.editor.active_buffer().text(), current);
+            assert_eq!(fs::read_to_string(path).unwrap(), "fn main(){}\n");
+            assert!(!runtime.editor.should_quit);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn format_on_save_preserves_external_conflicts_and_force_is_explicit() {
+        for forced in [false, true] {
+            let directory = tempdir().unwrap();
+            let mut runtime = feature_runtime(directory.path(), "defer");
+            let path = open_test_file(&mut runtime, "main.rs", "fn main(){}\n");
+            runtime
+                .editor
+                .active_buffer_mut()
+                .insert(Pos::new(0, 9), " ")
+                .unwrap();
+            runtime.editor.config.editor.format_on_save = true;
+            runtime.editor.execute_ex(if forced { "wq!" } else { "wq" });
+            runtime.handle_request();
+            fs::write(&path, "external contents\n").unwrap();
+            runtime
+                .rust_analyzer
+                .as_ref()
+                .unwrap()
+                .notify("test/release", Value::Null)
+                .unwrap();
+            pump_until(&mut runtime, |runtime| {
+                !runtime
+                    .pending_lsp
+                    .values()
+                    .any(|pending| pending.save.is_some())
+            });
+            assert_eq!(
+                fs::read_to_string(path).unwrap(),
+                if forced {
+                    "fn main() {}\n"
+                } else {
+                    "external contents\n"
+                }
+            );
+            assert_eq!(runtime.editor.should_quit, forced);
+            assert_eq!(runtime.editor.active_buffer().is_dirty(), !forced);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn format_on_save_handles_new_files_null_results_and_timeouts() {
+        for mode in ["normal", "null", "defer"] {
+            let directory = tempdir().unwrap();
+            let mut runtime = feature_runtime(directory.path(), mode);
+            runtime.editor.open_scratch_text("scratch", "fn main(){}\n");
+            runtime.editor.config.editor.format_on_save = true;
+            runtime.editor.execute_ex("wq new.rs");
+            runtime.handle_request();
+            if mode == "defer" {
+                for pending in runtime.pending_lsp.values_mut() {
+                    pending.requested_at -= Duration::from_secs(4);
+                }
+                runtime.expire_lsp_requests();
+            }
+            pump_until(&mut runtime, |runtime| runtime.editor.should_quit);
+            assert_eq!(
+                fs::read_to_string(directory.path().join("new.rs")).unwrap(),
+                if mode == "normal" {
+                    "fn main() {}\n"
+                } else {
+                    "fn main(){}\n"
+                }
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_inlays_refresh_by_revision_and_hover_keeps_multiline_text() {
+        let directory = tempdir().unwrap();
+        let mut runtime = feature_runtime(directory.path(), "normal");
+        let path = open_test_file(&mut runtime, "main.rs", "😀 value\n");
+        pump_until(&mut runtime, |runtime| {
+            runtime.editor.inlay_snapshots.contains_key(&path)
+        });
+        let snapshot = &runtime.editor.inlay_snapshots[&path];
+        assert_eq!(snapshot.hints[0].position, Pos::new(0, 1));
+        assert_eq!(snapshot.hints[0].label, ": u32 ");
+        runtime
+            .editor
+            .active_buffer_mut()
+            .insert(Pos::new(0, 2), "x")
+            .unwrap();
+        pump_until(&mut runtime, |runtime| {
+            runtime.editor.inlay_snapshots[&path].revision
+                == runtime.editor.active_buffer().revision()
+        });
+        runtime.editor.handle_key(crate::input::Key::char('K'));
+        runtime.handle_request();
+        pump_until(&mut runtime, |runtime| runtime.editor.hover.is_some());
+        assert_eq!(
+            runtime.editor.hover.as_ref().unwrap().text,
+            "fn main()\nDocumentation"
+        );
+        runtime.editor.handle_key(crate::input::Key::char('i'));
+        assert!(runtime.editor.hover.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn late_hover_is_dismissed_and_save_cannot_close_a_different_view_of_the_same_buffer() {
+        let directory = tempdir().unwrap();
+        let mut runtime = feature_runtime(directory.path(), "defer");
+        let path = open_test_file(&mut runtime, "main.rs", "fn main(){}\n");
+        runtime.editor.handle_key(crate::input::Key::char('K'));
+        runtime.handle_request();
+        runtime.editor.handle_key(crate::input::Key::char('i'));
+        runtime
+            .editor
+            .handle_key(crate::input::Key::plain(crate::input::KeyCode::Esc));
+        pump_until(&mut runtime, |runtime| {
+            !runtime
+                .pending_lsp
+                .values()
+                .any(|pending| pending.command == CommandId::Hover)
+        });
+        assert!(runtime.editor.hover.is_none());
+
+        runtime.editor.config.editor.format_on_save = true;
+        runtime.editor.execute_ex("wq");
+        runtime.handle_request();
+        runtime.editor.split(Orientation::Vertical);
+        runtime
+            .rust_analyzer
+            .as_ref()
+            .unwrap()
+            .notify("test/release", Value::Null)
+            .unwrap();
+        pump_until(&mut runtime, |runtime| {
+            !runtime
+                .pending_lsp
+                .values()
+                .any(|pending| pending.save.is_some())
+        });
+        assert_eq!(runtime.editor.panes.len(), 2);
+        assert_eq!(fs::read_to_string(path).unwrap(), "fn main(){}\n");
+    }
 
     fn local_runtime(root: &Path) -> Runtime {
         let editor = Editor::new(Config::default(), root.to_owned());
@@ -1952,6 +2897,46 @@ mod tests {
         assert!(runtime.editor.active_buffer_mut().undo().unwrap());
         assert_eq!(runtime.editor.active_buffer().text(), original);
         assert!(!runtime.editor.active_buffer().can_undo());
+    }
+
+    #[test]
+    fn formatting_full_document_eof_preserves_exact_newlines_and_undo() {
+        for source in ["fn main(){}\n", "fn main(){}\r\n"] {
+            for replacement in ["fn main() {}\n", "fn main() {}"] {
+                let directory = tempdir().unwrap();
+                let mut runtime = local_runtime(directory.path());
+                open_test_file(&mut runtime, "main.rs", source);
+                assert!(runtime.apply_text_edits(&json!([{
+                    "range": {"start": {"line":0,"character":0}, "end": {"line":1,"character":0}},
+                    "newText": replacement
+                }])));
+                let expected = if source.contains('\r') {
+                    replacement.replace('\n', "\r\n")
+                } else {
+                    replacement.into()
+                };
+                assert_eq!(runtime.editor.active_buffer().text(), expected);
+                runtime.editor.active_buffer_mut().undo().unwrap();
+                assert_eq!(runtime.editor.active_buffer().text(), source);
+                runtime.editor.active_buffer_mut().redo().unwrap();
+                assert_eq!(runtime.editor.active_buffer().text(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn formatting_overlapping_or_reversed_ranges_is_rejected_before_mutation() {
+        let directory = tempdir().unwrap();
+        let mut runtime = local_runtime(directory.path());
+        open_test_file(&mut runtime, "main.rs", "abcdef\n");
+        for edits in [
+            json!([text_edit(0, 1, 4, "x"), text_edit(0, 2, 5, "y")]),
+            json!([text_edit(0, 4, 1, "x")]),
+        ] {
+            assert!(!runtime.apply_text_edits(&edits));
+            assert_eq!(runtime.editor.active_buffer().text(), "abcdef\n");
+            assert!(!runtime.editor.active_buffer().in_transaction());
+        }
     }
 
     #[test]
@@ -2171,13 +3156,7 @@ mod tests {
             CommandId::Hover,
             json!({"contents": {"kind": "markdown", "value": "first\nsecond"}}),
         );
-        assert!(
-            runtime
-                .editor
-                .current_message()
-                .unwrap()
-                .contains("first second")
-        );
+        assert_eq!(runtime.editor.hover.as_ref().unwrap().text, "first\nsecond");
         assert_eq!(
             summarize_lsp_text(&json!({"contents": "界".repeat(800)}))
                 .chars()
@@ -2354,7 +3333,10 @@ mod tests {
         }
         assert_eq!(runtime.pending_lsp.len(), 13);
         for pending in runtime.pending_lsp.values() {
-            if matches!(pending.command, CommandId::Format | CommandId::Rename) {
+            if matches!(
+                pending.command,
+                CommandId::Format | CommandId::Rename | CommandId::Hover
+            ) {
                 assert_eq!(
                     pending.mutation_origin,
                     Some(LspMutationOrigin {
@@ -2588,6 +3570,59 @@ mod tests {
                 .current_message()
                 .unwrap()
                 .starts_with("cargo check failed: could not start")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_menu_commands_do_not_watch_saves_and_fmt_reloads_clean_views() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        let cargo = root.join("fake-cargo");
+        fs::write(&cargo, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> runs\nif [ \"$1\" = fmt ]; then printf 'fn main() {}\\n' > main.rs; fi\necho output\n").unwrap();
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut runtime = local_runtime(root);
+        runtime.editor.config.tools.cargo.path = cargo.display().to_string();
+        let path = open_test_file(&mut runtime, "main.rs", "fn main(){}\n");
+        type_keys(&mut runtime, " Cr");
+        wait_for_check(&mut runtime);
+        assert_eq!(runtime.editor.check.command, CargoCommand::Run);
+        assert!(!runtime.editor.check.watch);
+        assert!(
+            runtime
+                .editor
+                .check
+                .entries()
+                .iter()
+                .any(|entry| entry.title == "output")
+        );
+        runtime.editor.execute_ex("w");
+        runtime.handle_request();
+        assert!(runtime.cargo_check.is_none());
+        type_keys(&mut runtime, " Cf");
+        wait_for_check(&mut runtime);
+        assert_eq!(runtime.editor.active_buffer().text(), "fn main() {}\n");
+        assert!(!runtime.editor.active_buffer().is_dirty());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            runtime.editor.active_buffer().text()
+        );
+        runtime.editor.execute_ex("w");
+        runtime.handle_request();
+        assert!(
+            runtime
+                .editor
+                .current_message()
+                .unwrap()
+                .starts_with("Wrote")
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("runs"))
+                .unwrap()
+                .lines()
+                .count(),
+            2
         );
     }
 

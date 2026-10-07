@@ -605,6 +605,9 @@ impl TextState {
 
 #[derive(Clone, Debug)]
 enum Change {
+    /// Expose the implicit empty line after a loaded final newline so LSP
+    /// edits can distinguish the end of the last line from serialized EOF.
+    EofLine,
     Text {
         start: BytePoint,
         before_end: BytePoint,
@@ -628,6 +631,19 @@ enum Change {
 impl Change {
     fn apply(&self, state: &mut TextState, forward: bool) {
         match self {
+            Self::EofLine => {
+                if forward {
+                    let info = LineInfo::for_lines(&[String::new()]).pop().unwrap();
+                    state.content_hash = state.content_hash.wrapping_add(info.hash);
+                    state.lines.push(String::new());
+                    state.line_info.push(info);
+                } else {
+                    state.lines.pop();
+                    let info = state.line_info.pop().unwrap();
+                    state.content_hash = state.content_hash.wrapping_sub(info.hash);
+                }
+                debug_assert!(state.invariant_holds());
+            }
             Self::Text {
                 start,
                 before_end,
@@ -678,6 +694,7 @@ impl Change {
     }
     fn heap_bytes(&self) -> usize {
         match self {
+            Self::EofLine => 0,
             Self::Text { before, after, .. } => before.heap_bytes() + after.heap_bytes(),
             Self::Whole { before, after } => [before, after]
                 .iter()
@@ -856,6 +873,9 @@ impl Transaction {
         let mut preferred = state.preferred_ending;
         for change in self.changes.iter().rev() {
             match change {
+                Change::EofLine => {
+                    lines.pop();
+                }
                 Change::Text {
                     start,
                     after_end,
@@ -1453,6 +1473,14 @@ impl Buffer {
             self.finish_mutation(change);
         }
         Ok(cursor)
+    }
+
+    pub(crate) fn materialize_eof_line(&mut self) {
+        if self.state.endings.len() == self.state.lines.len() {
+            let change = Change::EofLine;
+            change.apply(&mut self.state, true);
+            self.finish_mutation(change);
+        }
     }
 
     pub fn delete_grapheme_forward(&mut self, at: Pos) -> Result<Option<String>> {

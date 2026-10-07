@@ -38,6 +38,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Run => {}
     }
 
+    #[cfg(not(feature = "gui"))]
+    if cli.gui {
+        return Err(
+            "this build has no GUI; rebuild with cargo build --release --features gui".into(),
+        );
+    }
     let working_directory = env::current_dir()?;
     let explicit_directory = cli
         .targets
@@ -123,7 +129,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let restore_session = !cli.no_session && !has_explicit_files && stdin_text.is_none();
-    Runtime::new(editor, restore_session)?.run()?;
+    let runtime = Runtime::new(editor, restore_session)?;
+    #[cfg(feature = "gui")]
+    if cli.gui {
+        return editor::gui::run(runtime);
+    }
+    runtime.run()?;
     Ok(())
 }
 

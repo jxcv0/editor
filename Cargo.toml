@@ -2,11 +2,24 @@
 name = "editor"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 default-run = "editor"
-description = "A fast, modal Rust terminal editor"
-license = "MIT OR Apache-2.0"
+description = "A fast, modal Rust editor with terminal and GPU frontends"
+license = "MIT"
+
+[features]
+default = []
+gui = ["dep:ab_glyph", "dep:ttf-parser", "dep:egui", "dep:egui-wgpu", "dep:egui-winit", "dep:futures-lite", "dep:wgpu", "dep:winit"]
 
 [dependencies]
+ab_glyph = { version = "0.2.32", optional = true }
+ttf-parser = { version = "0.25.1", optional = true }
+egui = { version = "=0.33.3", optional = true }
+egui-wgpu = { version = "=0.33.3", default-features = false, optional = true }
+egui-winit = { version = "=0.33.3", default-features = false, features = ["clipboard", "wayland", "x11"], optional = true }
+futures-lite = { version = "2.6.1", optional = true }
+wgpu = { version = "27.0.1", default-features = false, features = ["std", "vulkan", "wgsl"], optional = true }
+winit = { version = "0.30.13", optional = true }
 crossterm = "0.29"
 crossbeam-channel = "0.5"
 dirs = "6"

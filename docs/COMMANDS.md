@@ -15,6 +15,42 @@ An LSP binding may be registered and visible while its final UI action is
 unavailable; in that case the command must report status instead of editing
 text.
 
+## Desktop frontend
+
+Build with `cargo build --release --features gui` and launch
+`target/release/editor --gui [PATH ...]`. All startup arguments and the modal
+commands below also apply to the desktop frontend. A build without `gui`
+reports how to enable it before loading files or entering a terminal.
+
+FiraCode Nerd Font Mono is embedded and selected by default, with programming
+ligatures in the workspace. Each character still has its own cursor/click
+position. Ligatures stop at changes in styling and at non-ASCII grapheme
+boundaries. egui's bundled fallback fonts remain available for other glyphs.
+No font installation or configuration is required. The titlebar's **editor**
+menu opens the bundled font license in a scratch buffer.
+
+| Desktop input | Action |
+| --- | --- |
+| Ctrl-P | File finder. |
+| Ctrl-S | Save the current buffer through the usual conflict/formatting path. |
+| Ctrl-Shift-C | Copy the Visual selection (including block selections), or last yank, to the system clipboard. |
+| Ctrl-Shift-V | Paste from the system clipboard. Ctrl-V still enters Visual block mode. |
+| Ctrl-plus/minus/0 | Enlarge, shrink, or reset editor font size. |
+| Click a tab / explorer entry | Switch buffers / open a file or toggle a directory. |
+| Click / drag in source | Move the grapheme cursor / select characters in one pane. Clicking ends an open Insert transaction. |
+| Wheel over the workspace | Navigate the focused editor/list/diff, or scroll the focused terminal history. |
+| Drop a file | Open it through the normal UTF-8/file-size checks. |
+| Window close | Quit if clean; otherwise show keep-editing/discard choices for all dirty buffers. Esc cancels the dialog. |
+
+The toolbar and rail expose save, finder, search, Git, split, terminal, and
+Cargo commands. Ctrl-P, Ctrl-S, and font shortcuts are passed through when the
+terminal has focus; clipboard shortcuts belong to the desktop. Core selection
+is separate from terminal selection (the latter is not implemented). IME
+preedit is displayed without changing text; committed text uses core input.
+The explorer is resizable, source colors use `ui.theme`, and font zoom is not
+persisted. Dialogs, pointer input across window systems, clipboard providers,
+and IME should also be exercised on the target desktop before release.
+
 ## Normal mode
 
 ### Movement
@@ -48,6 +84,7 @@ count delimiter bytes inside strings or comments.
 | `i`, `I` | Insert at the cursor, or at the first nonblank grapheme. |
 | `a`, `A` | Insert after the cursor, or at end of line. |
 | `o`, `O` | Open an indented line below/above and enter Insert mode. |
+| `[count]D` (Shift-D) | Change from the cursor through end of line and enter Insert mode, like `c$`; a count extends through that many lines. On an empty line, enter Insert without removing its newline. This intentionally differs from Vim's `D`. |
 | `[count]x` | Delete graphemes on the current line into the selected and unnamed registers. |
 | `[count]r{char}` | Replace graphemes on the current line. |
 | `[count]J` | Join lines, replacing the boundary/leading whitespace with one space. |
@@ -61,7 +98,7 @@ non-find delete motions with their counts, and repeated-line deletes. It is not
 a byte-for-byte replay and does not yet cover every change type. Deletes made
 with `f`/`F`/`t`/`T` or a text object are currently remembered as a word delete,
 so `.` is not semantically exact for those cases. It re-inserts recorded Insert
-text at the current position but does not preserve the entry semantics of `c`,
+text at the current position but does not preserve the entry semantics of `c`/`D`,
 `a`/`A`, or `o`/`O`; indentation, comments, formatting, and arbitrary Visual
 edits are also not repeatable yet.
 
@@ -84,12 +121,20 @@ nothing silently. Search is line-oriented and uses Rust-regex syntax, not Vim's
 regular-expression dialect. Search highlighting and an incremental search
 preview are not yet implemented.
 
-Current-version diagnostics are also rendered beside the affected source line,
+In Normal mode, current-version diagnostics are also rendered beside the affected source line,
 ordered by severity and clipped to the pane width. `gl` shows the collected
 diagnostic messages for the cursor line. `K`, `gd`, `gD`, `gy`, `gI`, and `gr`
 issue distinct typed requests for hover, definition, declaration, type
 definition, implementation, and references. They require a ready
-`rust-analyzer`. Hover is summarized on the message line. `gr` opens a references
+`rust-analyzer`. `K` (Shift-K) opens a bordered hover box above the cursor,
+or below when there is insufficient room above. It preserves paragraphs and
+code lines, wraps within the pane, and supports `<C-f>`/`<C-b>` scrolling.
+`Esc` dismisses it; any editing/navigation key dismisses it and performs its
+usual action. Late hover results are discarded after further input.
+Inlay hints are requested automatically for the current Rust revision and
+rendered inline in Normal mode; neither hints nor diagnostic text interrupt
+Insert mode. Diagnostic gutter markers remain visible.
+`gr` opens a references
 picker, including for a single result, with each file/line/column followed by a
 source-code excerpt. Open buffers supply their current unsaved text; other files
 load previews asynchronously. Type to filter by path or code, then use `Enter`
@@ -214,7 +259,6 @@ registry is:
 | `<Space><Space>`, `<Space>ff` | Find project file | Opens the fuzzy file picker over files already streamed by the project scan. |
 | `<Space>/`, `<Space>sg` | Project grep | Opens streaming regex project search; changing the query cancels the previous task. |
 | `<Space>e` | Explorer | Open/focus it, or close it when it is already focused. |
-| `<Space>t` | Integrated terminal | Open and focus the bottom terminal, or hide it while preserving its shell session. |
 | `<Space>bb` | Switch buffer | Opens the fuzzy buffer picker. |
 | `<Space>bd` | Close buffer | Refuses a modified buffer. |
 | `<Space>bn`, `<Space>bp` | Next/previous buffer | Cycles the buffer list. |
@@ -224,12 +268,21 @@ registry is:
 | `<Space>cR` | Restart rust-analyzer | Restarts the client; remains available while the server is failed or not ready. |
 | `<Space>cc` | Cargo check | Runs `cargo check` now and shows the right-side check panel. |
 | `<Space>cw` | Watch cargo check | Toggles the check panel. While it is visible, saving a Rust source or Cargo manifest/lockfile re-runs the check; hiding it stops watching and cancels a running check. |
+| `<Space>Cr`, `<Space>Ct`, `<Space>Cb`, `<Space>Cc` | Cargo run/test/build/check | Run directly and show output in the right-side panel. Check also enables save watching. |
+| `<Space>Cu`, `<Space>Cl`, `<Space>Cf` | Cargo update/Clippy/fmt | Run directly; fmt changes reload into clean buffers when finished. |
+| `<Space>Cd`, `<Space>Cx`, `<Space>Cq` | Cargo doc/clean/cancel | Build docs, clean build outputs, or cancel the current Cargo command. |
 | `<Space>fr` | Recent files | Opens files visited during this process; this list is not persistent yet. |
 | `<Space>ss`, `<Space>sS` | Document/workspace symbols | Requests and lists symbols. Workspace locations can open; document-symbol selection remains incomplete. |
 | `<Space>sm` | Messages | Opens bounded message history. |
 | `<Space>xX` | Buffer diagnostics | Opens current-version diagnostics for the active buffer. |
 | `<Space>xx` | Workspace diagnostics | Opens all retained workspace diagnostics. |
-| `<Space>uh` | Toggle inlay hints | Toggles editor state; requesting/rendering hints is incomplete. |
+| `<Space>uh` | Toggle inlay hints | Enable/disable versioned, inline Rust hints in Normal mode. |
+| `<Space>ua` | Toggle animations | Toggle smooth scrolling and cursor animation together. Independent `ui.smooth_scroll` and `ui.cursor_animation` settings default to true. |
+| `<Space>gs` | Git status | Browse staged, unstaged, untracked, deleted, and conflicted paths. |
+| `<Space>gd`, `<Space>gD`, `<Space>gh` | Git diffs | Show the active saved file's unstaged, staged, or HEAD diff. |
+| `<Space>gb`, `<Space>gc` | Line history | Show the last commit affecting the current saved line, or its full commit patch. |
+| `<Space>ga`, `<Space>gu` | Stage/unstage file | Change the index for the active saved file. Refuse unsaved buffer edits. |
+| `<Space>gn`, `<Space>gp` | Next/previous Git hunk | Jump between staged/unstaged changed hunks, wrapping at the ends. Requires current clean-buffer line data. |
 | `<Space>-`, `<Space>w-` | Split below | Create a horizontal split showing the same buffer. |
 | `<Space>\|`, `<Space>w\|` | Split right | Create a vertical split showing the same buffer. |
 | `<Space>wd` | Close pane | Refuses to close the last pane. The buffer remains open. |
@@ -240,18 +293,88 @@ are incomplete. A registered integration command can therefore be shown even
 when the tool is missing or starting; invoking it should explain the current
 status.
 
+### Git
+
+Git runs directly, asynchronously, with literal path arguments and no pager,
+external diff driver, or textconv. Read-only status refreshes after startup,
+on active-file changes, after a save, and about every two seconds while idle.
+The foreground accepts line data only for the matching clean buffer revision
+and unchanged disk metadata. It hides those markers immediately on editing.
+Repository status uses the two-column [Git porcelain format](https://git-scm.com/docs/git-status):
+the first column is the index (staged), the second is the working tree
+(unstaged), and `??` means untracked. Renames appear as deletion/addition
+pairs. Branch/upstream information appears in the header; status-bar `S` and
+`U` count files in each category, including untracked files in `U`.
+
+The active-file gutter has separate staged and unstaged columns after the
+diagnostic column. `+` is addition, `~` replacement, and `-` deletion, anchored
+to the preceding surviving line (or the first line at the top). Staged marks
+are mapped from index coordinates through unstaged edits; replaced/deleted
+index lines have no staged mark on the new working text. The staged diff
+remains available for reviewing them. Binary changes and merge conflicts
+appear in status/diff views but do not provide ordinary text-hunk markers.
+
+| Keys in the Git view | Action |
+| --- | --- |
+| `j`/`k`, Down/Up | Select a status entry or scroll a diff. |
+| Page Down/Up, Ctrl-f/Ctrl-b | Move 12 entries/rows. |
+| `g`, `G` | First/last entry or top/bottom of a diff. |
+| `h`/`l`, Left/Right | Scroll horizontally by eight display cells in split diffs, or graphemes in unified/history views. |
+| `d`, Enter | Unstaged diff for the selected file. |
+| `D`, `H` | Staged diff, or diff between HEAD and the saved file. |
+| `s`, `u` | Stage/unstage the selected file, then refresh status. |
+| `o` | Close the view and open the selected file. |
+| Backspace | Return from a diff or history view to status. |
+| `r` | Refresh repository status. |
+| `q`, Esc | Close the Git view. |
+
+The view consumes input and paste without editing buffers. While loading,
+Esc/`q` can dismiss it; late results never reopen it. Ctrl-backtick dismisses
+the view and toggles the terminal. Diffs are read-only snapshots of saved
+files; save first to include buffer edits. Stage/unstage operate on entire
+files and reject dirty open buffers. Unstaging preserves working-tree content,
+including in repositories without commits. An unborn repository supports
+status, staged/unstaged diffs, and staging, but has no HEAD/line history.
+Untracked text is shown as an addition. Deleted paths can be staged from
+status. Current-line history reports uncommitted lines instead of attributing
+them to an unrelated commit.
+
+At 64 or more cells wide, patches use aligned BEFORE/AFTER columns, each with
+its own source line numbers. Contiguous removed/added blocks are paired in
+order; unequal blocks have blank cells so following context remains aligned.
+This is a bounded linear alignment, not similarity matching between unrelated
+lines. Both columns scroll together, tabs expand at four-cell stops, and wide
+or combining graphemes are clipped without shifting the other column. Missing
+final newlines are marked on the affected side. Narrow views use the original
+unified text. Commit patches can contain multiple files; file headers, binary
+diff notices, renames, empty diffs, and truncation notices remain visible.
+
+There is one Git worker plus at most one queued explicit request. Each child
+has a ten-second timeout and an output limit of `limits.tool_message_bytes`
+(clamped to 1 KiB–32 MiB); exceeding it reports an error. Status is limited to
+10,000 entries, and diff/history presentation to 50,000 lines with an explicit
+truncation notice. Git workers are cancelled and joined on shutdown. Missing
+Git or an unavailable repository produces a message for explicit commands;
+background failures clear stale Git state without interrupting editing.
+
 ### Integrated terminal
 
-The first `<Space>t` or `` Ctrl-` `` starts `$SHELL` in the project root through
+The first `:terminal` or `` Ctrl-` `` starts `$SHELL` in the project root through
 a PTY. Hiding and reopening the panel preserves that shell and its screen.
 Terminal-focused keys and paste are sent to the PTY. `` Ctrl-` `` toggles the
 panel from editor, explorer, picker, prompt, and terminal focus, leaving any
 pending Visual, Leader, operator, prompt, or picker state first. `Ctrl-\`
 returns focus to the editor without hiding the panel; `Ctrl-w j` focuses it
-again. From editor focus, `<Space>t` also hides the panel. `Shift-PageUp` and
+again. From editor focus, `:terminal` also hides the panel. `Shift-PageUp` and
 `Shift-PageDown` move through bounded scrollback by a page, while `Shift-Home`
 and `Shift-End` jump to its top and bottom. Mouse reporting, terminal text
 selection, and clipboard integration are not yet implemented.
+
+`Ctrl-D` is forwarded as EOF to the shell or foreground program. At an empty
+shell prompt it normally exits the shell; shell exit (including `exit`) closes
+the panel and returns terminal focus to the editor. Toggling the terminal again
+starts a fresh shell. Inside a running program, `Ctrl-D` keeps that program's
+normal EOF behavior, and the panel stays open while the shell is running.
 
 Without an enhanced keyboard protocol, terminals encode `` Ctrl-` `` as NUL, the
 same byte as `Ctrl-Space` and `Ctrl-@`, so those keys toggle the panel too and
@@ -259,7 +382,21 @@ are not forwarded to the shell. In Insert mode that byte keeps its
 `<C-Space>` completion meaning; a distinctly reported `` Ctrl-` `` still leaves
 Insert mode and toggles the terminal.
 
-### Cargo check panel
+### Cargo panel
+
+`<Space>C` opens the Cargo submenu. `:cargo COMMAND [args]` runs the same
+commands; arguments are separated by whitespace and passed literally, without
+shell expansion or quote parsing. For example, `:cargo test --lib` or
+`:cargo run --example demo`. Each run uses `tools.cargo.path` and appends
+`tools.cargo.args`; those configured flags must be valid for the chosen command.
+Program/test output appears during execution, preserving repeated lines, with
+at most 1,000 entries retained. Stdin is closed, so interactive programs belong
+in the integrated terminal. Starting another command, hiding the panel, or
+exiting the editor cancels the current process group. Only check commands
+enable save watching. Other commands cannot be restarted by a save.
+Clean buffers changed by completed commands reload immediately; dirty buffers
+remain protected. `<Space>Cq`, `:cargo cancel`, or `s` inside the panel cancels
+the current run.
 
 `<Space>cc` runs `cargo check --message-format=json` (plus `tools.cargo.args`)
 in the project root and opens the panel docked right of the panes. It needs at
@@ -277,7 +414,7 @@ has focus:
   PageDown/PageUp move by ten; `g`/`G` or Home/End select the first or last.
 - `Enter`, `o`, or `l` open the selected entry's file at rustc's line and
   column and return focus to the editor.
-- `r` re-runs the check.
+- `r` re-runs the current Cargo command with the same arguments; `s` stops it.
 - `<Space>` opens the leader menu and `:` the command line from editor focus.
 - `Esc`, `q`, `<C-h>`, or `<C-w>h` return focus to the editor; `<C-w>j` focuses
   a visible terminal.
@@ -329,6 +466,14 @@ example in the integrated terminal).
 
 ## Ex commands
 
+When `[editor] format_on_save = true`, Rust writes through `:w`, `:wq`,
+`:x`, and `:saveas` request formatting before the final save. Edits update the
+visible buffer as one undo step. The write retains normal disk-conflict checks,
+and `:wq` closes its original pane only after a successful write. Further edits
+or changing panes while formatting is pending cancel that save. Missing or
+failed servers and three-second timeouts fall back to saving unformatted text
+and report the reason. An unnamed buffer is first saved to establish its URI.
+
 Paths are resolved from the active project root. Long names and listed short
 aliases are accepted.
 
@@ -351,7 +496,13 @@ aliases are accepted.
 | `:earlier [N]`, `:later [N]` | Undo/redo `N` nodes on the current branch. |
 | `:messages` | Open message history. |
 | `:terminal`, `:term` | Toggle the integrated terminal panel. |
+| `:git`, `:git status` | Open Git status. |
+| `:git diff`, `:git staged`, `:git head` | View the active saved file against the index, HEAD against the index, or HEAD against the saved file. |
+| `:git blame`, `:git commit` | Show current-line commit metadata or that commit's patch. |
+| `:git stage`, `:git unstage` | Stage/unstage the active saved file. |
+| `:git next`, `:git prev`, `:git refresh` | Move between changed hunks, or refresh status/active-file markers without opening the view. |
 | `:check`, `:cargocheck` | Run `cargo check` and show the check panel. |
+| `:cargo COMMAND [args]` | Run check, run, test, build, update, clippy, fmt, doc, clean, or cancel. |
 | `:rename NEW_NAME` | Request an LSP rename and apply returned changes for the active buffer only. |
 | `:rarestart`, `:lsprestart` | Restart the `rust-analyzer` client. |
 | `:checkhealth` | Request the current health report; the report is incomplete in this MVP. |

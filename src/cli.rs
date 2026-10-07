@@ -100,6 +100,7 @@ pub struct Cli {
     pub action: CliAction,
     pub targets: Vec<Target>,
     pub no_session: bool,
+    pub gui: bool,
 }
 
 impl Cli {
@@ -131,6 +132,10 @@ impl Cli {
             }
 
             if parse_options {
+                if argument == OsStr::new("--gui") {
+                    cli.gui = true;
+                    continue;
+                }
                 if argument == OsStr::new("--no-session") {
                     cli.no_session = true;
                     continue;
@@ -352,6 +357,7 @@ impl fmt::Display for HelpText {
                PATH ...       Files to open; a directory selects the project root\n\
                -              Read a scratch buffer from standard input\n\n\
              Options:\n\
+               --gui          Open the GPU desktop frontend (requires feature gui)\n\
                --no-session   Do not restore the project's previous session\n\
                --help         Print this help and exit\n\
                --version      Print version information and exit\n\
@@ -379,6 +385,14 @@ impl fmt::Display for VersionText {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gui_flag_is_intermixed_and_double_dash_preserves_literal_path() {
+        let cli = Cli::parse_args(["src/main.rs", "--gui", "--no-session", "--", "--gui"]).unwrap();
+        assert!(cli.gui && cli.no_session);
+        assert_eq!(cli.targets.len(), 2);
+        assert_eq!(cli.targets[1].path(), Some(Path::new("--gui")));
+    }
+
     use super::*;
 
     fn parse<const N: usize>(arguments: [&str; N]) -> Result<Cli, CliError> {

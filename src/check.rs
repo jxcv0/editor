@@ -1,8 +1,8 @@
-//! `cargo check` runs for the watch panel.
+//! Supervised Cargo commands and the shared output/check panel.
 //!
-//! The runtime starts at most one supervised `cargo check --message-format=json`
-//! child at a time. A worker thread parses compiler messages into compact
-//! entries and streams them through a bounded queue, while the editor owns only
+//! The runtime starts at most one supervised Cargo child at a time. A worker
+//! parses compiler messages and program output into compact entries and
+//! streams them through a bounded queue, while the editor owns only
 //! the renderable [`CheckPanel`] state. Dropping a [`CargoCheckTask`] terminates
 //! the cargo process group.
 
@@ -32,6 +32,59 @@ const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 1_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const SEND_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum CargoCommand {
+    #[default]
+    Check,
+    Run,
+    Test,
+    Build,
+    Update,
+    Clippy,
+    Fmt,
+    Doc,
+    Clean,
+}
+
+impl CargoCommand {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Check => "check",
+            Self::Run => "run",
+            Self::Test => "test",
+            Self::Build => "build",
+            Self::Update => "update",
+            Self::Clippy => "clippy",
+            Self::Fmt => "fmt",
+            Self::Doc => "doc",
+            Self::Clean => "clean",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        [
+            Self::Check,
+            Self::Run,
+            Self::Test,
+            Self::Build,
+            Self::Update,
+            Self::Clippy,
+            Self::Fmt,
+            Self::Doc,
+            Self::Clean,
+        ]
+        .into_iter()
+        .find(|command| command.name() == name)
+    }
+
+    fn json_diagnostics(self) -> bool {
+        matches!(
+            self,
+            Self::Check | Self::Run | Self::Test | Self::Build | Self::Clippy | Self::Doc
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CheckLevel {
@@ -67,7 +120,7 @@ impl CheckEntry {
     fn output(line: String) -> Self {
         Self {
             level: None,
-            title: line,
+            title: line.chars().take(8192).collect(),
             location: None,
             origin: None,
             label: None,
@@ -99,9 +152,25 @@ pub enum CheckEvent {
 /// The command a run uses: `cargo check` with machine-readable diagnostics,
 /// followed by the configured extra arguments.
 pub fn cargo_check_spec(tool: &ToolConfig, root: &Path) -> ProcessSpec {
-    ProcessSpec::new(&tool.path)
-        .args(["check", "--message-format=json", "--color=never"])
-        .args(&tool.args)
+    cargo_spec(tool, root, CargoCommand::Check, &[])
+}
+
+pub fn cargo_spec(
+    tool: &ToolConfig,
+    root: &Path,
+    command: CargoCommand,
+    args: &[String],
+) -> ProcessSpec {
+    let mut spec = ProcessSpec::new(&tool.path).args([command.name()]);
+    if command.json_diagnostics() {
+        spec = spec.args(["--message-format=json"]);
+    }
+    if command != CargoCommand::Fmt {
+        spec = spec.args(["--color=never"]);
+    }
+    spec.args(&tool.args)
+        .args(args)
+        .env("CARGO_TERM_COLOR", "never")
         .current_dir(root)
 }
 
@@ -210,9 +279,18 @@ impl Worker {
             };
             for line in lines {
                 let event = match stream {
-                    OutputStream::Stdout => parse_message_line(&line, &self.root)
-                        .filter(|entry| seen.insert(entry.clone()))
-                        .map(CheckEvent::Entry),
+                    OutputStream::Stdout => {
+                        let diagnostic = parse_message_line(&line, &self.root);
+                        if let Some(entry) = diagnostic {
+                            // Bound de-duplication storage independently of output volume.
+                            (seen.len() >= MAX_ENTRIES || seen.insert(entry.clone()))
+                                .then_some(CheckEvent::Entry(entry))
+                        } else if !line.trim().is_empty() && !is_cargo_json(&line) {
+                            Some(CheckEvent::Entry(CheckEntry::output(line)))
+                        } else {
+                            None
+                        }
+                    }
                     OutputStream::Stderr => stderr_event(&line),
                 };
                 if let Some(event) = event
@@ -328,6 +406,22 @@ fn parse_message_line(line: &str, root: &Path) -> Option<CheckEntry> {
         .and_then(Value::as_str)
         .and_then(|path| Path::new(path).parent());
     parse_diagnostic(value.get("message")?, root, manifest_dir)
+}
+
+fn is_cargo_json(line: &str) -> bool {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.get("reason").and_then(Value::as_str),
+                Some(
+                    "compiler-message"
+                        | "compiler-artifact"
+                        | "build-script-executed"
+                        | "build-finished"
+                )
+            )
+        })
 }
 
 fn parse_diagnostic(
@@ -508,6 +602,9 @@ pub enum CheckStatus {
 #[derive(Debug, Default)]
 pub struct CheckPanel {
     pub visible: bool,
+    pub command: CargoCommand,
+    pub arguments: Vec<String>,
+    pub watch: bool,
     pub status: CheckStatus,
     /// Latest cargo status line of the current run.
     pub progress: String,
@@ -543,6 +640,18 @@ impl CheckPanel {
         self.started = Some(Instant::now());
     }
 
+    pub fn begin_command(&mut self, command: CargoCommand, arguments: Vec<String>) {
+        if command != self.command || command != CargoCommand::Check {
+            self.entries.clear();
+            self.omitted = 0;
+            self.selected = 0;
+            self.scroll = 0;
+        }
+        self.command = command;
+        self.arguments = arguments;
+        self.begin();
+    }
+
     pub fn cancel(&mut self) {
         if self.is_running() {
             self.status = CheckStatus::Cancelled;
@@ -558,6 +667,22 @@ impl CheckPanel {
         }
         match event {
             CheckEvent::Entry(entry) => {
+                // Program and test output should be visible while the child is
+                // still running, including repeated lines in their original order.
+                if self.command != CargoCommand::Check {
+                    let following = self.selected == self.entries.len().saturating_sub(1);
+                    if self.entries.len() >= MAX_ENTRIES {
+                        self.entries.remove(0);
+                        self.omitted = self.omitted.saturating_add(1);
+                        self.selected = self.selected.saturating_sub(1);
+                        self.scroll = self.scroll.saturating_sub(1);
+                    }
+                    self.entries.push(entry);
+                    if following {
+                        self.selected = self.entries.len() - 1;
+                    }
+                    return None;
+                }
                 if self.pending.len() >= MAX_ENTRIES {
                     self.pending_omitted = self.pending_omitted.saturating_add(1);
                 } else {
@@ -568,7 +693,10 @@ impl CheckPanel {
                 None
             }
             CheckEvent::Progress(line) => {
-                self.progress = line;
+                self.progress = line.clone();
+                if self.command != CargoCommand::Check {
+                    self.apply(CheckEvent::Entry(CheckEntry::output(line)));
+                }
                 None
             }
             CheckEvent::Finished { success, code } => {
@@ -582,13 +710,13 @@ impl CheckPanel {
                     code,
                     elapsed,
                 };
-                Some(format!("cargo check: {}", self.summary()))
+                Some(format!("cargo {}: {}", self.command.name(), self.summary()))
             }
             CheckEvent::Failed(error) => {
                 self.started = None;
                 self.publish();
                 self.status = CheckStatus::Failed(error.clone());
-                Some(format!("cargo check failed: {error}"))
+                Some(format!("cargo {} failed: {error}", self.command.name()))
             }
         }
     }
@@ -599,6 +727,9 @@ impl CheckPanel {
     }
 
     fn publish(&mut self) {
+        if self.command != CargoCommand::Check {
+            return;
+        }
         self.entries = std::mem::take(&mut self.pending);
         self.omitted = std::mem::take(&mut self.pending_omitted);
         self.progress.clear();
@@ -644,6 +775,8 @@ impl CheckPanel {
                     }
                 } else if warnings > 0 {
                     plural(warnings, "warning")
+                } else if self.command != CargoCommand::Check {
+                    "finished successfully".into()
                 } else {
                     "no errors or warnings".into()
                 }
@@ -674,6 +807,83 @@ mod tests {
             path: "cargo".into(),
             args: vec!["--all-targets".into()],
         }
+    }
+
+    #[test]
+    fn cargo_specs_use_only_supported_flags_and_keep_arguments_literal() {
+        for command in [
+            CargoCommand::Run,
+            CargoCommand::Test,
+            CargoCommand::Build,
+            CargoCommand::Update,
+            CargoCommand::Fmt,
+            CargoCommand::Clippy,
+            CargoCommand::Doc,
+            CargoCommand::Clean,
+        ] {
+            let args = vec!["--".into(), "literal;$HOME".into()];
+            let spec = cargo_spec(
+                &ToolConfig {
+                    path: "/custom/cargo".into(),
+                    args: Vec::new(),
+                },
+                Path::new("/work"),
+                command,
+                &args,
+            );
+            assert_eq!(spec.args[0], command.name());
+            assert_eq!(spec.args.last().unwrap(), "literal;$HOME");
+            assert_eq!(
+                spec.args.iter().any(|arg| arg == "--message-format=json"),
+                command.json_diagnostics()
+            );
+            assert_eq!(
+                spec.args.iter().any(|arg| arg == "--color=never"),
+                command != CargoCommand::Fmt
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_and_test_output_streams_live_preserving_repeated_lines_and_exit_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let task = CargoCheckTask::spawn(ProcessSpec::new("sh").args(["-c",
+            "printf 'hello\\nhello\\n{\"application\":true}\\n'; echo 'test failure' >&2; exit 7"]), directory.path().to_owned()).unwrap();
+        let mut panel = CheckPanel::default();
+        panel.begin_command(CargoCommand::Test, Vec::new());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while panel.is_running() {
+            assert!(Instant::now() < deadline);
+            for event in task.drain(64) {
+                if matches!(event, CheckEvent::Finished { .. }) {
+                    assert!(!panel.entries().is_empty(), "output appears before exit");
+                }
+                panel.apply(event);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            panel
+                .entries()
+                .iter()
+                .filter(|entry| entry.title == "hello")
+                .count(),
+            2
+        );
+        assert!(
+            panel
+                .entries()
+                .iter()
+                .any(|entry| entry.title == "{\"application\":true}")
+        );
+        assert!(
+            panel
+                .entries()
+                .iter()
+                .any(|entry| entry.title == "test failure")
+        );
+        assert_eq!(panel.summary(), "failed (exit 7)");
     }
 
     #[test]

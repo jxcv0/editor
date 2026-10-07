@@ -235,15 +235,25 @@ impl StdinWriter {
                 "child stdin is closed",
             ));
         };
-        self.queued_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
-                queued
-                    .checked_add(bytes.len())
-                    .filter(|total| *total <= byte_limit)
-            })
-            .map_err(|_| {
-                io::Error::new(io::ErrorKind::WouldBlock, "child stdin byte queue is full")
-            })?;
+        // Keep Rust 1.88 support: try_update requires 1.95, and fetch_update is deprecated.
+        let mut queued = self.queued_bytes.load(Ordering::Acquire);
+        loop {
+            let total = queued
+                .checked_add(bytes.len())
+                .filter(|total| *total <= byte_limit)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::WouldBlock, "child stdin byte queue is full")
+                })?;
+            match self.queued_bytes.compare_exchange_weak(
+                queued,
+                total,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => queued = current,
+            }
+        }
         match sender.try_send(bytes.to_vec()) {
             Ok(()) => Ok(()),
             Err(error) => {

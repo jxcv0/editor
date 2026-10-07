@@ -20,18 +20,33 @@ env:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.88.0", stable]
+        features: ["", gui]
 
     steps:
     - uses: actions/checkout@v7
     - name: Install Rust
       run: |
-        rustup toolchain install stable --profile minimal
-        rustup default stable
+        rustup toolchain install ${{ matrix.rust }} --profile minimal
+        rustup default ${{ matrix.rust }}
         rustc --version
     - name: Build
-      run: cargo build --locked --verbose
+      run: cargo build --locked --features "${{ matrix.features }}" --verbose
     - name: Run tests
-      run: cargo test --locked --verbose
+      run: cargo test --locked --features "${{ matrix.features }}" --verbose
+    - name: Build release
+      run: cargo build --release --locked --features "${{ matrix.features }}"
+    - name: Install software Vulkan for GUI rendering check
+      if: matrix.features == 'gui' && matrix.rust == 'stable'
+      run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+    - name: Render desktop and diff with software Vulkan
+      if: matrix.features == 'gui' && matrix.rust == 'stable'
+      run: |
+        vulkan_icd=$(find /usr/share/vulkan/icd.d -name 'lvp_icd*.json' -print -quit)
+        test -n "$vulkan_icd"
+        VK_DRIVER_FILES="$vulkan_icd" cargo test --locked --features gui offscreen_desktop_and_diff_render -- --ignored --nocapture

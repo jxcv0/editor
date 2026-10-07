@@ -22,12 +22,30 @@ struct Workspace {
 }
 
 impl Workspace {
+    fn git(&self, args: &[&str]) -> Vec<u8> {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&self.project)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
     fn new() -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let project = temporary.path().join("project");
         let config = temporary.path().join("config");
         let state = temporary.path().join("state");
         fs::create_dir_all(&project).unwrap();
+        // Give every fixture its own root, independent of the runner's parent
+        // Git checkout (including sandbox mounts around the temp directory).
+        fs::create_dir(project.join(".git")).unwrap();
         fs::create_dir_all(config.join("editor")).unwrap();
         let missing = temporary
             .path()
@@ -85,6 +103,9 @@ impl Workspace {
         command.env("XDG_CONFIG_HOME", &self.config);
         command.env("XDG_STATE_HOME", &self.state);
         command.env("TERM", "xterm-256color");
+        command.env("SHELL", "/bin/sh");
+        command.env("ENV", "/dev/null");
+        command.env("PS1", "editor-test-shell> ");
         let pair = native_pty_system()
             .openpty(PtySize {
                 rows: 24,
@@ -115,6 +136,52 @@ impl Workspace {
             raw: Vec::new(),
         }
     }
+}
+
+#[test]
+fn terminal_git_views_stage_unstage_and_show_line_history() {
+    let workspace = Workspace::new();
+    workspace.git(&["init", "-q"]);
+    workspace.git(&["config", "user.name", "Terminal Test"]);
+    workspace.git(&["config", "user.email", "test@example.invalid"]);
+    workspace.git(&["config", "commit.gpgsign", "false"]);
+    workspace.git(&["config", "core.hooksPath", "/dev/null"]);
+    let path = workspace.project.join("file.rs");
+    fs::write(&path, "first\noriginal\n").unwrap();
+    workspace.git(&["add", "file.rs"]);
+    workspace.git(&["commit", "-qm", "Original terminal fixture"]);
+    fs::write(&path, "first\nmodified\n").unwrap();
+    let mut terminal = workspace.terminal(&["--no-session", "file.rs"]);
+    terminal.wait_for("NORMAL");
+    terminal.ex("git diff");
+    terminal.wait_for("Unstaged (index");
+    terminal.wait_for("BEFORE");
+    terminal.wait_for("AFTER");
+    terminal.wait_for("2 - original");
+    terminal.wait_for("2 + modified");
+    terminal.send(b"s");
+    terminal.wait_for("Saved file staged");
+    assert!(!workspace.git(&["diff", "--cached"]).is_empty());
+    terminal.send(b"D");
+    terminal.wait_for("Staged (HEAD");
+    terminal.wait_for("2 + modified");
+    terminal.send(b"u");
+    terminal.wait_for("File unstaged");
+    assert!(workspace.git(&["diff", "--cached"]).is_empty());
+    terminal.send(b"q");
+    terminal.wait_for("NORMAL");
+    terminal.ex("git blame");
+    terminal.wait_for("Line 1:");
+    terminal.wait_for("Terminal Test");
+    terminal.send(b"q");
+    terminal.wait_for("NORMAL");
+    terminal.ex("git commit");
+    terminal.wait_for("2 + original");
+    terminal.send(b"q");
+    terminal.wait_for("NORMAL");
+    terminal.ex("q");
+    terminal.finish();
+    assert_eq!(fs::read_to_string(path).unwrap(), "first\nmodified\n");
 }
 
 struct EditorTerminal {
@@ -228,6 +295,45 @@ impl Drop for EditorTerminal {
             let _ = self.child.wait();
         }
     }
+}
+
+#[test]
+fn integrated_terminal_ctrl_d_closes_exited_shell_and_can_reopen() {
+    let workspace = Workspace::new();
+    fs::write(workspace.project.join("edit.txt"), "original\n").unwrap();
+    let mut terminal = workspace.terminal(&["--no-session", "edit.txt"]);
+    terminal.wait_for("NORMAL");
+    terminal.ex("terminal");
+    terminal.wait_for("editor-test-shell>");
+    terminal.wait_for("TERMINAL");
+
+    // EOF should finish a foreground program without closing its parent shell.
+    terminal.send(b"cat; printf '\\nEOF-%s\\n' handled\r");
+    terminal.send(b"\x04");
+    terminal.wait_for("EOF-handled");
+    assert!(terminal.parser.screen().contents().contains("TERMINAL"));
+
+    terminal.send(b"\x04");
+    terminal.wait_for_copies("TERMINAL", 0);
+    assert!(terminal.child.try_wait().unwrap().is_none());
+    terminal.send(b"iAFTER-EOF-");
+    terminal.wait_for("AFTER-EOF-original");
+    terminal.normal_mode();
+
+    terminal.ex("terminal");
+    terminal.wait_for("editor-test-shell>");
+    terminal.wait_for("TERMINAL");
+    assert!(!terminal.parser.screen().contents().contains("EOF-handled"));
+    terminal.send(b"printf 'fresh-%s\\n' shell\r");
+    terminal.wait_for("fresh-shell");
+    terminal.send(b"exit\r");
+    terminal.wait_for_copies("TERMINAL", 0);
+    terminal.ex("wq");
+    terminal.finish();
+    assert_eq!(
+        fs::read_to_string(workspace.project.join("edit.txt")).unwrap(),
+        "AFTER-EOF-original\n"
+    );
 }
 
 #[test]
