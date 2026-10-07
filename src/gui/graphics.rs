@@ -53,14 +53,10 @@ impl Graphics {
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .ok_or("no supported window surface configuration")?;
-        if let Some(format) = surface
-            .get_capabilities(&adapter)
-            .formats
-            .into_iter()
-            .find(|f| !f.is_srgb())
-        {
-            config.format = format;
-        }
+        // Prefer 8-bit linear formats. Color-managed compositors may list wide
+        // formats such as Rgba16Unorm first, which need unrequested features.
+        config.format =
+            egui_wgpu::preferred_framebuffer_format(&surface.get_capabilities(&adapter).formats)?;
         config.present_mode = wgpu::PresentMode::AutoVsync;
         surface.configure(&device, &config);
         let context = egui::Context::default();
