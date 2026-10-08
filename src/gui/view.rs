@@ -300,56 +300,102 @@ impl View {
 
     fn explorer(&mut self, ctx: &egui::Context, runtime: &mut Runtime) {
         let initial_width = f32::from(runtime.editor.explorer.width) * 8.0;
-        let response = egui::SidePanel::left("project-tree").default_width(initial_width).width_range(160.0..=440.0).resizable(true)
-            .frame(Frame::new().fill(BG).inner_margin(Margin { left: 10, right: 12, top: 10, bottom: 16 }))
+        let response = egui::SidePanel::left("project-tree")
+            .default_width(initial_width)
+            .width_range(160.0..=440.0)
+            .resizable(true)
+            .frame(Frame::new().fill(BG).inner_margin(Margin {
+                left: 10,
+                right: 12,
+                top: 10,
+                bottom: 16,
+            }))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("EXPLORER").size(11.0).strong().color(MUTED));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.small_button("×").clicked() { command(runtime, "explorer"); }
+                        if ui.small_button("×").clicked() {
+                            command(runtime, "explorer");
+                        }
                     });
                 });
                 ui.add_space(16.0);
-                ui.label(RichText::new(runtime.editor.explorer.root.file_name().unwrap_or_default().to_string_lossy()).strong().color(ACCENT));
+                ui.label(
+                    RichText::new(
+                        runtime
+                            .editor
+                            .explorer
+                            .root
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy(),
+                    )
+                    .strong()
+                    .color(ACCENT),
+                );
                 ui.add_space(10.0);
                 let count = runtime.editor.explorer.rows().len();
                 let selected = runtime.editor.explorer.selected;
                 let scroll_to_selected = self.last_explorer_selection != Some(selected);
                 self.last_explorer_selection = Some(selected);
                 let height = (ui.available_height() - 100.0).max(80.0);
-                let mut scroll = egui::ScrollArea::vertical().max_height(height).auto_shrink([false, false]);
-                if scroll_to_selected { scroll = scroll.vertical_scroll_offset((selected as f32 * 35.0 - height / 2.0).max(0.0)); }
+                let mut scroll = egui::ScrollArea::vertical()
+                    .max_height(height)
+                    .auto_shrink([false, false]);
+                if scroll_to_selected {
+                    scroll = scroll
+                        .vertical_scroll_offset((selected as f32 * 35.0 - height / 2.0).max(0.0));
+                }
                 scroll.show_rows(ui, 29.0, count, |ui, range| {
-                        for i in range {
-                            let entry = &runtime.editor.explorer.rows()[i];
-                            let directory = entry.is_directory();
-                            let expanded = runtime.editor.explorer.expanded.contains(&entry.path);
-                            let label = entry.path.file_name().unwrap_or_default().to_string_lossy();
-                            let marker = if directory { if expanded { "v" } else { ">" } } else { file_mark(&entry.path) };
-                            let text = format!("{}{}  {}", "  ".repeat(entry.depth.saturating_sub(1).min(20)), marker, label);
-                            let active = runtime.editor.active_buffer().path() == Some(entry.path.as_path());
-                            let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 29.0), Sense::click());
-                            if active || (i == selected && runtime.editor.focus == Focus::Explorer) {
-                                ui.painter().rect_filled(rect, 5.0, Color32::from_rgb(35, 56, 61));
-                            } else if response.hovered() { ui.painter().rect_filled(rect, 5.0, SURFACE); }
-                            ui.painter().with_clip_rect(rect).text(rect.left_center() + vec2(8.0, 0.0), Align2::LEFT_CENTER, text,
-                                FontId::proportional(13.0), if active { ACCENT } else if directory { TEXT } else { MUTED });
-                            if i == selected && scroll_to_selected { response.scroll_to_me(Some(Align::Center)); }
-                            if response.clicked() {
-                                normal(runtime);
-                                runtime.editor.explorer.selected = i;
-                                runtime.editor.focus = Focus::Explorer;
-                                runtime.handle_input(InputEvent::Key(Key::plain(KeyCode::Enter)));
-                            }
+                    for i in range {
+                        let entry = &runtime.editor.explorer.rows()[i];
+                        let directory = entry.is_directory();
+                        let expanded = runtime.editor.explorer.expanded.contains(&entry.path);
+                        let label = entry.path.file_name().unwrap_or_default().to_string_lossy();
+                        let marker = if directory {
+                            if expanded { "v" } else { ">" }
+                        } else {
+                            file_mark(&entry.path)
+                        };
+                        let text = format!(
+                            "{}{}  {}",
+                            "  ".repeat(entry.depth.saturating_sub(1).min(20)),
+                            marker,
+                            label
+                        );
+                        let active =
+                            runtime.editor.active_buffer().path() == Some(entry.path.as_path());
+                        let (rect, response) = ui
+                            .allocate_exact_size(vec2(ui.available_width(), 29.0), Sense::click());
+                        if active || (i == selected && runtime.editor.focus == Focus::Explorer) {
+                            ui.painter()
+                                .rect_filled(rect, 5.0, Color32::from_rgb(35, 56, 61));
+                        } else if response.hovered() {
+                            ui.painter().rect_filled(rect, 5.0, SURFACE);
                         }
-                    });
-                ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
-                    Frame::new().fill(SURFACE).corner_radius(8).inner_margin(12).show(ui, |ui| {
-                        ui.with_layout(Layout::top_down(Align::LEFT), |ui| {
-                        ui.label(RichText::new("A little space to think.").size(12.0).color(ACCENT));
-                        ui.label(RichText::new("Space   commands\ni           insert text\nEsc       normal mode").monospace().size(11.0).color(MUTED));
-                        });
-                    });
+                        ui.painter().with_clip_rect(rect).text(
+                            rect.left_center() + vec2(8.0, 0.0),
+                            Align2::LEFT_CENTER,
+                            text,
+                            FontId::proportional(13.0),
+                            if active {
+                                ACCENT
+                            } else if directory {
+                                TEXT
+                            } else {
+                                MUTED
+                            },
+                        );
+                        if i == selected && scroll_to_selected {
+                            response.scroll_to_me(Some(Align::Center));
+                        }
+                        if response.clicked() {
+                            normal(runtime);
+                            runtime.editor.explorer.selected = i;
+                            runtime.editor.focus = Focus::Explorer;
+                            runtime.handle_input(InputEvent::Key(Key::plain(KeyCode::Enter)));
+                        }
+                    }
                 });
             });
         runtime.editor.explorer.width = (response.response.rect.width() / 8.0)
